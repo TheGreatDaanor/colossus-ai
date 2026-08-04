@@ -61,8 +61,34 @@ for var in ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN ANTHROPIC_BASE_URL \
   [[ -n "${!var:-}" ]] && env_args+=(-e "$var=${!var}")
 done
 
-if [[ -z "${ANTHROPIC_API_KEY:-}${ANTHROPIC_AUTH_TOKEN:-}" ]]; then
-  warn "no ANTHROPIC_API_KEY / ANTHROPIC_AUTH_TOKEN in env — the agent will not authenticate"
+# Two ways to authenticate, and they bill differently:
+#
+#   ANTHROPIC_API_KEY   -> pay-per-token API credits
+#   claude.ai login     -> your Pro/Max subscription
+#
+# If you have a subscription, an exported API key silently diverts unattended loops
+# onto metered credits. So prefer forwarding the existing login when there's one,
+# and only fall back to the key.
+declare -a cred_args=()
+CLAUDE_CREDS="${CLAUDE_CREDS:-$HOME/.claude/.credentials.json}"
+
+if [[ -n "${ANTHROPIC_API_KEY:-}${ANTHROPIC_AUTH_TOKEN:-}" ]]; then
+  if [[ -f "$CLAUDE_CREDS" ]] && [[ -z "${FORCE_API_KEY:-}" ]]; then
+    warn "both an API key and a claude.ai login are present"
+    note "the API key wins, so this run bills to pay-per-token credits, not your"
+    note "subscription. To use the subscription instead:"
+    note "    unset ANTHROPIC_API_KEY   (then re-run)"
+    note "to silence this and keep using the key:  FORCE_API_KEY=1"
+  fi
+elif [[ -f "$CLAUDE_CREDS" ]]; then
+  # Mount the login read-only so the container inherits the subscription session.
+  cred_args=(-v "$CLAUDE_CREDS:/home/agent/.claude/.credentials.json:ro")
+  log "no API key — forwarding your claude.ai login (subscription billing)"
+else
+  warn "no ANTHROPIC_API_KEY and no claude.ai login at $CLAUDE_CREDS"
+  note "the agent will not authenticate inside the container. Either:"
+  note "    export ANTHROPIC_API_KEY=sk-...      (pay-per-token)"
+  note "    run 'claude' once on the host        (subscription, then re-run this)"
 fi
 
 declare -a tty_args=()
@@ -74,6 +100,7 @@ log "running in $IMAGE: $*"
 
 exec docker run --rm "${tty_args[@]}" \
   -v "$REPO_ROOT:/repo" \
+  "${cred_args[@]}" \
   -w /repo \
   --network bridge \
   --memory="${SANDBOX_MEMORY:-8g}" \
