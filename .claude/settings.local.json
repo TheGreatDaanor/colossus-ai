@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(grep -n -iC2 \"security\" /home/daanorai/colossus-ai/docs/USAGE.md /home/daanorai/colossus-ai/prompts/review.md)",
+      "Bash(grep -n -iC2 \"scan\" /home/daanorai/colossus-ai/.claude/skills/improve-codebase-architecture/SKILL.md)"
+    ]
+  }
+}

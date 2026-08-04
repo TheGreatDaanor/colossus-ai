@@ -2,3 +2,5 @@
 # agent workflow
 .agent-logs/
 .afk-worktrees/
+node_modules/
+node_modules/

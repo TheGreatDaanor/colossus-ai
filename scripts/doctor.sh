@@ -31,6 +31,7 @@ done
 FAIL=0; WARN=0
 declare -A CMDS=()         # declared here: section 4 reads it too
 declare -A CMD_BROKEN=()   # commands already proven unrunnable, don't execute them
+declare -A HOST_OK=()      # commands that actually passed on the host
 _c() { if [[ -t 1 ]]; then printf '\033[%sm' "$1"; fi; }
 head2() { printf '\n'; _c '1'; printf '%s\n' "$*"; _c '0'; }
 pass() { _c '32'; printf '  PASS  '; _c '0'; printf '%s\n' "$*"; }
@@ -177,6 +178,29 @@ else
         ;;
     esac
 
+    # `npm <binary>` is not a thing. npm only runs its own subcommands; to run a
+    # locally-installed binary you need `npx`. pnpm and yarn DO fall through to
+    # local binaries, so this check is npm-only.
+    if [[ "$c" == npm\ * ]]; then
+      sub="$(awk '{print $2}' <<<"$c")"
+      case " run run-script test start stop restart ci install install-test i add \
+uninstall remove rm update up outdated exec x init create publish pack version \
+audit ls list link unlink prune rebuild dedupe config get set help doctor why \
+view info fund ping pkg query search token whoami login logout access team org \
+star unstar deprecate dist-tag hook owner profile root prefix bin explain diff \
+sbom shrinkwrap " in
+        *" $sub "*) ;;   # a real npm subcommand
+        *)
+          fail "$key: '$sub' is not an npm subcommand — npm cannot run it"
+          note "npm only runs its own subcommands and package.json scripts."
+          note "to run a local binary directly, use npx:"
+          note "    - $key: \`npx $sub${c#npm $sub}\`"
+          note "or add it as a script in package.json and use \`npm run $sub\`"
+          CMD_BROKEN[$key]=1
+          ;;
+      esac
+    fi
+
     # Exit-status laundering. A command that cannot report failure is the most
     # damaging misconfiguration available: the agent commits broken code and the
     # loop reports success. Static, so check it even in --quick mode.
@@ -216,12 +240,15 @@ else
       elif (( rc == 127 )); then
         fail "$key: command not found"
         note "$(printf '%s' "$out" | tail -1)"
-      elif grep -qiE 'ENOENT|Missing script|no such file or directory|could not (read|find|open) [^ ]*(package\.json|go\.mod|Cargo\.toml)|no pyproject|is not recognized|command not found' <<<"$out"; then
+      elif grep -qiE 'ENOENT|Missing script|no such file or directory|could not (read|find|open) [^ ]*(package\.json|go\.mod|Cargo\.toml)|no pyproject|is not recognized|command not found|supported npm commands|Unknown command|unknown option' <<<"$out"; then
         # The distinction that matters: the tool never ran, versus it ran and
         # reported failures. Only the second one is "your tree is red today".
         fail "$key could not run at all (exit $rc) — this is not a failing test suite"
         note "$(printf '%s' "$out" | grep -iE 'ENOENT|Missing script|no such file' | head -1)"
-        if grep -qi 'Missing script' <<<"$out"; then
+        if grep -qi 'supported npm commands\|Unknown command' <<<"$out"; then
+          sub="$(awk '{print $2}' <<<"${CMDS[$key]}")"
+          note "npm has no '$sub' subcommand. Use: \`npx $sub ...\`"
+        elif grep -qi 'Missing script' <<<"$out"; then
           script="$(grep -oiE 'Missing script: *"[^"]+"' <<<"$out" | head -1 | sed 's/.*"\(.*\)"/\1/')"
           note "package.json exists but has no \"${script:-?}\" script"
           note "either add it to the \"scripts\" block, or point CLAUDE.md straight"
@@ -238,6 +265,7 @@ else
         note "$(printf '%s' "$out" | tail -2 | tr '\n' ' ')"
       else
         pass "$key exited 0 in ${dur}s"
+        HOST_OK[$key]=1
         if [[ "$key" == "Test" ]] && (( dur > 60 )); then
           warn "test suite takes ${dur}s — the agent runs this dozens of times"
           note "add a scoped variant to CLAUDE.md for tight loops"
@@ -374,11 +402,21 @@ else
       esac
     fi
     if (( CHECK_SANDBOX )) && [[ -n "${CMDS[Test]:-}" ]]; then
-      note "running your test command inside the container..."
-      if timeout "$CMD_TIMEOUT" ./scripts/sandbox.sh bash -lc "${CMDS[Test]}" >/dev/null 2>&1; then
-        pass "test command works INSIDE the sandbox"
+      if [[ -z "${HOST_OK[Test]:-}" ]]; then
+        # Running it in the container would fail for the same reason and produce
+        # a misleading "toolchain missing" verdict. Fix the host first.
+        note "skipping in-container run — the test command does not pass on the host yet"
+        note "fix section 1, then re-run with --sandbox"
       else
-        fail "test command fails inside the sandbox — toolchain missing from the image"
+        note "running your test command inside the container..."
+        if err="$(timeout "$CMD_TIMEOUT" ./scripts/sandbox.sh bash -lc "${CMDS[Test]}" 2>&1)"; then
+          pass "test command works INSIDE the sandbox"
+        else
+          fail "test command passes on the host but FAILS inside the sandbox"
+          note "$(printf '%s' "$err" | grep -viE '^\[|^warn:' | tail -2 | tr '\n' ' ')"
+          note "the image is missing something your tests need — add it to the"
+          note "toolchain block in scripts/Dockerfile, then: ./scripts/sandbox.sh --rebuild"
+        fi
       fi
     elif (( ! CHECK_SANDBOX )); then
       note "re-run with --sandbox to verify your loops work inside the container"

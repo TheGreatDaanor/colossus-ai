@@ -185,6 +185,24 @@ ls package.json go.mod Cargo.toml pyproject.toml pom.xml 2>/dev/null
 
 Whatever that finds tells you which row of the table you want.
 
+**`To see a list of supported npm commands, run: npm help`**
+
+You wrote `npm <binary>` where `npx <binary>` belongs. `npm` only runs its own
+subcommands and your `package.json` scripts — it cannot execute a local binary.
+
+| Wrong | Right |
+|---|---|
+| `npm vitest run` | `npx vitest run` or `npm test` |
+| `npm tsc --noEmit` | `npx tsc --noEmit` or `npm run typecheck` |
+| `npm eslint .` | `npx eslint .` or `npm run lint` |
+
+Note this is npm-specific: `pnpm vitest run` and `yarn vitest run` both work,
+because those two fall through to local binaries. npm doesn't.
+
+Either form is fine. `npm run <script>` is one more layer that can swallow an exit
+code; `npx <tool>` is more direct. The scaffold uses `npm run` because the scripts
+are already defined.
+
 **`npm error Missing script: "test"`**
 
 `package.json` exists but has no script by that name. See what you actually have:

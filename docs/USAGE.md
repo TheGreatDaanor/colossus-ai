@@ -60,6 +60,68 @@ Wrap up. Give me your recommendations for everything still unresolved, then writ
 
 ---
 
+# Second: git hygiene
+
+The agent commits. That single fact drives three habits, and skipping them is how a
+run becomes hard to unpick.
+
+## Always start from a clean tree
+
+**Why it matters:** every time the agent's tests pass, it runs `git add -A` and
+commits. `add -A` stages *everything* — including whatever you were halfway through.
+Your work ends up inside the agent's commit, under the agent's message.
+
+The damage isn't the commit itself, it's what it costs you afterwards:
+
+- `./scripts/review.sh` shows your changes mixed with the agent's, so you're
+  reviewing your own code as if it were the agent's
+- "what did the agent actually change?" has no answer any more
+- reverting a bad agent commit takes your work with it
+- during `loop.sh` this happens on *every* iteration, unattended
+
+```bash
+git status                              # should be empty
+git add -A && git commit -m "wip"       # keep it
+git stash                               # or set it aside
+```
+
+`once.sh` warns and pauses 5 seconds. `loop.sh` refuses to start — unattended, you
+aren't there to judge. Override either with `--allow-dirty` if you really mean it.
+
+## Always work on a branch
+
+```bash
+git checkout -b feat/points-and-streaks
+```
+
+The agent commits to whatever branch is checked out. On a branch you get:
+
+- `./scripts/review.sh main..HEAD` means exactly "everything the agent did"
+- a bad run is `git checkout main && git branch -D feat/...` away from gone
+- `main` stays a known-good reference
+
+On `main` directly, a bad run means picking commits apart by hand.
+
+## Commit messages are the loop's memory
+
+Each iteration starts with a fresh context and gets **the last five commit messages**
+as its only record of what happened before. That's why `prompts/implement.md` asks
+for the issue id and the reasoning. If you edit that prompt, keep that part — an
+agent that writes "fix stuff" has told the next iteration nothing.
+
+## Reading what happened
+
+```bash
+git log --oneline main..HEAD            # what the agent did
+git log --stat -1                       # what the last commit touched
+git diff main..HEAD -- src/             # the actual changes
+```
+
+If a commit looks wrong, `git revert <sha>` rather than resetting — the issue file
+is already marked `done`, and reverting keeps the history honest about what was tried.
+
+---
+
 # The workflow, one step at a time
 
 ```
@@ -238,6 +300,24 @@ Each time you find something, edit `prompts/implement.md` to prevent it, then ru
 again. **Three or four rounds is normal.** Every fix here is one you don't discover
 at 3am across ten unattended iterations.
 
+**Run it sandboxed.** This matters more than it looks:
+
+```bash
+./scripts/sandbox.sh ./scripts/once.sh
+```
+
+On the host, the agent runs with `acceptEdits`, which auto-approves **file edits
+only** — every Bash command still prompts. So an unattended agent can plan and write
+files but cannot run `npm`, `npx`, or your tests, and will correctly stop rather than
+guess. You'll see it report a blocker like *"requires human approval for any
+invocation of npm/npx, and no human is available"*.
+
+Inside the container it uses `bypassPermissions`, which approves Bash too. That's
+only defensible there, because the blast radius is one bind-mounted repo.
+
+Running on the host is fine if you're sitting there approving prompts — useful for
+the first run or two, when you want to see every command before it executes.
+
 **How long:** 5–20 minutes per run.
 
 **Where the log is:** `.agent-logs/once-<timestamp>.log`, and on screen.
@@ -245,10 +325,15 @@ at 3am across ten unattended iterations.
 **Options:**
 
 ```bash
-./scripts/once.sh --dry-run    # print the assembled prompt, run nothing
+./scripts/once.sh --dry-run       # print the assembled prompt, run nothing
+./scripts/once.sh --allow-dirty   # skip the dirty-tree pause
 ```
 
 Use `--dry-run` when you want to see exactly what the agent will be told.
+
+**If it warns that the tree is dirty:** commit or stash first. The agent commits
+with `git add -A`, so your uncommitted work lands inside its commit. See "git
+hygiene" above.
 
 **Move on when:** two consecutive runs produce work you'd have accepted in review.
 
@@ -316,8 +401,15 @@ the summary and review the commits.
 review with:  ./scripts/review.sh abc1234..def5678
 ```
 
-**Before you start:** commit or stash your own work — the agent commits into the same
-branch. And set a spend limit at your provider.
+**Before you start:** the tree must be clean — `loop.sh` refuses otherwise, because
+across several unattended iterations your uncommitted work would be absorbed into
+the agent's commits repeatedly. Be on a feature branch, not `main`. And set a spend
+limit at your provider.
+
+```bash
+git checkout -b feat/whatever
+git status                     # empty
+```
 
 ---
 

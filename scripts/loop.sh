@@ -21,6 +21,7 @@ while [[ $# -gt 0 ]]; do
     --max-iterations) MAX_ITERATIONS="${2:?}"; shift 2 ;;
     --max-minutes)    MAX_MINUTES="${2:?}";    shift 2 ;;
     --no-sandbox-warning) WARN_SANDBOX=0; shift ;;
+    --allow-dirty) ALLOW_DIRTY=1; export ALLOW_DIRTY; shift ;;
     -h|--help) sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) die "unknown argument: $1" ;;
   esac
@@ -38,6 +39,26 @@ if (( WARN_SANDBOX )) && [[ ! -f /.dockerenv ]] && [[ -z "${AFK_SANDBOXED:-}" ]]
   warn "prefer:  ./scripts/sandbox.sh ./scripts/loop.sh"
   warn "continuing in 5s — ctrl-c to stop"
   sleep 5
+fi
+
+# Unattended runs refuse a dirty tree outright. once.sh only warns, because there
+# you're watching and can judge. Here you are not: your uncommitted work would be
+# absorbed into the agent's commits across several iterations, and untangling that
+# afterwards is genuinely painful.
+dirty="$(git -C "$REPO_ROOT" status --porcelain)"
+if [[ -n "$dirty" ]] && [[ -z "${ALLOW_DIRTY:-}" ]]; then
+  n="$(printf '%s\n' "$dirty" | wc -l | tr -d ' ')"
+  warn "refusing to start: $n uncommitted file(s)"
+  note "the agent commits with 'git add -A' on every green iteration, so your"
+  note "work would end up inside its commits, unattended, several times over."
+  note ""
+  printf '%s\n' "$dirty" | head -10 | sed 's/^/       /' >&2
+  (( n > 10 )) && note "... and $(( n - 10 )) more"
+  note ""
+  note "  git add -A && git commit -m 'wip'     keep it"
+  note "  git stash                             set it aside"
+  note "  ./scripts/loop.sh --allow-dirty       proceed anyway"
+  exit 1
 fi
 
 deadline=$(( $(date +%s) + MAX_MINUTES * 60 ))

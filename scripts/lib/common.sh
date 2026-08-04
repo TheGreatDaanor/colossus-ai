@@ -4,6 +4,11 @@
 
 set -euo pipefail
 
+# Bumped whenever a script starts depending on something new in here. Scripts
+# assert a minimum, so a half-updated repo fails with an instruction rather than
+# "command not found" from a helper that does not exist yet.
+KIT_LIB_VERSION=2
+
 # ---------------------------------------------------------------- paths + config
 
 LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -18,7 +23,23 @@ STANDARDS_FILE="${STANDARDS_FILE:-$REPO_ROOT/.claude/skills/coding-standards/SKI
 AGENT_BIN="${AGENT_BIN:-claude}"
 IMPLEMENT_MODEL="${IMPLEMENT_MODEL:-sonnet}"
 REVIEW_MODEL="${REVIEW_MODEL:-opus}"
-PERMISSION_MODE="${PERMISSION_MODE:-acceptEdits}"
+# Permission mode has to match the environment, and getting it wrong is silent:
+#
+#   acceptEdits        auto-approves FILE EDITS ONLY. Bash still prompts. An
+#                      unattended agent therefore cannot run your tests, and will
+#                      correctly refuse to proceed rather than guess.
+#   bypassPermissions  approves everything, including Bash. Necessary for an
+#                      unattended loop — and only defensible inside a container,
+#                      where the blast radius is one bind-mounted repo.
+#
+# So: sandboxed -> bypass; on the host -> acceptEdits, and expect Bash prompts.
+if [[ -z "${PERMISSION_MODE:-}" ]]; then
+  if [[ -f /.dockerenv || -n "${AFK_SANDBOXED:-}" ]]; then
+    PERMISSION_MODE="bypassPermissions"
+  else
+    PERMISSION_MODE="acceptEdits"
+  fi
+fi
 
 SENTINEL="${SENTINEL:-NO MORE TASKS}"
 COMMIT_CONTEXT="${COMMIT_CONTEXT:-5}"
@@ -28,10 +49,28 @@ COMMIT_CONTEXT="${COMMIT_CONTEXT:-5}"
 _c() { if [[ -t 2 ]]; then printf '\033[%sm' "$1" >&2; fi; }
 log()  { _c '2;37'; printf '[%s] ' "$(date +%H:%M:%S)"; _c '0'; printf '%s\n' "$*" >&2; }
 warn() { _c '33';   printf 'warn: %s\n' "$*" >&2; _c '0'; }
+note() { _c '2';    printf '       %s\n' "$*" >&2; _c '0'; }
 die()  { _c '31';   printf 'error: %s\n' "$*" >&2; _c '0'; exit 1; }
 
 require() {
   command -v "$1" >/dev/null 2>&1 || die "required command not found: $1"
+}
+
+# require_lib <min-version> — call right after sourcing, if the script relies on
+# helpers added after v1. Turns a cryptic "command not found" into a fix.
+require_lib() {
+  local need="$1"
+  if (( ${KIT_LIB_VERSION:-0} < need )); then
+    printf 'error: scripts/lib/common.sh is out of date (have v%s, need v%s)\n' \
+      "${KIT_LIB_VERSION:-0}" "$need" >&2
+    printf '       the kit updates as a set — copying one script across leaves\n' >&2
+    printf '       the shared library behind. Re-install over the top:\n\n' >&2
+    printf '           /path/to/ai-eng-workspace/install.sh %s --force\n\n' "$REPO_ROOT" >&2
+    printf '       --force never touches CLAUDE.md, your coding-standards, local.env\n' >&2
+    printf '       or issues/. It backs up prompts/ and the Dockerfile before\n' >&2
+    printf '       replacing them, so tuning is recoverable from the .bak files.\n' >&2
+    exit 1
+  fi
 }
 
 require_repo() {
