@@ -41,7 +41,9 @@ the rationale in code.
 - [ ] Visible at: scan a target whose mocked fetch response is missing all
       four headers and has an insecure cookie → `curl localhost:PORT/scans/:id`
       shows 5 Finding rows with `category`, `severity`, and
-      `confidence: "definitive"`.
+      `confidence: "definitive"` — same 5 rows appear in the target's findings
+      sub-table on `http://localhost:PORT/dashboard/scans/:id` ([[001]]),
+      with no changes needed to `dashboard.ts`.
 
 ## Out of scope
 

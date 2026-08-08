@@ -35,7 +35,8 @@ served over plain `http://`, now shows a corresponding Finding, and
 - [ ] Visible at: scan three mocked targets (TLS 1.0, cert expiring in 10
       days, plain `http://`) → `curl localhost:PORT/scans/:id` shows each
       target's corresponding Finding and populated `tls_version`/
-      `tls_cert_expires_at` where applicable.
+      `tls_cert_expires_at` where applicable — same findings appear in the
+      dashboard detail view ([[001]]).
 
 ## Out of scope
 

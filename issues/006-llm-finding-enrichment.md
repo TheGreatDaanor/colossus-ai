@@ -43,7 +43,8 @@ findings exist, regardless of which detector made them).
 - [ ] `test`, `typecheck`, `lint` all pass
 - [ ] Visible at: test seeds a scan with fixture Finding rows, mocks the
       Anthropic call, and `curl localhost:PORT/scans/:id` shows
-      `explanation`/`suggested_fix` populated; a second identical
+      `explanation`/`suggested_fix` populated — same text renders in the
+      findings sub-table on the dashboard ([[001]]); a second identical
       finding-set in the same scan doesn't trigger a second LLM call
       (assert via mock call count).
 
