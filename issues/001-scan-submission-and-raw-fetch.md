@@ -83,9 +83,40 @@ with no new visual judgment call.
   return richer data — none of them touch `dashboard.ts` again. Server-rendered
   HTML via template literals, no client JS, no CSS framework, no new
   dependency — reads the same `ScannerService` as the JSON routes.
-- Infra: add an HTTP framework, `drizzle-orm`, and a SQLite driver as
-  dependencies; Drizzle config and migration generation (never hand-edit
-  generated files under `src/db/migrations/`).
+- Infra: add Hono, `drizzle-orm`, and `better-sqlite3` as dependencies; Drizzle
+  config and migration generation (never hand-edit generated files under
+  `src/db/migrations/`). Pending migrations auto-run on server startup. DB
+  file path via `DB_PATH` env var (default `./data/scanner.db`, gitignored).
+  Server port via `PORT` env var (hardcoded fallback default).
+
+## Implementation decisions specific to this slice
+
+- Fetch concurrency: hand-rolled batching (chunks of 10, `Promise.all` per
+  chunk), cap is per-scan not global.
+- URL dedup: exact string match, no normalization.
+- Malformed/disallowed-scheme URLs still get a `scan_targets` row
+  (`status: 'invalid'`) rather than being dropped silently.
+- `scans.status: 'failed'` fires only when zero URLs are valid after
+  per-URL validation; an empty `urls: []` array is instead rejected at
+  submission with `400` (nothing was submitted to attempt). Any scan with
+  at least one processed target — however bad — is `status: 'completed'`.
+- Validation failures return `400` with `{ error: string }`.
+- Default scan name (when omitted): human-readable local timestamp, e.g.
+  `Scan 2026-08-08 14:32:00`.
+- `response_headers` stored with lowercased keys.
+- `created_at`/`completed_at` use Drizzle's integer unix-ms
+  `mode: 'timestamp'`.
+- Redirects (3xx) captured via `fetch(..., { redirect: 'manual' })`,
+  classified as `status: 'ok'` with `redirect_location` set — no separate
+  `'redirected'` status.
+- `response_time_ms` is `null` on timeout.
+- Scans run as an unawaited in-process async function (fire-and-forget,
+  no queue); a process restart mid-scan leaves it stuck at `'running'`
+  with no recovery in v1.
+- Console log line per URL is plain text, not structured JSON.
+- Dashboard has no auto-refresh — manual reload only.
+- `ScannerService`'s fetch call is a constructor-injected parameter
+  (default: global `fetch`); route tests use Hono's `app.request()`.
 
 ## Definition of done
 
