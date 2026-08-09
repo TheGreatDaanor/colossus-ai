@@ -1,7 +1,7 @@
 ---
 id: 001
 title: Accept a scan, fetch targets, and show raw results on a dashboard
-status: open
+status: done
 type: human
 blocked-by: []
 ---
