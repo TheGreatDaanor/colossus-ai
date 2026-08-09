@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 import { createDb } from '../db/client.js';
-import { ScannerService, ScanValidationError, type FetchImpl } from './scanner.js';
+import { ScannerService, ScanValidationError, isDisallowedAddress, type FetchImpl } from './scanner.js';
 
 function deferred<T>(): { promise: Promise<T>; resolve: (v: T) => void } {
   let resolve!: (v: T) => void;
@@ -115,6 +115,26 @@ describe('ScannerService', () => {
     expect(target?.redirectLocation).toBe('https://example.com/new');
   });
 
+  it('gives a target on a private/loopback/link-local/metadata IP an invalid status without fetching it', async () => {
+    const fetchImpl: FetchImpl = vi.fn(async () => okResponse());
+    const svc = new ScannerService(createDb(':memory:'), { fetchImpl });
+
+    const scan = await svc.startScan(['http://127.0.0.1', 'http://169.254.169.254']);
+
+    const completed = await vi.waitFor(async () => {
+      const s = await svc.getScan(scan.id);
+      if (!s || s.status !== 'completed') throw new Error('not yet completed');
+      return s;
+    });
+
+    expect(completed.targets).toHaveLength(2);
+    for (const target of completed.targets) {
+      expect(target.status).toBe('invalid');
+      expect(target.error).toBeTruthy();
+    }
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
+
   it('gives a malformed or disallowed-scheme URL an invalid target without fetching it', async () => {
     const fetchImpl: FetchImpl = vi.fn(async () => okResponse());
     const svc = new ScannerService(createDb(':memory:'), { fetchImpl });
@@ -190,5 +210,51 @@ describe('ScannerService', () => {
     });
 
     expect(maxInFlight).toBeLessThanOrEqual(3);
+  });
+});
+
+describe('isDisallowedAddress', () => {
+  it('flags IPv4 loopback addresses', () => {
+    expect(isDisallowedAddress('127.0.0.1')).toBe(true);
+    expect(isDisallowedAddress('127.255.255.255')).toBe(true);
+  });
+
+  it('flags IPv4 private ranges', () => {
+    expect(isDisallowedAddress('10.0.0.1')).toBe(true);
+    expect(isDisallowedAddress('172.16.0.1')).toBe(true);
+    expect(isDisallowedAddress('172.31.255.255')).toBe(true);
+    expect(isDisallowedAddress('192.168.1.1')).toBe(true);
+  });
+
+  it('flags IPv4 link-local addresses, including the cloud metadata address', () => {
+    expect(isDisallowedAddress('169.254.169.254')).toBe(true);
+    expect(isDisallowedAddress('169.254.0.1')).toBe(true);
+  });
+
+  it('allows public IPv4 addresses', () => {
+    expect(isDisallowedAddress('8.8.8.8')).toBe(false);
+    expect(isDisallowedAddress('93.184.216.34')).toBe(false);
+  });
+
+  it('flags the IPv6 loopback address', () => {
+    expect(isDisallowedAddress('::1')).toBe(true);
+  });
+
+  it('flags IPv6 link-local addresses', () => {
+    expect(isDisallowedAddress('fe80::1')).toBe(true);
+  });
+
+  it('flags IPv6 unique-local (private) addresses', () => {
+    expect(isDisallowedAddress('fd00::1')).toBe(true);
+    expect(isDisallowedAddress('fc00::1')).toBe(true);
+  });
+
+  it('allows public IPv6 addresses', () => {
+    expect(isDisallowedAddress('2606:4700:4700::1111')).toBe(false);
+  });
+
+  it('flags IPv4-mapped IPv6 addresses that embed a disallowed IPv4 address', () => {
+    expect(isDisallowedAddress('::ffff:127.0.0.1')).toBe(true);
+    expect(isDisallowedAddress('::ffff:169.254.169.254')).toBe(true);
   });
 });
