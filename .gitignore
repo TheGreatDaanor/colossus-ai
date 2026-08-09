@@ -4,3 +4,6 @@
 .afk-worktrees/
 node_modules/
 node_modules/
+
+# scanner SQLite data
+data/

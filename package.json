@@ -13,11 +13,19 @@
     "build": "tsc -p tsconfig.build.json"
   },
   "devDependencies": {
+    "@types/better-sqlite3": "^9.6.0",
     "@types/node": "^22.10.0",
+    "drizzle-kit": "^0.31.10",
     "eslint": "^9.17.0",
     "tsx": "^4.19.0",
     "typescript": "^5.7.0",
     "typescript-eslint": "^8.18.0",
     "vitest": "^2.1.0"
+  },
+  "dependencies": {
+    "@hono/node-server": "^2.1.0",
+    "better-sqlite3": "^13.0.3",
+    "drizzle-orm": "^0.45.2",
+    "hono": "^4.13.1"
   }
 }

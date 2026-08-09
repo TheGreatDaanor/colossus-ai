@@ -1,7 +1,7 @@
 ---
 id: 002
 title: Reject targets on private/loopback/link-local/metadata IPs (SSRF guard)
-status: open
+status: done
 type: afk
 blocked-by: [001]
 ---
@@ -32,7 +32,7 @@ operator's internal network.
 - [ ] Failing test written first, confirmed red
 - [ ] Implementation makes it green
 - [ ] `test`, `typecheck`, `lint` all pass
-- [ ] Visible at: `curl -X POST localhost:PORT/scans -d '{"urls":["http://127.0.0.1","http://169.254.169.254"]}'` then `curl localhost:PORT/scans/:id` shows both targets with `status: "invalid"` and an explanatory `error`, and the injected fetch mock in tests asserts it was never called for those targets.
+- [ ] Visible at: `curl -X POST localhost:PORT/scans -d '{"urls":["http://127.0.0.1","http://169.254.169.254"]}'` then `curl localhost:PORT/scans/:id` (or `http://localhost:PORT/dashboard/scans/:id` in a browser, using the dashboard from [[001]]) shows both targets with `status: "invalid"` and an explanatory `error`, and the injected fetch mock in tests asserts it was never called for those targets.
 
 ## Out of scope
 

@@ -30,7 +30,10 @@ per-finding detail.
 - [ ] `test`, `typecheck`, `lint` all pass
 - [ ] Visible at: test seeds fixture findings of mixed severities on a scan;
       `curl localhost:PORT/scans/:id` response includes a
-      `findings_by_severity` block with correct counts per level.
+      `findings_by_severity` block with correct counts per level. (This
+      summary block isn't rendered on the dashboard — [[001]]'s template only
+      covers per-target/per-finding detail; adding it there is optional
+      follow-up polish, not required for this issue's DoD.)
 
 ## Out of scope
 

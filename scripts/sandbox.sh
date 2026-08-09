@@ -14,6 +14,21 @@
 set -euo pipefail
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/common.sh"
 
+# Guard against a half-updated repo: an older lib/common.sh lacks helpers used
+# below, and would fail with a cryptic "command not found" mid-run. Tests a
+# variable, not a function, so it also works against a lib that predates both.
+if (( ${KIT_LIB_VERSION:-0} < 2 )); then
+  printf 'error: scripts/lib/common.sh is out of date (have v%s, need v2)\n' "${KIT_LIB_VERSION:-0}" >&2
+  printf '       the kit updates as a SET. Copying one script across leaves the\n' >&2
+  printf '       shared library behind. Re-install over the top:\n\n' >&2
+  printf '           /path/to/ai-eng-workspace/install.sh "%s" --force\n\n' "$REPO_ROOT" >&2
+  printf '       --force never touches CLAUDE.md, coding-standards, local.env or\n' >&2
+  printf '       issues/. It backs up prompts/ and the Dockerfile before replacing\n' >&2
+  printf '       them, so any tuning is recoverable from the .bak files.\n' >&2
+  exit 1
+fi
+
+
 require docker
 require_repo
 
@@ -82,6 +97,21 @@ if [[ -n "${ANTHROPIC_API_KEY:-}${ANTHROPIC_AUTH_TOKEN:-}" ]]; then
   fi
 elif [[ -f "$CLAUDE_CREDS" ]]; then
   # Mount the login read-only so the container inherits the subscription session.
+  #
+  # The image must already contain /home/agent/.claude owned by the agent. If it
+  # doesn't, Docker creates that parent as root and every Bash call in the
+  # container then dies with EACCES on .claude/session-env. Check rather than
+  # assume, because the symptom points nowhere near the cause.
+  if ! docker run --rm "$IMAGE" test -w /home/agent/.claude 2>/dev/null; then
+    warn "the image has no writable /home/agent/.claude"
+    note "mounting credentials would make Docker create it as root, and every"
+    note "Bash command inside would fail with:"
+    note "    EACCES: permission denied, mkdir '/home/agent/.claude/session-env'"
+    note ""
+    note "rebuild with the current Dockerfile, which creates and chowns it:"
+    note "    ./scripts/sandbox.sh --rebuild"
+    die "refusing to mount credentials into an image that cannot use them"
+  fi
   cred_args=(-v "$CLAUDE_CREDS:/home/agent/.claude/.credentials.json:ro")
   log "no API key — forwarding your claude.ai login (subscription billing)"
 else

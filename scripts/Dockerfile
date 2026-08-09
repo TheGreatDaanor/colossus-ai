@@ -24,12 +24,8 @@ RUN curl -LsSf https://astral.sh/uv/install.sh | env UV_INSTALL_DIR=/usr/local/b
 RUN npm install -g @anthropic-ai/claude-code
 
 # ---- project toolchain: add anything your test/typecheck/lint commands need ----
-RUN corepack enable && corepack prepare pnpm@latest --activate
-RUN apt-get update && apt-get install -y --no-install-recommends \
-      postgresql-client libpq-dev \
-    && rm -rf /var/lib/apt/lists/*
-RUN uv venv /opt/venv && . /opt/venv/bin/activate
-RUN apt-get update && apt-get install -y --no-install-recommends golang-go && rm -rf /var/lib/apt/lists/*
+# RUN corepack enable && corepack prepare pnpm@latest --activate
+# RUN apt-get update && apt-get install -y postgresql-client
 # -------------------------------------------------------------------------------
 
 # Non-root, with a uid that maps cleanly onto a Linux host bind mount, so files
@@ -49,12 +45,17 @@ RUN apt-get update && apt-get install -y --no-install-recommends golang-go && rm
 #   - otherwise create `agent`
 #   - always own /home/agent: npm, git and the agent CLI write there, and
 #     without it they fail in ways that are hard to trace back to here
+#
+# /home/agent/.claude MUST exist and be owned here. sandbox.sh may bind-mount a
+# credentials file into it, and Docker creates any missing parent directory as
+# root — after which the agent (uid $UID) cannot mkdir its session-env, and
+# EVERY Bash call fails with EACCES before the command even runs.
 ARG UID=1001
 ARG GID=1001
 RUN set -eux; \
     if ! getent group "$GID" >/dev/null; then groupadd -g "$GID" agent; fi; \
     if ! getent passwd "$UID" >/dev/null; then useradd -u "$UID" -g "$GID" -M -s /bin/bash agent; fi; \
-    mkdir -p /home/agent/.cache /home/agent/.config; \
+    mkdir -p /home/agent/.cache /home/agent/.config /home/agent/.claude; \
     chown -R "$UID:$GID" /home/agent; \
     echo "container user resolved to uid=$UID gid=$GID ($(getent passwd "$UID" | cut -d: -f1))"
 
