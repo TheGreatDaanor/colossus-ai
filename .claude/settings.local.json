@@ -5,7 +5,8 @@
       "Bash(grep -n -iC2 \"scan\" /home/daanorai/colossus-ai/.claude/skills/improve-codebase-architecture/SKILL.md)",
       "Bash(npx vitest *)",
       "Bash(git add *)",
-      "Bash(git commit -m ' *)"
+      "Bash(git commit -m ' *)",
+      "Bash(npx eslint .)" 
     ]
   }
 }

@@ -1,6 +1,12 @@
 import { describe, expect, it, vi } from 'vitest';
 import { createDb } from '../db/client.js';
-import { ScannerService, ScanValidationError, isDisallowedAddress, type FetchImpl } from './scanner.js';
+import {
+  ScannerService,
+  ScanValidationError,
+  isDisallowedAddress,
+  detectHeaderFindings,
+  type FetchImpl,
+} from './scanner.js';
 
 function deferred<T>(): { promise: Promise<T>; resolve: (v: T) => void } {
   let resolve!: (v: T) => void;
@@ -113,6 +119,39 @@ describe('ScannerService', () => {
     expect(target?.status).toBe('ok');
     expect(target?.statusCode).toBe(302);
     expect(target?.redirectLocation).toBe('https://example.com/new');
+  });
+
+  it('records a Finding per missing security header and one for an insecure cookie', async () => {
+    const fetchImpl: FetchImpl = vi.fn(
+      async () =>
+        new Response(null, {
+          status: 200,
+          headers: { 'set-cookie': 'session=abc123' },
+        }),
+    );
+    const svc = new ScannerService(createDb(':memory:'), { fetchImpl });
+    const scan = await svc.startScan(['https://example.com']);
+
+    const completed = await vi.waitFor(async () => {
+      const s = await svc.getScan(scan.id);
+      if (!s || s.status !== 'completed') throw new Error('not yet completed');
+      return s;
+    });
+
+    const [target] = completed.targets;
+    expect(target?.findings).toHaveLength(5);
+    expect(target?.findings.map((f) => f.category).sort()).toEqual(
+      [
+        'insecure-cookie',
+        'missing-csp',
+        'missing-hsts',
+        'missing-x-content-type-options',
+        'missing-x-frame-options',
+      ].sort(),
+    );
+    for (const finding of target?.findings ?? []) {
+      expect(finding.confidence).toBe('definitive');
+    }
   });
 
   it('gives a target on a private/loopback/link-local/metadata IP an invalid status without fetching it', async () => {
@@ -256,5 +295,48 @@ describe('isDisallowedAddress', () => {
   it('flags IPv4-mapped IPv6 addresses that embed a disallowed IPv4 address', () => {
     expect(isDisallowedAddress('::ffff:127.0.0.1')).toBe(true);
     expect(isDisallowedAddress('::ffff:169.254.169.254')).toBe(true);
+  });
+});
+
+describe('detectHeaderFindings', () => {
+  it('flags a response missing all four security headers', () => {
+    const result = detectHeaderFindings({});
+
+    expect(result.map((f) => f.category).sort()).toEqual(
+      ['missing-csp', 'missing-hsts', 'missing-x-content-type-options', 'missing-x-frame-options'].sort(),
+    );
+    for (const finding of result) {
+      expect(finding.confidence).toBe('definitive');
+    }
+  });
+
+  it('does not flag any of the four headers when all are present', () => {
+    const result = detectHeaderFindings({
+      'content-security-policy': "default-src 'self'",
+      'x-frame-options': 'DENY',
+      'x-content-type-options': 'nosniff',
+      'strict-transport-security': 'max-age=63072000',
+    });
+
+    expect(result).toHaveLength(0);
+  });
+
+  it('flags a Set-Cookie header missing Secure, HttpOnly, and SameSite as insecure', () => {
+    const result = detectHeaderFindings({ 'set-cookie': 'session=abc123' });
+
+    const cookieFinding = result.find((f) => f.category === 'insecure-cookie');
+    expect(cookieFinding).toMatchObject({ severity: 'medium', confidence: 'definitive' });
+  });
+
+  it('does not flag a Set-Cookie header that has Secure, HttpOnly, and SameSite set', () => {
+    const result = detectHeaderFindings({ 'set-cookie': 'session=abc123; Secure; HttpOnly; SameSite=Strict' });
+
+    expect(result.find((f) => f.category === 'insecure-cookie')).toBeUndefined();
+  });
+
+  it('does not flag a cookie when no Set-Cookie header is present', () => {
+    const result = detectHeaderFindings({ 'content-security-policy': "default-src 'self'" });
+
+    expect(result.find((f) => f.category === 'insecure-cookie')).toBeUndefined();
   });
 });

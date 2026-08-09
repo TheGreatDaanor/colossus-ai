@@ -2,7 +2,14 @@ import { lookup } from 'node:dns/promises';
 import { isIP } from 'node:net';
 import { eq } from 'drizzle-orm';
 import type { Db } from '../db/client.js';
-import { scans, scanTargets, findings, type ScanTargetStatus } from '../db/schema.js';
+import {
+  scans,
+  scanTargets,
+  findings,
+  type ScanTargetStatus,
+  type FindingSeverity,
+  type FindingConfidence,
+} from '../db/schema.js';
 
 export class ScanValidationError extends Error {}
 
@@ -139,6 +146,44 @@ function lowercaseHeaders(headers: Headers): Record<string, string> {
   return out;
 }
 
+export type HeaderFinding = {
+  category: string;
+  severity: FindingSeverity;
+  confidence: FindingConfidence;
+};
+
+// Severity is not pinned by the PRD beyond the five-value scale, so this is a
+// judgment call: missing HSTS/CSP allow the broadest attacks (no encryption
+// enforcement / arbitrary script injection) so they skew high; framing and
+// MIME-sniffing protections are narrower in impact, so they sit lower.
+const MISSING_HEADER_FINDINGS: { header: string; category: string; severity: FindingSeverity }[] = [
+  { header: 'content-security-policy', category: 'missing-csp', severity: 'high' },
+  { header: 'strict-transport-security', category: 'missing-hsts', severity: 'high' },
+  { header: 'x-frame-options', category: 'missing-x-frame-options', severity: 'medium' },
+  { header: 'x-content-type-options', category: 'missing-x-content-type-options', severity: 'low' },
+];
+
+function isCookieSecure(setCookie: string): boolean {
+  const attributes = setCookie.split(';').map((part) => part.trim().toLowerCase());
+  const hasSecure = attributes.includes('secure');
+  const hasHttpOnly = attributes.includes('httponly');
+  const hasSameSite = attributes.some((attr) => attr.startsWith('samesite='));
+  return hasSecure && hasHttpOnly && hasSameSite;
+}
+
+export function detectHeaderFindings(headers: Record<string, string>): HeaderFinding[] {
+  const result: HeaderFinding[] = MISSING_HEADER_FINDINGS.filter(({ header }) => !(header in headers)).map(
+    ({ category, severity }) => ({ category, severity, confidence: 'definitive' }),
+  );
+
+  const setCookie = headers['set-cookie'];
+  if (setCookie !== undefined && !isCookieSecure(setCookie)) {
+    result.push({ category: 'insecure-cookie', severity: 'medium', confidence: 'definitive' });
+  }
+
+  return result;
+}
+
 export type FetchImpl = (url: string, init: RequestInit) => Promise<Response>;
 
 export class ScannerService {
@@ -270,18 +315,26 @@ export class ScannerService {
       const elapsed = Math.round(performance.now() - start);
       const status: ScanTargetStatus = 'ok';
       const redirectLocation = response.headers.get('location');
+      const responseHeaders = lowercaseHeaders(response.headers);
 
       this.#db
         .update(scanTargets)
         .set({
           status,
           statusCode: response.status,
-          responseHeaders: lowercaseHeaders(response.headers),
+          responseHeaders,
           responseTimeMs: elapsed,
           redirectLocation: redirectLocation ?? null,
         })
         .where(eq(scanTargets.id, target.id))
         .run();
+
+      for (const finding of detectHeaderFindings(responseHeaders)) {
+        this.#db
+          .insert(findings)
+          .values({ scanTargetId: target.id, ...finding })
+          .run();
+      }
 
       console.warn(`[scan ${target.scanId}] ${target.url} succeeded`);
     } catch (err) {
