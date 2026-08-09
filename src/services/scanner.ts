@@ -1,5 +1,6 @@
 import { lookup } from 'node:dns/promises';
 import { isIP } from 'node:net';
+import { connect as tlsConnect } from 'node:tls';
 import { eq } from 'drizzle-orm';
 import type { Db } from '../db/client.js';
 import {
@@ -184,22 +185,78 @@ export function detectHeaderFindings(headers: Record<string, string>): HeaderFin
   return result;
 }
 
+export type TlsInfo = { version: string; certExpiresAt: Date };
+export type TlsFinding = { category: string; severity: FindingSeverity; confidence: FindingConfidence };
+
+const OUTDATED_TLS_VERSIONS = new Set(['TLSv1', 'TLSv1.1']);
+const CERT_EXPIRY_WARNING_DAYS = 30;
+const MS_PER_DAY = 1000 * 60 * 60 * 24;
+
+export const NO_TLS_FINDING: TlsFinding = { category: 'no-tls', severity: 'high', confidence: 'definitive' };
+
+export function detectTlsFindings(info: TlsInfo, now: Date = new Date()): TlsFinding[] {
+  const result: TlsFinding[] = [];
+
+  if (OUTDATED_TLS_VERSIONS.has(info.version)) {
+    result.push({ category: 'outdated-tls', severity: 'high', confidence: 'definitive' });
+  }
+
+  const daysUntilExpiry = (info.certExpiresAt.getTime() - now.getTime()) / MS_PER_DAY;
+  if (daysUntilExpiry <= CERT_EXPIRY_WARNING_DAYS) {
+    result.push({ category: 'cert-expiring-soon', severity: 'medium', confidence: 'definitive' });
+  }
+
+  return result;
+}
+
+export type TlsCheckImpl = (hostname: string, port: number) => Promise<TlsInfo>;
+
+function defaultTlsCheck(hostname: string, port: number, timeoutMs: number): Promise<TlsInfo> {
+  return new Promise((resolve, reject) => {
+    const socket = tlsConnect({ host: hostname, port, servername: hostname, timeout: timeoutMs }, () => {
+      const version = socket.getProtocol();
+      const cert = socket.getPeerCertificate();
+      socket.end();
+
+      if (version === null || !cert.valid_to) {
+        reject(new Error(`unable to read TLS info for ${hostname}:${port}`));
+        return;
+      }
+      resolve({ version, certExpiresAt: new Date(cert.valid_to) });
+    });
+
+    socket.on('error', reject);
+    socket.on('timeout', () => {
+      socket.destroy();
+      reject(new Error(`TLS handshake to ${hostname}:${port} timed out`));
+    });
+  });
+}
+
 export type FetchImpl = (url: string, init: RequestInit) => Promise<Response>;
 
 export class ScannerService {
   readonly #db: Db;
   readonly #fetchImpl: FetchImpl;
+  readonly #tlsCheckImpl: TlsCheckImpl;
   readonly #timeoutMs: number;
   readonly #concurrency: number;
 
   constructor(
     db: Db,
-    options: { fetchImpl?: FetchImpl; timeoutMs?: number; concurrency?: number } = {},
+    options: {
+      fetchImpl?: FetchImpl;
+      tlsCheckImpl?: TlsCheckImpl;
+      timeoutMs?: number;
+      concurrency?: number;
+    } = {},
   ) {
     this.#db = db;
     this.#fetchImpl = options.fetchImpl ?? fetch;
     this.#timeoutMs = options.timeoutMs ?? 10_000;
     this.#concurrency = options.concurrency ?? 10;
+    this.#tlsCheckImpl =
+      options.tlsCheckImpl ?? ((hostname, port) => defaultTlsCheck(hostname, port, this.#timeoutMs));
   }
 
   async startScan(urls: string[], options: StartScanOptions = {}): Promise<Scan> {
@@ -287,7 +344,8 @@ export class ScannerService {
   async #processTarget(target: ScanTarget): Promise<void> {
     console.warn(`[scan ${target.scanId}] ${target.url} started`);
 
-    const hostname = new URL(target.url).hostname;
+    const targetUrl = new URL(target.url);
+    const hostname = targetUrl.hostname;
     const disallowedAddress = await findDisallowedAddress(hostname);
     if (disallowedAddress !== null) {
       this.#db
@@ -334,6 +392,38 @@ export class ScannerService {
           .insert(findings)
           .values({ scanTargetId: target.id, ...finding })
           .run();
+      }
+
+      if (targetUrl.protocol === 'http:') {
+        this.#db
+          .insert(findings)
+          .values({ scanTargetId: target.id, ...NO_TLS_FINDING })
+          .run();
+      } else {
+        // TLS-check failures degrade gracefully (target stays `ok`, TLS columns/findings
+        // are just skipped) rather than failing the target — mirrors the CVE-lookup
+        // degrade-on-failure behavior planned for 005, and keeps one bad handshake from
+        // aborting the whole concurrency batch via an unhandled rejection in #runScan.
+        try {
+          const port = targetUrl.port ? Number(targetUrl.port) : 443;
+          const tlsInfo = await this.#tlsCheckImpl(hostname, port);
+
+          this.#db
+            .update(scanTargets)
+            .set({ tlsVersion: tlsInfo.version, tlsCertExpiresAt: tlsInfo.certExpiresAt })
+            .where(eq(scanTargets.id, target.id))
+            .run();
+
+          for (const finding of detectTlsFindings(tlsInfo)) {
+            this.#db
+              .insert(findings)
+              .values({ scanTargetId: target.id, ...finding })
+              .run();
+          }
+        } catch (tlsErr) {
+          const message = tlsErr instanceof Error ? tlsErr.message : String(tlsErr);
+          console.warn(`[scan ${target.scanId}] ${target.url} TLS check failed: ${message}`);
+        }
       }
 
       console.warn(`[scan ${target.scanId}] ${target.url} succeeded`);

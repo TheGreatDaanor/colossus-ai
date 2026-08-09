@@ -5,7 +5,9 @@ import {
   ScanValidationError,
   isDisallowedAddress,
   detectHeaderFindings,
+  detectTlsFindings,
   type FetchImpl,
+  type TlsCheckImpl,
 } from './scanner.js';
 
 function deferred<T>(): { promise: Promise<T>; resolve: (v: T) => void } {
@@ -16,6 +18,14 @@ function deferred<T>(): { promise: Promise<T>; resolve: (v: T) => void } {
 
 function okResponse(body: Record<string, string> = { 'x-test': '1' }): Response {
   return new Response(null, { status: 200, headers: body });
+}
+
+// Every test above the `detectTlsFindings`/TLS-specific block exercises https
+// targets incidentally, not the TLS check itself — inject a fast, deterministic
+// stand-in so those tests never open a real socket (per the issue's "no real
+// sockets in tests" testing decision) and stay fast/offline-safe.
+function okTlsCheckImpl(): TlsCheckImpl {
+  return vi.fn(async () => ({ version: 'TLSv1.3', certExpiresAt: new Date('2099-01-01T00:00:00Z') }));
 }
 
 describe('ScannerService', () => {
@@ -42,7 +52,7 @@ describe('ScannerService', () => {
 
   it('records raw response data and completes once a fetch succeeds', async () => {
     const fetchImpl: FetchImpl = vi.fn(async () => okResponse({ 'X-Test': 'yes' }));
-    const svc = new ScannerService(createDb(':memory:'), { fetchImpl });
+    const svc = new ScannerService(createDb(':memory:'), { fetchImpl, tlsCheckImpl: okTlsCheckImpl() });
     const scan = await svc.startScan(['https://example.com']);
 
     const completed = await vi.waitFor(async () => {
@@ -106,7 +116,7 @@ describe('ScannerService', () => {
     const fetchImpl: FetchImpl = vi.fn(
       async () => new Response(null, { status: 302, headers: { location: 'https://example.com/new' } }),
     );
-    const svc = new ScannerService(createDb(':memory:'), { fetchImpl });
+    const svc = new ScannerService(createDb(':memory:'), { fetchImpl, tlsCheckImpl: okTlsCheckImpl() });
     const scan = await svc.startScan(['https://example.com']);
 
     const completed = await vi.waitFor(async () => {
@@ -129,7 +139,7 @@ describe('ScannerService', () => {
           headers: { 'set-cookie': 'session=abc123' },
         }),
     );
-    const svc = new ScannerService(createDb(':memory:'), { fetchImpl });
+    const svc = new ScannerService(createDb(':memory:'), { fetchImpl, tlsCheckImpl: okTlsCheckImpl() });
     const scan = await svc.startScan(['https://example.com']);
 
     const completed = await vi.waitFor(async () => {
@@ -154,6 +164,115 @@ describe('ScannerService', () => {
     }
   });
 
+  it('records tls_version and tls_cert_expires_at on an https target from the TLS check', async () => {
+    const fetchImpl: FetchImpl = vi.fn(async () => okResponse());
+    const certExpiresAt = new Date('2099-01-01T00:00:00Z');
+    const tlsCheckImpl: TlsCheckImpl = vi.fn(async () => ({ version: 'TLSv1.3', certExpiresAt }));
+    const svc = new ScannerService(createDb(':memory:'), { fetchImpl, tlsCheckImpl });
+
+    const scan = await svc.startScan(['https://example.com']);
+
+    const completed = await vi.waitFor(async () => {
+      const s = await svc.getScan(scan.id);
+      if (!s || s.status !== 'completed') throw new Error('not yet completed');
+      return s;
+    });
+
+    const [target] = completed.targets;
+    expect(target?.tlsVersion).toBe('TLSv1.3');
+    expect(target?.tlsCertExpiresAt).toEqual(certExpiresAt);
+  });
+
+  it('records an outdated-tls Finding for an https target on TLS below 1.2', async () => {
+    const fetchImpl: FetchImpl = vi.fn(async () => okResponse());
+    const tlsCheckImpl: TlsCheckImpl = vi.fn(async () => ({
+      version: 'TLSv1',
+      certExpiresAt: new Date('2099-01-01T00:00:00Z'),
+    }));
+    const svc = new ScannerService(createDb(':memory:'), { fetchImpl, tlsCheckImpl });
+
+    const scan = await svc.startScan(['https://example.com']);
+
+    const completed = await vi.waitFor(async () => {
+      const s = await svc.getScan(scan.id);
+      if (!s || s.status !== 'completed') throw new Error('not yet completed');
+      return s;
+    });
+
+    const [target] = completed.targets;
+    expect(target?.findings.find((f) => f.category === 'outdated-tls')).toMatchObject({
+      severity: 'high',
+      confidence: 'definitive',
+    });
+  });
+
+  it('records a cert-expiring-soon Finding for an https target with a cert expiring within 30 days', async () => {
+    const fetchImpl: FetchImpl = vi.fn(async () => okResponse());
+    const soon = new Date(Date.now() + 10 * 24 * 60 * 60 * 1000);
+    const tlsCheckImpl: TlsCheckImpl = vi.fn(async () => ({ version: 'TLSv1.3', certExpiresAt: soon }));
+    const svc = new ScannerService(createDb(':memory:'), { fetchImpl, tlsCheckImpl });
+
+    const scan = await svc.startScan(['https://example.com']);
+
+    const completed = await vi.waitFor(async () => {
+      const s = await svc.getScan(scan.id);
+      if (!s || s.status !== 'completed') throw new Error('not yet completed');
+      return s;
+    });
+
+    const [target] = completed.targets;
+    expect(target?.findings.find((f) => f.category === 'cert-expiring-soon')).toMatchObject({
+      severity: 'medium',
+      confidence: 'definitive',
+    });
+  });
+
+  it('records a no-tls Finding for a plain http:// target and skips the TLS check', async () => {
+    const fetchImpl: FetchImpl = vi.fn(async () => okResponse());
+    const tlsCheckImpl: TlsCheckImpl = vi.fn(async () => ({
+      version: 'TLSv1.3',
+      certExpiresAt: new Date('2099-01-01T00:00:00Z'),
+    }));
+    const svc = new ScannerService(createDb(':memory:'), { fetchImpl, tlsCheckImpl });
+
+    const scan = await svc.startScan(['http://example.com']);
+
+    const completed = await vi.waitFor(async () => {
+      const s = await svc.getScan(scan.id);
+      if (!s || s.status !== 'completed') throw new Error('not yet completed');
+      return s;
+    });
+
+    const [target] = completed.targets;
+    expect(target?.findings.find((f) => f.category === 'no-tls')).toMatchObject({
+      severity: 'high',
+      confidence: 'definitive',
+    });
+    expect(target?.tlsVersion).toBeNull();
+    expect(tlsCheckImpl).not.toHaveBeenCalled();
+  });
+
+  it('leaves TLS fields null and keeps the target ok when the TLS check fails', async () => {
+    const fetchImpl: FetchImpl = vi.fn(async () => okResponse());
+    const tlsCheckImpl: TlsCheckImpl = vi.fn(async () => {
+      throw new Error('handshake failed');
+    });
+    const svc = new ScannerService(createDb(':memory:'), { fetchImpl, tlsCheckImpl });
+
+    const scan = await svc.startScan(['https://example.com']);
+
+    const completed = await vi.waitFor(async () => {
+      const s = await svc.getScan(scan.id);
+      if (!s || s.status !== 'completed') throw new Error('not yet completed');
+      return s;
+    });
+
+    const [target] = completed.targets;
+    expect(target?.status).toBe('ok');
+    expect(target?.tlsVersion).toBeNull();
+    expect(target?.findings.find((f) => f.category === 'outdated-tls' || f.category === 'cert-expiring-soon')).toBeUndefined();
+  });
+
   it('gives a target on a private/loopback/link-local/metadata IP an invalid status without fetching it', async () => {
     const fetchImpl: FetchImpl = vi.fn(async () => okResponse());
     const svc = new ScannerService(createDb(':memory:'), { fetchImpl });
@@ -176,7 +295,7 @@ describe('ScannerService', () => {
 
   it('gives a malformed or disallowed-scheme URL an invalid target without fetching it', async () => {
     const fetchImpl: FetchImpl = vi.fn(async () => okResponse());
-    const svc = new ScannerService(createDb(':memory:'), { fetchImpl });
+    const svc = new ScannerService(createDb(':memory:'), { fetchImpl, tlsCheckImpl: okTlsCheckImpl() });
 
     const scan = await svc.startScan(['not a url', 'file:///etc/passwd', 'https://good.example.com']);
     const result = await svc.getScan(scan.id);
@@ -189,7 +308,7 @@ describe('ScannerService', () => {
 
   it('dedupes exact-string-duplicate URLs into a single target', async () => {
     const fetchImpl: FetchImpl = vi.fn(async () => okResponse());
-    const svc = new ScannerService(createDb(':memory:'), { fetchImpl });
+    const svc = new ScannerService(createDb(':memory:'), { fetchImpl, tlsCheckImpl: okTlsCheckImpl() });
 
     const scan = await svc.startScan(['https://example.com', 'https://example.com']);
     const result = await svc.getScan(scan.id);
@@ -212,7 +331,10 @@ describe('ScannerService', () => {
   });
 
   it('lists scans newest first', async () => {
-    const svc = new ScannerService(createDb(':memory:'), { fetchImpl: vi.fn(async () => okResponse()) });
+    const svc = new ScannerService(createDb(':memory:'), {
+      fetchImpl: vi.fn(async () => okResponse()),
+      tlsCheckImpl: okTlsCheckImpl(),
+    });
 
     const first = await svc.startScan(['https://a.example.com']);
     const second = await svc.startScan(['https://b.example.com']);
@@ -223,7 +345,10 @@ describe('ScannerService', () => {
   });
 
   it('defaults the scan name to a human-readable timestamp when omitted', async () => {
-    const svc = new ScannerService(createDb(':memory:'), { fetchImpl: vi.fn(async () => okResponse()) });
+    const svc = new ScannerService(createDb(':memory:'), {
+      fetchImpl: vi.fn(async () => okResponse()),
+      tlsCheckImpl: okTlsCheckImpl(),
+    });
     const scan = await svc.startScan(['https://example.com']);
     expect(scan.name).toMatch(/^Scan \d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/);
   });
@@ -238,7 +363,11 @@ describe('ScannerService', () => {
       inFlight -= 1;
       return okResponse();
     });
-    const svc = new ScannerService(createDb(':memory:'), { fetchImpl, concurrency: 3 });
+    const svc = new ScannerService(createDb(':memory:'), {
+      fetchImpl,
+      concurrency: 3,
+      tlsCheckImpl: okTlsCheckImpl(),
+    });
     const urls = Array.from({ length: 7 }, (_, i) => `https://example.com/${i}`);
 
     const scan = await svc.startScan(urls);
@@ -338,5 +467,48 @@ describe('detectHeaderFindings', () => {
     const result = detectHeaderFindings({ 'content-security-policy': "default-src 'self'" });
 
     expect(result.find((f) => f.category === 'insecure-cookie')).toBeUndefined();
+  });
+});
+
+describe('detectTlsFindings', () => {
+  const farFutureExpiry = new Date('2099-01-01T00:00:00Z');
+
+  it('flags a TLS version below 1.2 as outdated', () => {
+    const result = detectTlsFindings({ version: 'TLSv1', certExpiresAt: farFutureExpiry });
+
+    const finding = result.find((f) => f.category === 'outdated-tls');
+    expect(finding).toMatchObject({ severity: 'high', confidence: 'definitive' });
+  });
+
+  it('does not flag TLS 1.2 or 1.3 as outdated', () => {
+    expect(
+      detectTlsFindings({ version: 'TLSv1.2', certExpiresAt: farFutureExpiry }).find(
+        (f) => f.category === 'outdated-tls',
+      ),
+    ).toBeUndefined();
+    expect(
+      detectTlsFindings({ version: 'TLSv1.3', certExpiresAt: farFutureExpiry }).find(
+        (f) => f.category === 'outdated-tls',
+      ),
+    ).toBeUndefined();
+  });
+
+  it('flags a certificate expiring within 30 days as cert-expiring-soon', () => {
+    const now = new Date('2026-01-01T00:00:00Z');
+    const certExpiresAt = new Date('2026-01-10T00:00:00Z');
+
+    const result = detectTlsFindings({ version: 'TLSv1.3', certExpiresAt }, now);
+
+    const finding = result.find((f) => f.category === 'cert-expiring-soon');
+    expect(finding).toMatchObject({ severity: 'medium', confidence: 'definitive' });
+  });
+
+  it('does not flag a certificate expiring more than 30 days out', () => {
+    const now = new Date('2026-01-01T00:00:00Z');
+    const certExpiresAt = new Date('2026-06-01T00:00:00Z');
+
+    const result = detectTlsFindings({ version: 'TLSv1.3', certExpiresAt }, now);
+
+    expect(result.find((f) => f.category === 'cert-expiring-soon')).toBeUndefined();
   });
 });
