@@ -209,6 +209,39 @@ export function detectTlsFindings(info: TlsInfo, now: Date = new Date()): TlsFin
   return result;
 }
 
+export type VersionBanner = { software: string; version: string };
+
+// Neither the PRD nor the issue pins an exact banner source, so this is a judgment
+// call: `name/version` is the de-facto convention for both the Server and
+// X-Powered-By headers (e.g. `nginx/1.18.0`, `PHP/7.4.3`), and some software repeats
+// that same convention in a robots.txt comment. Headers are checked first since
+// they're the more reliable signal; robots.txt is only consulted if neither matches.
+const BANNER_HEADER_NAMES = ['server', 'x-powered-by'];
+const BANNER_PATTERN = /([A-Za-z][\w.-]*)\/(\d[\w.-]*)/;
+
+export function extractVersionBanner(
+  headers: Record<string, string>,
+  robotsBody: string | null,
+): VersionBanner | null {
+  for (const headerName of BANNER_HEADER_NAMES) {
+    const value = headers[headerName];
+    if (value === undefined) continue;
+    const match = BANNER_PATTERN.exec(value);
+    if (match?.[1] !== undefined && match[2] !== undefined) {
+      return { software: match[1], version: match[2] };
+    }
+  }
+
+  if (robotsBody !== null) {
+    const match = BANNER_PATTERN.exec(robotsBody);
+    if (match?.[1] !== undefined && match[2] !== undefined) {
+      return { software: match[1], version: match[2] };
+    }
+  }
+
+  return null;
+}
+
 export type TlsCheckImpl = (hostname: string, port: number) => Promise<TlsInfo>;
 
 function defaultTlsCheck(hostname: string, port: number, timeoutMs: number): Promise<TlsInfo> {
@@ -235,10 +268,33 @@ function defaultTlsCheck(hostname: string, port: number, timeoutMs: number): Pro
 
 export type FetchImpl = (url: string, init: RequestInit) => Promise<Response>;
 
+export type OsvMatch = { cveId: string };
+export type OsvCheckImpl = (banner: VersionBanner) => Promise<OsvMatch | null>;
+
+async function defaultOsvCheck(banner: VersionBanner): Promise<OsvMatch | null> {
+  const response = await fetch('https://api.osv.dev/v1/query', {
+    method: 'POST',
+    body: JSON.stringify({ version: banner.version, package: { name: banner.software, ecosystem: 'Generic' } }),
+  });
+  if (!response.ok) throw new Error(`OSV.dev query failed with status ${response.status}`);
+
+  const data = (await response.json()) as { vulns?: { id: string }[] };
+  const first = data.vulns?.[0];
+  return first !== undefined ? { cveId: first.id } : null;
+}
+
+const CVE_FINDING_CATEGORY = 'known-vulnerability';
+// A version-string match doesn't prove a fix wasn't backported, so CVE findings stay
+// `possible` confidence (per the PRD) rather than `definitive`. Severity isn't reported
+// by a bare OSV.dev match in this v1 integration, so every match is treated as `high` —
+// a known, matched CVE is a serious signal even without a parsed CVSS score.
+const CVE_FINDING_SEVERITY: FindingSeverity = 'high';
+
 export class ScannerService {
   readonly #db: Db;
   readonly #fetchImpl: FetchImpl;
   readonly #tlsCheckImpl: TlsCheckImpl;
+  readonly #osvCheckImpl: OsvCheckImpl;
   readonly #timeoutMs: number;
   readonly #concurrency: number;
 
@@ -247,6 +303,7 @@ export class ScannerService {
     options: {
       fetchImpl?: FetchImpl;
       tlsCheckImpl?: TlsCheckImpl;
+      osvCheckImpl?: OsvCheckImpl;
       timeoutMs?: number;
       concurrency?: number;
     } = {},
@@ -257,6 +314,7 @@ export class ScannerService {
     this.#concurrency = options.concurrency ?? 10;
     this.#tlsCheckImpl =
       options.tlsCheckImpl ?? ((hostname, port) => defaultTlsCheck(hostname, port, this.#timeoutMs));
+    this.#osvCheckImpl = options.osvCheckImpl ?? defaultOsvCheck;
   }
 
   async startScan(urls: string[], options: StartScanOptions = {}): Promise<Scan> {
@@ -329,9 +387,13 @@ export class ScannerService {
   async #runScan(scanId: number, targetRows: ScanTarget[]): Promise<void> {
     this.#db.update(scans).set({ status: 'running' }).where(eq(scans.id, scanId)).run();
 
+    // Cached per scan run, not on the instance: the PRD requires CVE lookups to be
+    // cached per unique version string *within a scan* and never reused across scans.
+    const cveCache = new Map<string, OsvMatch | null>();
+
     for (let i = 0; i < targetRows.length; i += this.#concurrency) {
       const batch = targetRows.slice(i, i + this.#concurrency);
-      await Promise.all(batch.map((target) => this.#processTarget(target)));
+      await Promise.all(batch.map((target) => this.#processTarget(target, cveCache)));
     }
 
     this.#db
@@ -341,7 +403,7 @@ export class ScannerService {
       .run();
   }
 
-  async #processTarget(target: ScanTarget): Promise<void> {
+  async #processTarget(target: ScanTarget, cveCache: Map<string, OsvMatch | null>): Promise<void> {
     console.warn(`[scan ${target.scanId}] ${target.url} started`);
 
     const targetUrl = new URL(target.url);
@@ -426,6 +488,24 @@ export class ScannerService {
         }
       }
 
+      const robotsBody = await this.#fetchRobotsTxt(targetUrl);
+      const banner = extractVersionBanner(responseHeaders, robotsBody);
+      if (banner !== null) {
+        const match = await this.#lookupCve(banner, cveCache, target.scanId, target.url);
+        if (match !== null) {
+          this.#db
+            .insert(findings)
+            .values({
+              scanTargetId: target.id,
+              category: CVE_FINDING_CATEGORY,
+              severity: CVE_FINDING_SEVERITY,
+              confidence: 'possible',
+              cveId: match.cveId,
+            })
+            .run();
+        }
+      }
+
       console.warn(`[scan ${target.scanId}] ${target.url} succeeded`);
     } catch (err) {
       const timedOut = err instanceof Error && err.name === 'AbortError';
@@ -445,5 +525,43 @@ export class ScannerService {
     } finally {
       clearTimeout(timer);
     }
+  }
+
+  async #fetchRobotsTxt(targetUrl: URL): Promise<string | null> {
+    try {
+      const robotsUrl = new URL('/robots.txt', targetUrl).toString();
+      const response = await this.#fetchImpl(robotsUrl, { redirect: 'manual' });
+      return await response.text();
+    } catch {
+      // robots.txt is an extra probe surface, not a required one — a missing or
+      // broken robots.txt just means banner extraction relies on headers alone.
+      return null;
+    }
+  }
+
+  async #lookupCve(
+    banner: VersionBanner,
+    cache: Map<string, OsvMatch | null>,
+    scanId: number,
+    url: string,
+  ): Promise<OsvMatch | null> {
+    const key = `${banner.software}/${banner.version}`;
+    if (cache.has(key)) return cache.get(key) ?? null;
+
+    let match: OsvMatch | null = null;
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      try {
+        match = await this.#osvCheckImpl(banner);
+        break;
+      } catch (err) {
+        if (attempt === 2) {
+          const message = err instanceof Error ? err.message : String(err);
+          console.warn(`[scan ${scanId}] ${url} CVE lookup failed after retry: ${message}`);
+        }
+      }
+    }
+
+    cache.set(key, match);
+    return match;
   }
 }

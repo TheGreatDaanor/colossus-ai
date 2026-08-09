@@ -6,8 +6,10 @@ import {
   isDisallowedAddress,
   detectHeaderFindings,
   detectTlsFindings,
+  extractVersionBanner,
   type FetchImpl,
   type TlsCheckImpl,
+  type OsvCheckImpl,
 } from './scanner.js';
 
 function deferred<T>(): { promise: Promise<T>; resolve: (v: T) => void } {
@@ -353,6 +355,155 @@ describe('ScannerService', () => {
     expect(scan.name).toMatch(/^Scan \d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/);
   });
 
+  it('records a possible-confidence Finding with a cve_id when the version banner matches an OSV.dev vulnerability', async () => {
+    const fetchImpl: FetchImpl = vi.fn(async () => okResponse({ server: 'nginx/1.18.0' }));
+    const osvCheckImpl: OsvCheckImpl = vi.fn(async () => ({ cveId: 'CVE-2021-23017' }));
+    const svc = new ScannerService(createDb(':memory:'), {
+      fetchImpl,
+      tlsCheckImpl: okTlsCheckImpl(),
+      osvCheckImpl,
+    });
+
+    const scan = await svc.startScan(['https://example.com']);
+
+    const completed = await vi.waitFor(async () => {
+      const s = await svc.getScan(scan.id);
+      if (!s || s.status !== 'completed') throw new Error('not yet completed');
+      return s;
+    });
+
+    const [target] = completed.targets;
+    expect(target?.findings.find((f) => f.category === 'known-vulnerability')).toMatchObject({
+      confidence: 'possible',
+      cveId: 'CVE-2021-23017',
+    });
+  });
+
+  it('does not query OSV.dev a second time for a second target with the identical version banner', async () => {
+    const fetchImpl: FetchImpl = vi.fn(async () => okResponse({ server: 'nginx/1.18.0' }));
+    const osvCheckImpl: OsvCheckImpl = vi.fn(async () => ({ cveId: 'CVE-2021-23017' }));
+    const svc = new ScannerService(createDb(':memory:'), {
+      fetchImpl,
+      tlsCheckImpl: okTlsCheckImpl(),
+      osvCheckImpl,
+    });
+
+    const scan = await svc.startScan(['https://a.example.com', 'https://b.example.com']);
+
+    const completed = await vi.waitFor(async () => {
+      const s = await svc.getScan(scan.id);
+      if (!s || s.status !== 'completed') throw new Error('not yet completed');
+      return s;
+    });
+
+    for (const target of completed.targets) {
+      expect(target.findings.find((f) => f.category === 'known-vulnerability')).toMatchObject({
+        cveId: 'CVE-2021-23017',
+      });
+    }
+    expect(osvCheckImpl).toHaveBeenCalledTimes(1);
+  });
+
+  it('retries an OSV.dev lookup once before giving up, keeping the target ok with no CVE finding', async () => {
+    const fetchImpl: FetchImpl = vi.fn(async () => okResponse({ server: 'nginx/1.18.0' }));
+    const osvCheckImpl: OsvCheckImpl = vi.fn(async () => {
+      throw new Error('OSV.dev unavailable');
+    });
+    const svc = new ScannerService(createDb(':memory:'), {
+      fetchImpl,
+      tlsCheckImpl: okTlsCheckImpl(),
+      osvCheckImpl,
+    });
+
+    const scan = await svc.startScan(['https://example.com']);
+
+    const completed = await vi.waitFor(async () => {
+      const s = await svc.getScan(scan.id);
+      if (!s || s.status !== 'completed') throw new Error('not yet completed');
+      return s;
+    });
+
+    const [target] = completed.targets;
+    expect(target?.status).toBe('ok');
+    expect(target?.findings.find((f) => f.category === 'known-vulnerability')).toBeUndefined();
+    expect(osvCheckImpl).toHaveBeenCalledTimes(2);
+  });
+
+  it('recovers a CVE match when the OSV.dev lookup succeeds on retry', async () => {
+    const fetchImpl: FetchImpl = vi.fn(async () => okResponse({ server: 'nginx/1.18.0' }));
+    const osvCheckImpl: OsvCheckImpl = vi
+      .fn<OsvCheckImpl>()
+      .mockRejectedValueOnce(new Error('transient failure'))
+      .mockResolvedValueOnce({ cveId: 'CVE-2021-23017' });
+    const svc = new ScannerService(createDb(':memory:'), {
+      fetchImpl,
+      tlsCheckImpl: okTlsCheckImpl(),
+      osvCheckImpl,
+    });
+
+    const scan = await svc.startScan(['https://example.com']);
+
+    const completed = await vi.waitFor(async () => {
+      const s = await svc.getScan(scan.id);
+      if (!s || s.status !== 'completed') throw new Error('not yet completed');
+      return s;
+    });
+
+    const [target] = completed.targets;
+    expect(target?.findings.find((f) => f.category === 'known-vulnerability')).toMatchObject({
+      cveId: 'CVE-2021-23017',
+    });
+  });
+
+  it('records no known-vulnerability Finding when no version banner is present', async () => {
+    const fetchImpl: FetchImpl = vi.fn(async () => okResponse());
+    const osvCheckImpl: OsvCheckImpl = vi.fn(async () => ({ cveId: 'CVE-2021-23017' }));
+    const svc = new ScannerService(createDb(':memory:'), {
+      fetchImpl,
+      tlsCheckImpl: okTlsCheckImpl(),
+      osvCheckImpl,
+    });
+
+    const scan = await svc.startScan(['https://example.com']);
+
+    const completed = await vi.waitFor(async () => {
+      const s = await svc.getScan(scan.id);
+      if (!s || s.status !== 'completed') throw new Error('not yet completed');
+      return s;
+    });
+
+    const [target] = completed.targets;
+    expect(target?.findings.find((f) => f.category === 'known-vulnerability')).toBeUndefined();
+    expect(osvCheckImpl).not.toHaveBeenCalled();
+  });
+
+  it('keeps the target ok and still extracts a banner from headers when the robots.txt fetch fails', async () => {
+    const fetchImpl: FetchImpl = vi.fn(async (url: string) => {
+      if (url.endsWith('/robots.txt')) throw new Error('connection refused');
+      return okResponse({ server: 'nginx/1.18.0' });
+    });
+    const osvCheckImpl: OsvCheckImpl = vi.fn(async () => ({ cveId: 'CVE-2021-23017' }));
+    const svc = new ScannerService(createDb(':memory:'), {
+      fetchImpl,
+      tlsCheckImpl: okTlsCheckImpl(),
+      osvCheckImpl,
+    });
+
+    const scan = await svc.startScan(['https://example.com']);
+
+    const completed = await vi.waitFor(async () => {
+      const s = await svc.getScan(scan.id);
+      if (!s || s.status !== 'completed') throw new Error('not yet completed');
+      return s;
+    });
+
+    const [target] = completed.targets;
+    expect(target?.status).toBe('ok');
+    expect(target?.findings.find((f) => f.category === 'known-vulnerability')).toMatchObject({
+      cveId: 'CVE-2021-23017',
+    });
+  });
+
   it('processes at most `concurrency` URLs at once', async () => {
     let inFlight = 0;
     let maxInFlight = 0;
@@ -467,6 +618,40 @@ describe('detectHeaderFindings', () => {
     const result = detectHeaderFindings({ 'content-security-policy': "default-src 'self'" });
 
     expect(result.find((f) => f.category === 'insecure-cookie')).toBeUndefined();
+  });
+});
+
+describe('extractVersionBanner', () => {
+  it('extracts a software/version pair from the Server header', () => {
+    expect(extractVersionBanner({ server: 'nginx/1.18.0' }, null)).toEqual({
+      software: 'nginx',
+      version: '1.18.0',
+    });
+  });
+
+  it('extracts a software/version pair from the X-Powered-By header', () => {
+    expect(extractVersionBanner({ 'x-powered-by': 'PHP/7.4.3' }, null)).toEqual({
+      software: 'PHP',
+      version: '7.4.3',
+    });
+  });
+
+  it('falls back to a software/version pair found in the robots.txt body', () => {
+    expect(extractVersionBanner({}, '# Generated by WordPress/5.4.2')).toEqual({
+      software: 'WordPress',
+      version: '5.4.2',
+    });
+  });
+
+  it('prefers a header banner over a robots.txt banner when both are present', () => {
+    expect(extractVersionBanner({ server: 'nginx/1.18.0' }, '# Generated by WordPress/5.4.2')).toEqual({
+      software: 'nginx',
+      version: '1.18.0',
+    });
+  });
+
+  it('returns null when no banner is found in headers or robots.txt', () => {
+    expect(extractVersionBanner({ 'x-test': 'yes' }, 'User-agent: *')).toBeNull();
   });
 });
 
