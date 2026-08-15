@@ -1,6 +1,7 @@
 import { lookup } from 'node:dns/promises';
 import { isIP } from 'node:net';
 import { connect as tlsConnect } from 'node:tls';
+import Anthropic from '@anthropic-ai/sdk';
 import { eq } from 'drizzle-orm';
 import type { Db } from '../db/client.js';
 import {
@@ -209,6 +210,39 @@ export function detectTlsFindings(info: TlsInfo, now: Date = new Date()): TlsFin
   return result;
 }
 
+export type VersionBanner = { software: string; version: string };
+
+// Neither the PRD nor the issue pins an exact banner source, so this is a judgment
+// call: `name/version` is the de-facto convention for both the Server and
+// X-Powered-By headers (e.g. `nginx/1.18.0`, `PHP/7.4.3`), and some software repeats
+// that same convention in a robots.txt comment. Headers are checked first since
+// they're the more reliable signal; robots.txt is only consulted if neither matches.
+const BANNER_HEADER_NAMES = ['server', 'x-powered-by'];
+const BANNER_PATTERN = /([A-Za-z][\w.-]*)\/(\d[\w.-]*)/;
+
+export function extractVersionBanner(
+  headers: Record<string, string>,
+  robotsBody: string | null,
+): VersionBanner | null {
+  for (const headerName of BANNER_HEADER_NAMES) {
+    const value = headers[headerName];
+    if (value === undefined) continue;
+    const match = BANNER_PATTERN.exec(value);
+    if (match?.[1] !== undefined && match[2] !== undefined) {
+      return { software: match[1], version: match[2] };
+    }
+  }
+
+  if (robotsBody !== null) {
+    const match = BANNER_PATTERN.exec(robotsBody);
+    if (match?.[1] !== undefined && match[2] !== undefined) {
+      return { software: match[1], version: match[2] };
+    }
+  }
+
+  return null;
+}
+
 export type TlsCheckImpl = (hostname: string, port: number) => Promise<TlsInfo>;
 
 function defaultTlsCheck(hostname: string, port: number, timeoutMs: number): Promise<TlsInfo> {
@@ -235,10 +269,99 @@ function defaultTlsCheck(hostname: string, port: number, timeoutMs: number): Pro
 
 export type FetchImpl = (url: string, init: RequestInit) => Promise<Response>;
 
+export type OsvMatch = { cveId: string };
+export type OsvCheckImpl = (banner: VersionBanner) => Promise<OsvMatch | null>;
+
+async function defaultOsvCheck(banner: VersionBanner): Promise<OsvMatch | null> {
+  const response = await fetch('https://api.osv.dev/v1/query', {
+    method: 'POST',
+    body: JSON.stringify({ version: banner.version, package: { name: banner.software, ecosystem: 'Generic' } }),
+  });
+  if (!response.ok) throw new Error(`OSV.dev query failed with status ${response.status}`);
+
+  const data = (await response.json()) as { vulns?: { id: string }[] };
+  const first = data.vulns?.[0];
+  return first !== undefined ? { cveId: first.id } : null;
+}
+
+const CVE_FINDING_CATEGORY = 'known-vulnerability';
+// A version-string match doesn't prove a fix wasn't backported, so CVE findings stay
+// `possible` confidence (per the PRD) rather than `definitive`. Severity isn't reported
+// by a bare OSV.dev match in this v1 integration, so every match is treated as `high` —
+// a known, matched CVE is a serious signal even without a parsed CVSS score.
+const CVE_FINDING_SEVERITY: FindingSeverity = 'high';
+
+export type LlmEnrichInput = {
+  category: string;
+  severity: FindingSeverity;
+  confidence: FindingConfidence;
+  cveId: string | null;
+};
+export type LlmEnrichment = { explanation: string; suggestedFix: string };
+export type EnrichedFinding = { explanation: string | null; suggestedFix: string | null };
+export type LlmEnrichImpl = (findings: LlmEnrichInput[]) => Promise<LlmEnrichment[]>;
+
+const ENRICHMENT_TOOL_NAME = 'report_finding_explanations';
+const LLM_RETRY_DELAY_MS = 1000;
+
+async function defaultLlmEnrich(findings: LlmEnrichInput[]): Promise<LlmEnrichment[]> {
+  const client = new Anthropic();
+  const response = await client.messages.create({
+    model: 'claude-sonnet-5',
+    max_tokens: 4096,
+    tool_choice: { type: 'tool', name: ENRICHMENT_TOOL_NAME },
+    tools: [
+      {
+        name: ENRICHMENT_TOOL_NAME,
+        description:
+          'Report a plain-English explanation and a suggested fix for each security finding, one entry per finding, in the same order as the input list.',
+        input_schema: {
+          type: 'object',
+          properties: {
+            findings: {
+              type: 'array',
+              items: {
+                type: 'object',
+                properties: {
+                  explanation: { type: 'string', description: 'Plain-English explanation of the risk.' },
+                  suggestedFix: { type: 'string', description: 'A concrete suggested fix.' },
+                },
+                required: ['explanation', 'suggestedFix'],
+              },
+            },
+          },
+          required: ['findings'],
+        },
+      },
+    ],
+    messages: [
+      {
+        role: 'user',
+        content: `For each of these security findings, give a short plain-English explanation and a suggested fix. Findings:\n${JSON.stringify(findings)}`,
+      },
+    ],
+  });
+
+  const toolUse = response.content.find((block) => block.type === 'tool_use');
+  if (toolUse === undefined || toolUse.type !== 'tool_use') {
+    throw new Error('LLM enrichment response did not include a tool_use block');
+  }
+
+  const input = toolUse.input as { findings?: unknown };
+  if (!Array.isArray(input.findings)) throw new Error('LLM enrichment response is missing a findings array');
+  return input.findings as LlmEnrichment[];
+}
+
+function findingFingerprint(finding: LlmEnrichInput): string {
+  return `${finding.category}|${finding.severity}|${finding.confidence}|${finding.cveId ?? ''}`;
+}
+
 export class ScannerService {
   readonly #db: Db;
   readonly #fetchImpl: FetchImpl;
   readonly #tlsCheckImpl: TlsCheckImpl;
+  readonly #osvCheckImpl: OsvCheckImpl;
+  readonly #llmEnrichImpl: LlmEnrichImpl;
   readonly #timeoutMs: number;
   readonly #concurrency: number;
 
@@ -247,6 +370,8 @@ export class ScannerService {
     options: {
       fetchImpl?: FetchImpl;
       tlsCheckImpl?: TlsCheckImpl;
+      osvCheckImpl?: OsvCheckImpl;
+      llmEnrichImpl?: LlmEnrichImpl;
       timeoutMs?: number;
       concurrency?: number;
     } = {},
@@ -257,6 +382,8 @@ export class ScannerService {
     this.#concurrency = options.concurrency ?? 10;
     this.#tlsCheckImpl =
       options.tlsCheckImpl ?? ((hostname, port) => defaultTlsCheck(hostname, port, this.#timeoutMs));
+    this.#osvCheckImpl = options.osvCheckImpl ?? defaultOsvCheck;
+    this.#llmEnrichImpl = options.llmEnrichImpl ?? defaultLlmEnrich;
   }
 
   async startScan(urls: string[], options: StartScanOptions = {}): Promise<Scan> {
@@ -329,9 +456,16 @@ export class ScannerService {
   async #runScan(scanId: number, targetRows: ScanTarget[]): Promise<void> {
     this.#db.update(scans).set({ status: 'running' }).where(eq(scans.id, scanId)).run();
 
+    // Cached per scan run, not on the instance: the PRD requires CVE lookups to be
+    // cached per unique version string *within a scan* and never reused across scans.
+    const cveCache = new Map<string, OsvMatch | null>();
+    // Same rationale, for LLM enrichment: identical finding-sets within one scan
+    // reuse a single call, keyed by a fingerprint of the sorted finding-set.
+    const llmCache = new Map<string, Promise<EnrichedFinding[]>>();
+
     for (let i = 0; i < targetRows.length; i += this.#concurrency) {
       const batch = targetRows.slice(i, i + this.#concurrency);
-      await Promise.all(batch.map((target) => this.#processTarget(target)));
+      await Promise.all(batch.map((target) => this.#processTarget(target, cveCache, llmCache)));
     }
 
     this.#db
@@ -341,7 +475,11 @@ export class ScannerService {
       .run();
   }
 
-  async #processTarget(target: ScanTarget): Promise<void> {
+  async #processTarget(
+    target: ScanTarget,
+    cveCache: Map<string, OsvMatch | null>,
+    llmCache: Map<string, Promise<EnrichedFinding[]>>,
+  ): Promise<void> {
     console.warn(`[scan ${target.scanId}] ${target.url} started`);
 
     const targetUrl = new URL(target.url);
@@ -387,18 +525,17 @@ export class ScannerService {
         .where(eq(scanTargets.id, target.id))
         .run();
 
+      // Findings are collected here rather than inserted immediately so that
+      // #enrichFindings sees the target's whole finding-set at once — the LLM
+      // dedup cache is keyed on the full set, not per-individual-finding.
+      const targetFindings: LlmEnrichInput[] = [];
+
       for (const finding of detectHeaderFindings(responseHeaders)) {
-        this.#db
-          .insert(findings)
-          .values({ scanTargetId: target.id, ...finding })
-          .run();
+        targetFindings.push({ ...finding, cveId: null });
       }
 
       if (targetUrl.protocol === 'http:') {
-        this.#db
-          .insert(findings)
-          .values({ scanTargetId: target.id, ...NO_TLS_FINDING })
-          .run();
+        targetFindings.push({ ...NO_TLS_FINDING, cveId: null });
       } else {
         // TLS-check failures degrade gracefully (target stays `ok`, TLS columns/findings
         // are just skipped) rather than failing the target — mirrors the CVE-lookup
@@ -415,16 +552,36 @@ export class ScannerService {
             .run();
 
           for (const finding of detectTlsFindings(tlsInfo)) {
-            this.#db
-              .insert(findings)
-              .values({ scanTargetId: target.id, ...finding })
-              .run();
+            targetFindings.push({ ...finding, cveId: null });
           }
         } catch (tlsErr) {
           const message = tlsErr instanceof Error ? tlsErr.message : String(tlsErr);
           console.warn(`[scan ${target.scanId}] ${target.url} TLS check failed: ${message}`);
         }
       }
+
+      const robotsBody = await this.#fetchRobotsTxt(targetUrl);
+      const banner = extractVersionBanner(responseHeaders, robotsBody);
+      if (banner !== null) {
+        const match = await this.#lookupCve(banner, cveCache, target.scanId, target.url);
+        if (match !== null) {
+          targetFindings.push({
+            category: CVE_FINDING_CATEGORY,
+            severity: CVE_FINDING_SEVERITY,
+            confidence: 'possible',
+            cveId: match.cveId,
+          });
+        }
+      }
+
+      const enrichments = await this.#enrichFindings(targetFindings, llmCache, target.scanId, target.url);
+      targetFindings.forEach((finding, index) => {
+        const enrichment = enrichments[index] ?? { explanation: null, suggestedFix: null };
+        this.#db
+          .insert(findings)
+          .values({ scanTargetId: target.id, ...finding, ...enrichment })
+          .run();
+      });
 
       console.warn(`[scan ${target.scanId}] ${target.url} succeeded`);
     } catch (err) {
@@ -445,5 +602,95 @@ export class ScannerService {
     } finally {
       clearTimeout(timer);
     }
+  }
+
+  async #fetchRobotsTxt(targetUrl: URL): Promise<string | null> {
+    try {
+      const robotsUrl = new URL('/robots.txt', targetUrl).toString();
+      const response = await this.#fetchImpl(robotsUrl, { redirect: 'manual' });
+      return await response.text();
+    } catch {
+      // robots.txt is an extra probe surface, not a required one — a missing or
+      // broken robots.txt just means banner extraction relies on headers alone.
+      return null;
+    }
+  }
+
+  async #lookupCve(
+    banner: VersionBanner,
+    cache: Map<string, OsvMatch | null>,
+    scanId: number,
+    url: string,
+  ): Promise<OsvMatch | null> {
+    const key = `${banner.software}/${banner.version}`;
+    if (cache.has(key)) return cache.get(key) ?? null;
+
+    let match: OsvMatch | null = null;
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      try {
+        match = await this.#osvCheckImpl(banner);
+        break;
+      } catch (err) {
+        if (attempt === 2) {
+          const message = err instanceof Error ? err.message : String(err);
+          console.warn(`[scan ${scanId}] ${url} CVE lookup failed after retry: ${message}`);
+        }
+      }
+    }
+
+    cache.set(key, match);
+    return match;
+  }
+
+  async #enrichFindings(
+    targetFindings: LlmEnrichInput[],
+    cache: Map<string, Promise<EnrichedFinding[]>>,
+    scanId: number,
+    url: string,
+  ): Promise<EnrichedFinding[]> {
+    if (targetFindings.length === 0) return [];
+
+    // Sorted by fingerprint so two targets with the same findings in a different
+    // insertion order still hit the cache under the same key.
+    const withIndex = targetFindings.map((finding, index) => ({ finding, index }));
+    const sorted = [...withIndex].sort((a, b) =>
+      findingFingerprint(a.finding).localeCompare(findingFingerprint(b.finding)),
+    );
+    const key = sorted.map(({ finding }) => findingFingerprint(finding)).join('|');
+
+    // The promise itself (not its resolved value) is cached synchronously,
+    // before any await — so a second target reaching this key while the first
+    // call is still in flight awaits the same promise instead of firing its
+    // own concurrent LLM call.
+    let inFlight = cache.get(key);
+    if (!inFlight) {
+      inFlight = (async () => {
+        for (let attempt = 1; attempt <= 2; attempt++) {
+          try {
+            const result = await this.#llmEnrichImpl(sorted.map(({ finding }) => finding));
+            if (result.length !== sorted.length) throw new Error('LLM enrichment returned a mismatched result count');
+            return result;
+          } catch (err) {
+            if (attempt === 2) {
+              const message = err instanceof Error ? err.message : String(err);
+              console.warn(`[scan ${scanId}] ${url} LLM enrichment failed after retry: ${message}`);
+            } else {
+              await new Promise((resolve) => setTimeout(resolve, LLM_RETRY_DELAY_MS));
+            }
+          }
+        }
+        return sorted.map(() => ({ explanation: null, suggestedFix: null }));
+      })();
+      cache.set(key, inFlight);
+    }
+
+    const sortedResult = await inFlight;
+
+    const result: EnrichedFinding[] = targetFindings.map(() => ({ explanation: null, suggestedFix: null }));
+    sorted.forEach(({ index }, position) => {
+      const enriched = sortedResult[position];
+      if (enriched) result[index] = enriched;
+    });
+    return result;
   }
 }
