@@ -34,4 +34,4 @@ npx eslint
 \`\`\`
 ```
 
-Adjust the exact commands to match what's actually in `package.json` — I'm inferring from the project conventions I have visibility into (the CLAUDE.md commands: `npx vitest run`, `npx tsc --noEmit`, `npx eslint`, `npm run dev`), but I haven't read the current README or package.json in this response so I can't confirm there isn't more project-specific setup (env vars, DB setup, etc.) that should go in there too.
+Adjust the exact commands to match what's actually in `package.json` (the CLAUDE.md commands: `npx vitest run`, `npx tsc --noEmit`, `npx eslint`, `npm run dev`)
