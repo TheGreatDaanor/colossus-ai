@@ -355,6 +355,43 @@ describe('ScannerService', () => {
     expect(result?.targets).toHaveLength(1);
   });
 
+  it('sends the per-scan userAgent override as the User-Agent header on every fetch', async () => {
+    const fetchImpl: FetchImpl = vi.fn(async () => okResponse());
+    const svc = new ScannerService(createDb(':memory:'), { fetchImpl, tlsCheckImpl: okTlsCheckImpl(), llmEnrichImpl: okLlmEnrichImpl() });
+
+    const scan = await svc.startScan(['https://example.com'], { userAgent: 'my-scanner/1.0' });
+    await vi.waitFor(async () => {
+      const s = await svc.getScan(scan.id);
+      if (!s || s.status !== 'completed') throw new Error('not yet completed');
+    });
+
+    expect(fetchImpl).toHaveBeenCalledWith(
+      'https://example.com',
+      expect.objectContaining({ headers: expect.objectContaining({ 'user-agent': 'my-scanner/1.0' }) }),
+    );
+  });
+
+  it('falls back to the configured global default User-Agent when a scan omits userAgent', async () => {
+    const fetchImpl: FetchImpl = vi.fn(async () => okResponse());
+    const svc = new ScannerService(createDb(':memory:'), {
+      fetchImpl,
+      tlsCheckImpl: okTlsCheckImpl(),
+      llmEnrichImpl: okLlmEnrichImpl(),
+      defaultUserAgent: 'global-default/2.0',
+    });
+
+    const scan = await svc.startScan(['https://example.com']);
+    await vi.waitFor(async () => {
+      const s = await svc.getScan(scan.id);
+      if (!s || s.status !== 'completed') throw new Error('not yet completed');
+    });
+
+    expect(fetchImpl).toHaveBeenCalledWith(
+      'https://example.com',
+      expect.objectContaining({ headers: expect.objectContaining({ 'user-agent': 'global-default/2.0' }) }),
+    );
+  });
+
   it('fails the scan immediately when every URL is invalid', async () => {
     const svc = new ScannerService(createDb(':memory:'));
 

@@ -16,6 +16,7 @@ import {
 export class ScanValidationError extends Error {}
 
 const MAX_URLS = 100;
+const DEFAULT_USER_AGENT = process.env['DEFAULT_USER_AGENT'] ?? 'colossus-ai-scanner/1.0';
 
 export type Scan = typeof scans.$inferSelect;
 export type ScanTarget = typeof scanTargets.$inferSelect;
@@ -369,6 +370,7 @@ export class ScannerService {
   readonly #llmEnrichImpl: LlmEnrichImpl;
   readonly #timeoutMs: number;
   readonly #concurrency: number;
+  readonly #defaultUserAgent: string;
 
   constructor(
     db: Db,
@@ -379,12 +381,14 @@ export class ScannerService {
       llmEnrichImpl?: LlmEnrichImpl;
       timeoutMs?: number;
       concurrency?: number;
+      defaultUserAgent?: string;
     } = {},
   ) {
     this.#db = db;
     this.#fetchImpl = options.fetchImpl ?? fetch;
     this.#timeoutMs = options.timeoutMs ?? 10_000;
     this.#concurrency = options.concurrency ?? 10;
+    this.#defaultUserAgent = options.defaultUserAgent ?? DEFAULT_USER_AGENT;
     this.#tlsCheckImpl =
       options.tlsCheckImpl ?? ((hostname, port) => defaultTlsCheck(hostname, port, this.#timeoutMs));
     this.#osvCheckImpl = options.osvCheckImpl ?? defaultOsvCheck;
@@ -436,7 +440,7 @@ export class ScannerService {
         .get(),
     );
 
-    void this.#runScan(scan.id, targetRows);
+    void this.#runScan(scan.id, targetRows, scan.userAgent ?? this.#defaultUserAgent);
 
     return scan;
   }
@@ -465,7 +469,7 @@ export class ScannerService {
     return this.#db.select().from(scans).orderBy(scans.createdAt).all().reverse();
   }
 
-  async #runScan(scanId: number, targetRows: ScanTarget[]): Promise<void> {
+  async #runScan(scanId: number, targetRows: ScanTarget[], userAgent: string): Promise<void> {
     this.#db.update(scans).set({ status: 'running' }).where(eq(scans.id, scanId)).run();
 
     // Cached per scan run, not on the instance: the PRD requires CVE lookups to be
@@ -477,7 +481,7 @@ export class ScannerService {
 
     for (let i = 0; i < targetRows.length; i += this.#concurrency) {
       const batch = targetRows.slice(i, i + this.#concurrency);
-      await Promise.all(batch.map((target) => this.#processTarget(target, cveCache, llmCache)));
+      await Promise.all(batch.map((target) => this.#processTarget(target, cveCache, llmCache, userAgent)));
     }
 
     this.#db
@@ -491,6 +495,7 @@ export class ScannerService {
     target: ScanTarget,
     cveCache: Map<string, OsvMatch | null>,
     llmCache: Map<string, Promise<EnrichedFinding[]>>,
+    userAgent: string,
   ): Promise<void> {
     console.warn(`[scan ${target.scanId}] ${target.url} started`);
 
@@ -519,6 +524,7 @@ export class ScannerService {
       const response = await this.#fetchImpl(target.url, {
         redirect: 'manual',
         signal: controller.signal,
+        headers: { 'user-agent': userAgent },
       });
       const elapsed = Math.round(performance.now() - start);
       const status: ScanTargetStatus = 'ok';
@@ -572,7 +578,7 @@ export class ScannerService {
         }
       }
 
-      const robotsBody = await this.#fetchRobotsTxt(targetUrl);
+      const robotsBody = await this.#fetchRobotsTxt(targetUrl, userAgent);
       const banner = extractVersionBanner(responseHeaders, robotsBody);
       if (banner !== null) {
         const match = await this.#lookupCve(banner, cveCache, target.scanId, target.url);
@@ -616,10 +622,10 @@ export class ScannerService {
     }
   }
 
-  async #fetchRobotsTxt(targetUrl: URL): Promise<string | null> {
+  async #fetchRobotsTxt(targetUrl: URL, userAgent: string): Promise<string | null> {
     try {
       const robotsUrl = new URL('/robots.txt', targetUrl).toString();
-      const response = await this.#fetchImpl(robotsUrl, { redirect: 'manual' });
+      const response = await this.#fetchImpl(robotsUrl, { redirect: 'manual', headers: { 'user-agent': userAgent } });
       return await response.text();
     } catch {
       // robots.txt is an extra probe surface, not a required one — a missing or
