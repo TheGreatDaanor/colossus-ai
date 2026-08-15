@@ -1,7 +1,7 @@
 ---
 id: 002
 title: Reject targets on private/loopback/link-local/metadata IPs (SSRF guard)
-status: open
+status: done
 type: afk
 blocked-by: [001]
 ---

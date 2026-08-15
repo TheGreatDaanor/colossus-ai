@@ -34,18 +34,27 @@ function scanListTable(scanList: Scan[]): string {
 function findingsTable(findingList: Finding[]): string {
   if (findingList.length === 0) return '<p>no findings</p>';
 
-  const columns = Object.keys(findingList[0] ?? {});
-  const header = columns.map((col) => `<th>${escapeHtml(col)}</th>`).join('');
   const rows = findingList
-    .map(
-      (finding) =>
-        `<tr>${columns
-          .map((col) => `<td>${escapeHtml((finding as unknown as Record<string, unknown>)[col])}</td>`)
-          .join('')}</tr>`,
-    )
+    .map((finding) => {
+      const enrichment = [
+        finding.explanation !== null ? `<div>explanation: ${escapeHtml(finding.explanation)}</div>` : '',
+        finding.suggestedFix !== null ? `<div>suggested_fix: ${escapeHtml(finding.suggestedFix)}</div>` : '',
+      ].join('');
+
+      return `<tr>
+        <td>${escapeHtml(finding.category)}</td>
+        <td>${escapeHtml(finding.severity)}</td>
+        <td>${escapeHtml(finding.confidence)}</td>
+        <td>${escapeHtml(finding.cveId ?? '')}</td>
+        <td>${enrichment}</td>
+      </tr>`;
+    })
     .join('');
 
-  return `<table><thead><tr>${header}</tr></thead><tbody>${rows}</tbody></table>`;
+  return `<table>
+    <thead><tr><th>category</th><th>severity</th><th>confidence</th><th>cve_id</th><th>explanation / suggested_fix</th></tr></thead>
+    <tbody>${rows}</tbody>
+  </table>`;
 }
 
 function targetsTable(targets: (ScanTarget & { findings: Finding[] })[]): string {

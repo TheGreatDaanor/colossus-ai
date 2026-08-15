@@ -1,7 +1,7 @@
 ---
 id: 004
 title: Surface TLS-outdated, cert-expiring, and no-TLS findings
-status: open
+status: done
 type: afk
 blocked-by: [001]
 ---

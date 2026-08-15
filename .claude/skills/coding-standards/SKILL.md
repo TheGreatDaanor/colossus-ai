@@ -1,71 +1,65 @@
 ---
 name: coding-standards
 description: The project's coding standards and conventions. Pull this when writing or modifying code and you are unsure about naming, error handling, module boundaries, test placement, or dependency choices. The reviewer receives this file pushed into context automatically.
+metadata:
+  type: reference
 ---
 
 # Coding standards
 
-<!--
-PUSH vs PULL
-------------
-This file is PULLED by the implementer: it sits in the repo with the description
-above, and the agent fetches it when it has a question. That keeps it out of the
-implementer's context the rest of the time.
-
-It is PUSHED to the reviewer: scripts/review.sh cats this file into the review
-prompt, so the reviewer always has the standards alongside the diff to compare
-against. Judging requires the rubric in hand; writing does not.
-
-Fill this in for your project. Delete what doesn't apply. Every rule here costs
-reviewer context, so keep only rules you'd actually block a PR over.
--->
-
-## Modules
-
-- Prefer deepening an existing module over creating a new one.
-- A new module needs a small public interface and real functionality behind it.
-  If it exports one function, it belongs inside something that already exists.
-- No `utils` / `helpers` / `common` modules. Name the concept or put it where it's used.
-- Nothing reaches past a module's public interface into its internals.
-
 ## Naming
 
-- No evidence anywhere in the repo: zero throw, try/catcsses exist in the 3 source files. The current SKILL.mdline (Result<T, AppError>) is unfounded template boilerplate, not an observed convention. Leave this slot or write it only once real error-handling code exists 
-— don't keep the placeholder er flag a rule the codebase has never followed.
+- Files: `camelCase` module name, `.test.ts` suffix beside it (`scanner.ts` / `scanner.test.ts`).
+- Types: `PascalCase`; enums are string-literal unions (`type ScanStatus = 'pending' | 'running' | ...`), never TS `enum`.
+- Private class fields use real `#private` fields (`#db`, `#events`), not the `private` keyword.
+- Route factory functions are named `create<Noun>Routes` (`createScansRoutes`).
 
-## Errors
+## Errors — two patterns, both in active use
 
-- Services return `Result<T, AppError>`; they never throw. Only route handlers
-  throw, and only to produce an HTTP status.
-- Never swallow an error to make a test pass.
-- Errors crossing a module boundary get translated into that module's vocabulary.
+- Services throw, they never return a `Result` type — no `Result<T, E>` exists anywhere in this codebase, don't invent one.
+  - Expected/validated failures throw a domain-specific error class (`ScanValidationError`).
+  - "Should never happen" invariants throw a bare `Error` (`if (!scan) throw new Error('failed to insert scan')`).
+- Routes catch the domain error class and translate it to an HTTP status; anything unrecognized is rethrown for Hono's default handler (`scans.ts`: catch `ScanValidationError` → 400, else `throw err`).
+- Malformed request bodies return `null` from a parser function instead of throwing; the route turns `null` into a 400.
 
 ## Tests
 
-- Sit beside the code: points.ts → points.test.ts, same directory. Matches vitest.config.ts's include: ['src/**/*.test.ts'].
-- vitest describe/it, one behavior per test, name statesevel 2 exactly at the 100 point threshold').
-- Test only through the public interface (award/totalFor/levelFor), never touches the private #events field directly.
-- No mocks anywhere.
-- No tests/integration/ directory exists — the current SKILL.md mentions one; that's aspirational, not observed.
+- Sit beside the code: `foo.ts` → `foo.test.ts`, same directory (matches `vitest.config.ts`'s `include: ['src/**/*.test.ts']`).
+- `describe`/`it`, one behavior per test, name reads as a full sentence (`'rejects an empty URL list'`).
+- Route tests spin up a real Hono app plus a real in-memory SQLite db (`createDb(':memory:')`) and call `app.request(...)` — no mocking the framework.
+- Fakes are injected through constructor options (`fetchImpl`, `tlsCheckImpl`), not `vi.mock()` module mocking.
+- Wait for async completion with `vi.waitFor(...)` polling the read method (e.g. `getScan`), not fake timers.
+- A short comment explaining *why* is normal above non-obvious test setup (why TLS is faked, why DNS failure fails open) — this is the one place longer comments belong.
 
+## Modules
+
+- Prefer deepening an existing module over creating a new one; no `utils` / `helpers` / `common` modules.
+- One class per domain service, small public method set (`startScan` / `getScan` / `listScans`); everything else is a private field or a module-private helper above the class.
+- Routes are thin: parse input, call the service, map the result/error to a response. No business logic in `src/routes/*`.
+- `src/db/` is the only place that imports `drizzle-orm`. `schema.ts` defines tables; `client.ts` wraps `better-sqlite3` + `drizzle` and runs migrations on startup.
+- `src/services/points.ts` and its test are leftover template scaffolding from a different domain (courses/quizzes) and don't match the actual product (an endpoint vulnerability scanner). Don't extend it or copy its patterns — `scanner.ts` is the real convention source.
 
 ## Dependencies
 
-- npm, not pnpm: package-lock.json is committed, there's and every script in package.json invokes the tooldirectly (vitest run, tsc --noEmit, eslint .) rather than via pnpm. This contradicts the current SKILL.md, which says "pnpm only." That line is wrong for this repo — replace pnpm → npm throughout, nds (npm vitest run, npm tsc --noEmit) as the source oftruth.
-- devDependencies only — no runtime deps at all yet.
+- npm, not pnpm — `package-lock.json` is committed and every script invokes tools directly (`vitest run`, `tsc --noEmit`, `eslint .`).
+- Keep runtime deps minimal and explicit (`hono`, `@hono/node-server`, `drizzle-orm`, `better-sqlite3`).
+
+## TypeScript / lint
+
+- `strict: true` plus `noUncheckedIndexedAccess` and `exactOptionalPropertyTypes` — guard array/object index access explicitly (`arr[i]` checked against `undefined`), don't assert it away.
+- `verbatimModuleSyntax`: relative imports use a `.js` extension even though the source is `.ts` (`from '../db/client.js'`).
+- `any` and unused vars are hard lint errors. `console.log` is banned; `console.warn`/`console.error` are allowed and used for scan-lifecycle logging.
+- An `any` or a disabled lint rule requires a comment justifying it — reviewer-enforced, not tooling-enforced.
 
 ## Data and migrations
 
-- No src/db/ directory exists, and drizzle-kit/drizzle-orm aren't in package.json. The current SKILL.md's Drizzle/src/db/migrations rule describes a layer that doesn't exist in this codebase — generic example, not this project's reality. CLAUDE.md'sarchitecture section references src/db/ too, but nothing backs it yet. Either leave this slot none until a db layer lands, or confirm
-with the user whether Drizzle is actually the intended cas fact.
-- Migrations are forward-only and reversible-by-compensation, never destructive
-  without an explicit issue saying so.
+- Drizzle + `better-sqlite3`. Timestamps are `integer` columns with `{ mode: 'timestamp' }`; JSON columns are `text(..., { mode: 'json' })` with a `$type<...>()` cast.
+- Migrations are generated by drizzle-kit into `src/db/migrations/` and applied automatically by `createDb()` on startup.
+- Never hand-edit files under `src/db/migrations/` (generated; also stated in root `CLAUDE.md`).
 
 ## Things that are always wrong here
 
-- Committing secrets, `.env` files, or credentials
-- Disabling a lint rule inline without a comment saying why
-- `any` / untyped escapes without a comment saying why
-- Widening or skipping a test to get to green
-
-Bottom line: three of the five existing slots (Errors, D currently hold the doc's generic example text ratherthan this project's actual conventions, and two of those are actively wrong (pnpm, Drizzle). Naming and Tests are well-supported by real code and safe to keep close to what's already written.
+- Committing secrets, `.env` files, or credentials.
+- `any` or a disabled lint rule with no comment saying why.
+- Business logic in a route handler instead of the service it calls into.
+- A new `utils`/`helpers` module instead of deepening an existing one.

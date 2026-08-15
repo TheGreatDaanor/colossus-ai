@@ -1,7 +1,7 @@
 ---
 id: 003
 title: Surface missing-header and insecure-cookie findings
-status: open
+status: done
 type: afk
 blocked-by: [001]
 ---
