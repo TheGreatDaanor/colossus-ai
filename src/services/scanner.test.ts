@@ -175,6 +175,34 @@ describe('ScannerService', () => {
     }
   });
 
+  it('summarizes findings_by_severity counts across all targets in a scan', async () => {
+    const fetchImpl: FetchImpl = vi.fn(
+      async () =>
+        new Response(null, {
+          status: 200,
+          headers: { 'set-cookie': 'session=abc123' },
+        }),
+    );
+    const svc = new ScannerService(createDb(':memory:'), { fetchImpl, tlsCheckImpl: okTlsCheckImpl(), llmEnrichImpl: okLlmEnrichImpl() });
+    const scan = await svc.startScan(['https://example.com']);
+
+    const completed = await vi.waitFor(async () => {
+      const s = await svc.getScan(scan.id);
+      if (!s || s.status !== 'completed') throw new Error('not yet completed');
+      return s;
+    });
+
+    // missing-csp: high, missing-hsts: high, missing-x-frame-options: medium,
+    // missing-x-content-type-options: low, insecure-cookie: medium
+    expect(completed.findingsBySeverity).toEqual({
+      critical: 0,
+      high: 2,
+      medium: 2,
+      low: 1,
+      info: 0,
+    });
+  });
+
   it('records tls_version and tls_cert_expires_at on an https target from the TLS check', async () => {
     const fetchImpl: FetchImpl = vi.fn(async () => okResponse());
     const certExpiresAt = new Date('2099-01-01T00:00:00Z');

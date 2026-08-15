@@ -20,7 +20,12 @@ const MAX_URLS = 100;
 export type Scan = typeof scans.$inferSelect;
 export type ScanTarget = typeof scanTargets.$inferSelect;
 export type Finding = typeof findings.$inferSelect;
-export type ScanWithTargets = Scan & { targets: (ScanTarget & { findings: Finding[] })[] };
+export type FindingsBySeverity = Record<FindingSeverity, number>;
+
+export type ScanWithTargets = Scan & {
+  targets: (ScanTarget & { findings: Finding[] })[];
+  findingsBySeverity: FindingsBySeverity;
+};
 
 export type StartScanOptions = {
   name?: string;
@@ -446,7 +451,14 @@ export class ScannerService {
       findings: this.#db.select().from(findings).where(eq(findings.scanTargetId, target.id)).all(),
     }));
 
-    return { ...scan, targets };
+    const findingsBySeverity: FindingsBySeverity = { critical: 0, high: 0, medium: 0, low: 0, info: 0 };
+    for (const target of targets) {
+      for (const finding of target.findings) {
+        findingsBySeverity[finding.severity]++;
+      }
+    }
+
+    return { ...scan, targets, findingsBySeverity };
   }
 
   async listScans(): Promise<Scan[]> {
