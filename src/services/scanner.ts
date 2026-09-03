@@ -162,6 +162,8 @@ const MISSING_HEADER_FINDINGS: { header: string; category: string; severity: Fin
   { header: 'strict-transport-security', category: 'missing-hsts', severity: 'high' },
   { header: 'x-frame-options', category: 'missing-x-frame-options', severity: 'medium' },
   { header: 'x-content-type-options', category: 'missing-x-content-type-options', severity: 'low' },
+  { header: 'referrer-policy', category: 'missing-referrer-policy', severity: 'low' },
+  { header: 'permissions-policy', category: 'missing-permissions-policy', severity: 'low' },
 ];
 
 function isCookieSecure(setCookie: string): boolean {

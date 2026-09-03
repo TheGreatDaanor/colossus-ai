@@ -151,12 +151,14 @@ describe('ScannerService', () => {
     });
 
     const [target] = completed.targets;
-    expect(target?.findings).toHaveLength(5);
+    expect(target?.findings).toHaveLength(7);
     expect(target?.findings.map((f) => f.category).sort()).toEqual(
       [
         'insecure-cookie',
         'missing-csp',
         'missing-hsts',
+        'missing-permissions-policy',
+        'missing-referrer-policy',
         'missing-x-content-type-options',
         'missing-x-frame-options',
       ].sort(),
@@ -579,26 +581,42 @@ describe('isDisallowedAddress', () => {
 });
 
 describe('detectHeaderFindings', () => {
-  it('flags a response missing all four security headers', () => {
+  it('flags a response missing all six security headers', () => {
     const result = detectHeaderFindings({});
 
     expect(result.map((f) => f.category).sort()).toEqual(
-      ['missing-csp', 'missing-hsts', 'missing-x-content-type-options', 'missing-x-frame-options'].sort(),
+      [
+        'missing-csp',
+        'missing-hsts',
+        'missing-permissions-policy',
+        'missing-referrer-policy',
+        'missing-x-content-type-options',
+        'missing-x-frame-options',
+      ].sort(),
     );
     for (const finding of result) {
       expect(finding.confidence).toBe('definitive');
     }
   });
 
-  it('does not flag any of the four headers when all are present', () => {
+  it('does not flag any of the six headers when all are present', () => {
     const result = detectHeaderFindings({
       'content-security-policy': "default-src 'self'",
       'x-frame-options': 'DENY',
       'x-content-type-options': 'nosniff',
       'strict-transport-security': 'max-age=63072000',
+      'referrer-policy': 'no-referrer',
+      'permissions-policy': 'geolocation=()',
     });
 
     expect(result).toHaveLength(0);
+  });
+
+  it('flags missing Referrer-Policy and Permissions-Policy as low severity', () => {
+    const result = detectHeaderFindings({});
+
+    expect(result.find((f) => f.category === 'missing-referrer-policy')).toMatchObject({ severity: 'low' });
+    expect(result.find((f) => f.category === 'missing-permissions-policy')).toMatchObject({ severity: 'low' });
   });
 
   it('flags a Set-Cookie header missing Secure, HttpOnly, and SameSite as insecure', () => {
