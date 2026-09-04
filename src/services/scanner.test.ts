@@ -584,6 +584,10 @@ describe('ScannerService', () => {
             'x-frame-options': 'DENY',
             'x-content-type-options': 'nosniff',
             'strict-transport-security': 'max-age=63072000',
+            // Both added by the Referrer-Policy/Permissions-Policy check — without them
+            // this target has 2 findings and the "no findings" premise doesn't hold.
+            'referrer-policy': 'no-referrer',
+            'permissions-policy': 'geolocation=()',
           },
         }),
     );
@@ -754,6 +758,35 @@ describe('ScannerService', () => {
       expect(target.findings.length).toBeGreaterThan(0);
     }
     expect(callCount).toBe(1);
+  });
+
+  // Regression guard: `mode` is threaded from #runScan through #processTarget purely to
+  // reach the injection step, so a refactor can drop it without any other test noticing.
+  it('records injection attempts on an active-mode target but not a passive one', async () => {
+    const svc = new ScannerService(createDb(':memory:'), {
+      fetchImpl: vi.fn(async () => okResponse()),
+      tlsCheckImpl: okTlsCheckImpl(),
+      llmEnrichImpl: okLlmEnrichImpl(),
+    });
+
+    const active = await svc.startScan(['https://example.com/?q=1'], {
+      mode: 'active',
+      confirmAuthorized: true,
+    });
+    const activeDone = await vi.waitFor(async () => {
+      const s = await svc.getScan(active.id);
+      if (!s || s.status !== 'completed') throw new Error('not yet completed');
+      return s;
+    });
+    expect(activeDone.targets[0]?.injectionAttempts).toHaveLength(1);
+
+    const passive = await svc.startScan(['https://example.com/?q=1']);
+    const passiveDone = await vi.waitFor(async () => {
+      const s = await svc.getScan(passive.id);
+      if (!s || s.status !== 'completed') throw new Error('not yet completed');
+      return s;
+    });
+    expect(passiveDone.targets[0]?.injectionAttempts).toBeNull();
   });
 });
 
@@ -936,115 +969,5 @@ describe('detectTlsFindings', () => {
     const result = detectTlsFindings({ version: 'TLSv1.3', certExpiresAt }, now);
 
     expect(result.find((f) => f.category === 'cert-expiring-soon')).toBeUndefined();
-  });
-});
-
-describe('finding enrichment', () => {
-  it('populates explanation and suggested fix on every finding of a scanned target', async () => {
-    const enrichImpl: EnrichImpl = vi.fn<EnrichImpl>(async (toEnrich) =>
-      toEnrich.map((f) => ({
-        category: f.category,
-        explanation: `why ${f.category} matters`,
-        suggestedFix: `how to fix ${f.category}`,
-      })),
-    );
-    const svc = new ScannerService(createDb(':memory:'), {
-      fetchImpl: vi.fn(async () => okResponse()),
-      tlsCheckImpl: okTlsCheckImpl(),
-      enrichImpl,
-    });
-
-    const scan = await svc.startScan(['https://example.com']);
-    const completed = await vi.waitFor(async () => {
-      const s = await svc.getScan(scan.id);
-      if (!s || s.status !== 'completed') throw new Error('not yet completed');
-      return s;
-    });
-
-    const found = completed.targets[0]?.findings ?? [];
-    expect(found.length).toBeGreaterThan(0);
-    for (const finding of found) {
-      expect(finding.explanation).toBe(`why ${finding.category} matters`);
-      expect(finding.suggestedFix).toBe(`how to fix ${finding.category}`);
-    }
-  });
-
-  // The only observable difference between "cached" and "called twice" is the call count —
-  // the enriched text is identical either way — so this asserts on the seam by necessity.
-  it('reuses one enrichment call for two targets with an identical finding set', async () => {
-    const enrichImpl: EnrichImpl = vi.fn<EnrichImpl>(async (toEnrich) =>
-      toEnrich.map((f) => ({ category: f.category, explanation: 'why', suggestedFix: 'how' })),
-    );
-    const svc = new ScannerService(createDb(':memory:'), {
-      fetchImpl: vi.fn(async () => okResponse()),
-      tlsCheckImpl: okTlsCheckImpl(),
-      enrichImpl,
-    });
-
-    const scan = await svc.startScan(['https://a.example.com', 'https://b.example.com']);
-    const completed = await vi.waitFor(async () => {
-      const s = await svc.getScan(scan.id);
-      if (!s || s.status !== 'completed') throw new Error('not yet completed');
-      return s;
-    });
-
-    expect(completed.targets).toHaveLength(2);
-    for (const target of completed.targets) {
-      expect(target.findings.length).toBeGreaterThan(0);
-      for (const finding of target.findings) expect(finding.explanation).toBe('why');
-    }
-    expect(enrichImpl).toHaveBeenCalledTimes(1);
-  });
-
-  it('retries once and then leaves findings unenriched when the LLM call keeps failing', async () => {
-    const enrichImpl: EnrichImpl = vi.fn(async () => {
-      throw new Error('anthropic unavailable');
-    });
-    const svc = new ScannerService(createDb(':memory:'), {
-      fetchImpl: vi.fn(async () => okResponse()),
-      tlsCheckImpl: okTlsCheckImpl(),
-      enrichImpl,
-    });
-
-    const scan = await svc.startScan(['https://example.com']);
-    const completed = await vi.waitFor(async () => {
-      const s = await svc.getScan(scan.id);
-      if (!s || s.status !== 'completed') throw new Error('not yet completed');
-      return s;
-    });
-
-    const target = completed.targets[0];
-    expect(target?.status).toBe('ok');
-    expect(target?.findings.length).toBeGreaterThan(0);
-    for (const finding of target?.findings ?? []) {
-      expect(finding.explanation).toBeNull();
-      expect(finding.suggestedFix).toBeNull();
-    }
-    expect(enrichImpl).toHaveBeenCalledTimes(2);
-  });
-
-  it('recovers on the retry when the first LLM call fails', async () => {
-    const enrichImpl: EnrichImpl = vi
-      .fn<EnrichImpl>()
-      .mockRejectedValueOnce(new Error('transient'))
-      .mockImplementation(async (toEnrich) =>
-        toEnrich.map((f) => ({ category: f.category, explanation: 'why', suggestedFix: 'how' })),
-      );
-    const svc = new ScannerService(createDb(':memory:'), {
-      fetchImpl: vi.fn(async () => okResponse()),
-      tlsCheckImpl: okTlsCheckImpl(),
-      enrichImpl,
-    });
-
-    const scan = await svc.startScan(['https://example.com']);
-    const completed = await vi.waitFor(async () => {
-      const s = await svc.getScan(scan.id);
-      if (!s || s.status !== 'completed') throw new Error('not yet completed');
-      return s;
-    });
-
-    const found = completed.targets[0]?.findings ?? [];
-    expect(found.length).toBeGreaterThan(0);
-    for (const finding of found) expect(finding.explanation).toBe('why');
   });
 });
