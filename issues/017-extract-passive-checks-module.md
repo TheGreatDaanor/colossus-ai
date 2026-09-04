@@ -27,12 +27,23 @@ Per [[CONTEXT]], `passive-checks.ts` must not import from
 `active-scanner.ts` in either direction: mode selects which detector sets
 run, and the passive/active split only holds if the code reflects it.
 
+## What has already moved by the time this runs
+
+[[012]] extracts `findDisallowedAddress` and the IP-range tables into
+`src/services/ssrf-guard.ts` — it has to, to avoid an import cycle with
+`active-scanner.ts`. So the guard is *already* out of `scanner.ts` when this
+issue starts, and this issue does not touch it.
+
+OSV correlation and LLM enrichment stay in `scanner.ts`. Splitting them too
+would be the better end state, but [[021]] is modifying enrichment in the same
+window, and moving code you are also editing is how a "pure move" review stops
+being pure. Leave them; they are their own issue, later.
+
 ## Layers touched
 
 - Service: new `src/services/passive-checks.ts` — moves
-  `detectHeaderFindings`, `detectTlsFindings`, `extractVersionBanner`,
-  `isCookieSecure`'s replacement from [[016]], and the associated constant
-  tables.
+  `detectHeaderFindings`, `detectCookieFindings`, `detectTlsFindings`,
+  `extractVersionBanner` and the associated constant tables.
 - Service: `src/services/scanner.ts` — imports them; re-exports any symbol
   currently imported elsewhere so no caller breaks.
 - Tests: move the corresponding cases into

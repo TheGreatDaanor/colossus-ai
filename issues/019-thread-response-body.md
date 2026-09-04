@@ -19,12 +19,31 @@ belongs to [[013]]'s evidence storage, and nothing in the body-derived check
 set needs the body after its detectors have run. Holding it for the duration
 of one target's checks keeps this slice free of schema change.
 
+## The boundary carries a parsed document, not a raw string
+
+Three consumers want this body: [[020]]'s tag and attribute checks, the
+generator-tag banner path, and later [[014]]'s link and form harvesting. Each
+re-parsing the same (up to 2 MB, hostile) string is waste, so the detector
+boundary receives an already-parsed document.
+
+Parser: **`cheerio`**. Every consumer here is doing selector-and-attribute
+extraction — `$('form[action]')`, `$('meta[name=generator]')`,
+`$('script[src]')` — and cheerio is `parse5` underneath, so this is
+spec-compliant parsing with the ergonomic layer on top. `parse5` alone means
+hand-walking the tree in every detector; `jsdom` is a full DOM over hostile
+input, which is exactly the cost the size bound below exists to avoid.
+
+The parser dependency therefore lands here, in [[019]], rather than in
+[[020]] where it was originally flagged.
+
 ## Layers touched
 
+- Dependency: add `cheerio`.
 - Service: `src/services/scanner.ts` — read the body (bounded; see below)
-  after the existing header handling and hand it to the detector call.
+  after the existing header handling, parse it once, and hand the document to
+  the detector call.
 - Service: `src/services/passive-checks.ts` — detector signature accepts an
-  optional body alongside headers.
+  optional parsed document alongside headers.
 - Schema: none, deliberately.
 
 ## Bounds

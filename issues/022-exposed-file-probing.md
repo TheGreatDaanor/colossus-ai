@@ -24,8 +24,23 @@ unsubmitted request of this shape (`robots.txt`, for banner detection).
 
 Cut now so the decision is recorded rather than silently reinvented, but not
 scheduled: unlike [[018]] and [[020]], this introduces per-target request
-fan-out and therefore needs a timeout and concurrency budget that belongs
-alongside [[013]]. Do not start it before that budget exists.
+fan-out and therefore needs a request budget that does not exist yet.
+
+That budget is **not** [[013]]'s. [[013]] caps concurrent *browser contexts*
+in active mode; this needs a per-target *HTTP request* allowance in passive
+mode, where several extra GETs per target multiply against the existing
+concurrency of 10. Different resource. This issue defines its own, below.
+
+## Request fan-out budget (defined here)
+
+- A per-target request allowance — `maxExtraRequests`, default ~6 — covering
+  every request beyond the target's primary fetch.
+- Enforced in one small helper, so [[014]]'s crawl (same fan-out shape, same
+  need, capped at 25 discovered pages) reuses it rather than inventing a
+  second bound.
+- A global in-flight semaphore would protect the machine but not the *target*,
+  which is the party there is an attestation with. The allowance is per-target
+  for that reason.
 
 ## Checks and their categories
 
@@ -51,7 +66,7 @@ it sensibly rather than as an alarm.
 
 ## Definition of done
 
-- [ ] Timeout/concurrency budget from [[013]] exists
+- [ ] Per-target request allowance implemented as described above
 - [ ] Failing test written first, confirmed red
 - [ ] Implementation makes it green
 - [ ] `test`, `typecheck`, `lint` all pass

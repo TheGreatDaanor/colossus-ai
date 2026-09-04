@@ -30,11 +30,44 @@ no migration. Before implementing, confirm nothing outside
 `src/services/scanner.ts` relies on the positional-array assumption —
 check, do not assume.
 
+## The key cannot be the category
+
+Categories are **not unique per target**, and already are not, before [[018]]
+and [[020]] add anything. [[016]] shipped `detectCookieFindings`, which emits
+one finding per missing attribute *per cookie* — a target with three insecure
+cookies produces three findings all carrying `category:
+"cookie-missing-secure"`. Keying by category would collapse or misattribute
+among them: the exact bug this issue exists to fix.
+
+The key is a **synthetic per-finding id** (`f0`, `f1`, …) sent with each
+finding in the prompt and echoed back by the model. Positional in origin, but
+self-describing, so a reordered, short, or truncated response still lands
+correctly — and it imposes no "every detector must produce a discriminator"
+contract on future detectors.
+
+Deduplicating to one finding per category (carrying a list of affected
+cookies) would also make the key unique, and would simplify the model — but it
+silently reverses [[016]], which shipped one issue ago specifically to get
+per-cookie granularity.
+
+## Enrichment must stop overwriting detector explanations
+
+Related bug on the same code path: cookie findings already carry a precise,
+factual `explanation` ("Cookie \"session\" is missing the Secure attribute"),
+and the insert in `#processTarget` prefers the LLM's `explanation` over it.
+
+Flip the precedence — the detector's `explanation` wins, the LLM fills only
+where the detector left it null, and `suggestedFix` stays LLM-owned. A
+detector's explanation is a fact about the response; the LLM's is a paraphrase
+of a category name. This is a behavior change slightly beyond the keying
+scope, carried here because it is three lines on the same code path.
+
 ## Layers touched
 
-- Service: `src/services/scanner.ts` — prompt asks for an object/array keyed
-  by finding category; unmatched keys are dropped, unmatched findings are
-  stored with null enrichment.
+- Service: `src/services/scanner.ts` — prompt sends each finding with a
+  synthetic id and asks for results keyed by it; unmatched keys are dropped,
+  unmatched findings are stored with null enrichment; detector explanations
+  take precedence over LLM ones.
 - Schema: none. `explanation`/`suggestedFix` are already nullable.
 
 ## Definition of done

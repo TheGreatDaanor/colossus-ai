@@ -21,13 +21,31 @@ the target's attempt outcome showing why.
 - From PRD: active scanning doesn't become a hole in my own SSRF
   protection.
 
+## Extract the guard first — do not import it from `scanner.ts`
+
+`scanner.ts` already imports `active-scanner.ts` (for
+`enumerateInjectionPoints`). Exporting `findDisallowedAddress` *from*
+`scanner.ts` for `active-scanner.ts` to use would close that into a cycle, and
+an import cycle combined with Vitest module mocking produces failures that
+read like logic bugs.
+
+So `findDisallowedAddress` and the IP-range tables move to a new
+`src/services/ssrf-guard.ts` that both modules import. This is the same move
+[[017]] makes for the detectors, one issue earlier, and it makes the guard
+independently testable — which matters more here than for anything else in the
+file. It also removes the guard from the set of things [[017]] would otherwise
+leave behind in `scanner.ts` under the heading of "orchestration", where it
+does not belong.
+
 ## Layers touched
 
+- Service: new `src/services/ssrf-guard.ts` — `findDisallowedAddress` and the
+  IP-range constant tables, moved verbatim from `scanner.ts`.
+- Service: `src/services/scanner.ts` — imports the guard from its new home.
 - Service: `src/services/active-scanner.ts` — a `page.route()` /
-  `page.on('request')` interception hook resolves each request's hostname
-  and checks it against the existing `findDisallowedAddress` (from
-  `scanner.ts`, exported for reuse) before allowing it; a match aborts the
-  request and marks the attempt `unavailable`.
+  `page.on('request')` interception hook resolves each request's hostname and
+  checks it against `findDisallowedAddress` before allowing it; a match aborts
+  the request and marks the attempt `unavailable`.
 
 ## Definition of done
 
@@ -40,3 +58,10 @@ the target's attempt outcome showing why.
 
 - DNS rebinding between check-time and request-time — same accepted gap as
   [[002]], not closed here either.
+- Emitting a **finding** for a target that redirects the scanner at a private
+  address (`redirect-to-internal-address`, medium, definitive). A target doing
+  this is genuinely interesting and this is a real candidate — but this issue
+  is defensive: its job is that the scanner does not become the exploit, and
+  turning it into a detector doubles its surface and its test matrix. Recorded
+  here so it is not reinvented from scratch later.
+
