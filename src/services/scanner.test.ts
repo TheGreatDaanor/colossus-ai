@@ -160,12 +160,14 @@ describe('ScannerService', () => {
     });
 
     const [target] = completed.targets;
-    expect(target?.findings).toHaveLength(5);
+    expect(target?.findings).toHaveLength(7);
     expect(target?.findings.map((f) => f.category).sort()).toEqual(
       [
         'insecure-cookie',
         'missing-csp',
         'missing-hsts',
+        'missing-permissions-policy',
+        'missing-referrer-policy',
         'missing-x-content-type-options',
         'missing-x-frame-options',
       ].sort(),
@@ -802,26 +804,42 @@ describe('isDisallowedAddress', () => {
 });
 
 describe('detectHeaderFindings', () => {
-  it('flags a response missing all four security headers', () => {
+  it('flags a response missing all six security headers', () => {
     const result = detectHeaderFindings({});
 
     expect(result.map((f) => f.category).sort()).toEqual(
-      ['missing-csp', 'missing-hsts', 'missing-x-content-type-options', 'missing-x-frame-options'].sort(),
+      [
+        'missing-csp',
+        'missing-hsts',
+        'missing-permissions-policy',
+        'missing-referrer-policy',
+        'missing-x-content-type-options',
+        'missing-x-frame-options',
+      ].sort(),
     );
     for (const finding of result) {
       expect(finding.confidence).toBe('definitive');
     }
   });
 
-  it('does not flag any of the four headers when all are present', () => {
+  it('does not flag any of the six headers when all are present', () => {
     const result = detectHeaderFindings({
       'content-security-policy': "default-src 'self'",
       'x-frame-options': 'DENY',
       'x-content-type-options': 'nosniff',
       'strict-transport-security': 'max-age=63072000',
+      'referrer-policy': 'no-referrer',
+      'permissions-policy': 'geolocation=()',
     });
 
     expect(result).toHaveLength(0);
+  });
+
+  it('flags missing Referrer-Policy and Permissions-Policy as low severity', () => {
+    const result = detectHeaderFindings({});
+
+    expect(result.find((f) => f.category === 'missing-referrer-policy')).toMatchObject({ severity: 'low' });
+    expect(result.find((f) => f.category === 'missing-permissions-policy')).toMatchObject({ severity: 'low' });
   });
 
   it('flags a Set-Cookie header missing Secure, HttpOnly, and SameSite as insecure', () => {
@@ -918,5 +936,115 @@ describe('detectTlsFindings', () => {
     const result = detectTlsFindings({ version: 'TLSv1.3', certExpiresAt }, now);
 
     expect(result.find((f) => f.category === 'cert-expiring-soon')).toBeUndefined();
+  });
+});
+
+describe('finding enrichment', () => {
+  it('populates explanation and suggested fix on every finding of a scanned target', async () => {
+    const enrichImpl: EnrichImpl = vi.fn<EnrichImpl>(async (toEnrich) =>
+      toEnrich.map((f) => ({
+        category: f.category,
+        explanation: `why ${f.category} matters`,
+        suggestedFix: `how to fix ${f.category}`,
+      })),
+    );
+    const svc = new ScannerService(createDb(':memory:'), {
+      fetchImpl: vi.fn(async () => okResponse()),
+      tlsCheckImpl: okTlsCheckImpl(),
+      enrichImpl,
+    });
+
+    const scan = await svc.startScan(['https://example.com']);
+    const completed = await vi.waitFor(async () => {
+      const s = await svc.getScan(scan.id);
+      if (!s || s.status !== 'completed') throw new Error('not yet completed');
+      return s;
+    });
+
+    const found = completed.targets[0]?.findings ?? [];
+    expect(found.length).toBeGreaterThan(0);
+    for (const finding of found) {
+      expect(finding.explanation).toBe(`why ${finding.category} matters`);
+      expect(finding.suggestedFix).toBe(`how to fix ${finding.category}`);
+    }
+  });
+
+  // The only observable difference between "cached" and "called twice" is the call count —
+  // the enriched text is identical either way — so this asserts on the seam by necessity.
+  it('reuses one enrichment call for two targets with an identical finding set', async () => {
+    const enrichImpl: EnrichImpl = vi.fn<EnrichImpl>(async (toEnrich) =>
+      toEnrich.map((f) => ({ category: f.category, explanation: 'why', suggestedFix: 'how' })),
+    );
+    const svc = new ScannerService(createDb(':memory:'), {
+      fetchImpl: vi.fn(async () => okResponse()),
+      tlsCheckImpl: okTlsCheckImpl(),
+      enrichImpl,
+    });
+
+    const scan = await svc.startScan(['https://a.example.com', 'https://b.example.com']);
+    const completed = await vi.waitFor(async () => {
+      const s = await svc.getScan(scan.id);
+      if (!s || s.status !== 'completed') throw new Error('not yet completed');
+      return s;
+    });
+
+    expect(completed.targets).toHaveLength(2);
+    for (const target of completed.targets) {
+      expect(target.findings.length).toBeGreaterThan(0);
+      for (const finding of target.findings) expect(finding.explanation).toBe('why');
+    }
+    expect(enrichImpl).toHaveBeenCalledTimes(1);
+  });
+
+  it('retries once and then leaves findings unenriched when the LLM call keeps failing', async () => {
+    const enrichImpl: EnrichImpl = vi.fn(async () => {
+      throw new Error('anthropic unavailable');
+    });
+    const svc = new ScannerService(createDb(':memory:'), {
+      fetchImpl: vi.fn(async () => okResponse()),
+      tlsCheckImpl: okTlsCheckImpl(),
+      enrichImpl,
+    });
+
+    const scan = await svc.startScan(['https://example.com']);
+    const completed = await vi.waitFor(async () => {
+      const s = await svc.getScan(scan.id);
+      if (!s || s.status !== 'completed') throw new Error('not yet completed');
+      return s;
+    });
+
+    const target = completed.targets[0];
+    expect(target?.status).toBe('ok');
+    expect(target?.findings.length).toBeGreaterThan(0);
+    for (const finding of target?.findings ?? []) {
+      expect(finding.explanation).toBeNull();
+      expect(finding.suggestedFix).toBeNull();
+    }
+    expect(enrichImpl).toHaveBeenCalledTimes(2);
+  });
+
+  it('recovers on the retry when the first LLM call fails', async () => {
+    const enrichImpl: EnrichImpl = vi
+      .fn<EnrichImpl>()
+      .mockRejectedValueOnce(new Error('transient'))
+      .mockImplementation(async (toEnrich) =>
+        toEnrich.map((f) => ({ category: f.category, explanation: 'why', suggestedFix: 'how' })),
+      );
+    const svc = new ScannerService(createDb(':memory:'), {
+      fetchImpl: vi.fn(async () => okResponse()),
+      tlsCheckImpl: okTlsCheckImpl(),
+      enrichImpl,
+    });
+
+    const scan = await svc.startScan(['https://example.com']);
+    const completed = await vi.waitFor(async () => {
+      const s = await svc.getScan(scan.id);
+      if (!s || s.status !== 'completed') throw new Error('not yet completed');
+      return s;
+    });
+
+    const found = completed.targets[0]?.findings ?? [];
+    expect(found.length).toBeGreaterThan(0);
+    for (const finding of found) expect(finding.explanation).toBe('why');
   });
 });

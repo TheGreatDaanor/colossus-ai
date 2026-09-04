@@ -11,7 +11,9 @@ import {
   type ScanTargetStatus,
   type FindingSeverity,
   type FindingConfidence,
+  type ScanMode,
 } from '../db/schema.js';
+import { enumerateInjectionAttempts } from './active-scanner.js';
 
 export class ScanValidationError extends Error {}
 
@@ -25,6 +27,9 @@ export type ScanWithTargets = Scan & { targets: (ScanTarget & { findings: Findin
 export type StartScanOptions = {
   name?: string;
   userAgent?: string;
+  mode?: ScanMode;
+  confirmAuthorized?: boolean;
+  authorizationNote?: string;
 };
 
 function defaultScanName(now: Date): string {
@@ -163,6 +168,8 @@ const MISSING_HEADER_FINDINGS: { header: string; category: string; severity: Fin
   { header: 'strict-transport-security', category: 'missing-hsts', severity: 'high' },
   { header: 'x-frame-options', category: 'missing-x-frame-options', severity: 'medium' },
   { header: 'x-content-type-options', category: 'missing-x-content-type-options', severity: 'low' },
+  { header: 'referrer-policy', category: 'missing-referrer-policy', severity: 'low' },
+  { header: 'permissions-policy', category: 'missing-permissions-policy', severity: 'low' },
 ];
 
 function isCookieSecure(setCookie: string): boolean {
@@ -265,6 +272,81 @@ function defaultTlsCheck(hostname: string, port: number, timeoutMs: number): Pro
       reject(new Error(`TLS handshake to ${hostname}:${port} timed out`));
     });
   });
+}
+
+export type EnrichedFinding = { category: string; explanation: string; suggestedFix: string };
+export type EnrichImpl = (findings: Finding[]) => Promise<EnrichedFinding[]>;
+
+const ENRICH_MODEL = 'claude-opus-5';
+
+const ENRICH_TOOL = {
+  name: 'report_finding_explanations',
+  description: 'Report a plain-English explanation and suggested fix for each security finding.',
+  input_schema: {
+    type: 'object' as const,
+    properties: {
+      findings: {
+        type: 'array',
+        items: {
+          type: 'object',
+          properties: {
+            category: { type: 'string', description: 'The finding category being explained.' },
+            explanation: { type: 'string', description: 'Why this finding matters, in plain English.' },
+            suggested_fix: { type: 'string', description: 'A concrete, actionable remediation step.' },
+          },
+          required: ['category', 'explanation', 'suggested_fix'],
+          additionalProperties: false,
+        },
+      },
+    },
+    required: ['findings'],
+    additionalProperties: false,
+  },
+  strict: true,
+};
+
+// Scanned sites control some of the text that reaches this prompt (banners, cookie names).
+// Prompt-injection hardening is explicitly out of scope per the PRD — raw findings are always
+// rendered regardless of what comes back here, so a hijacked explanation cannot hide a finding.
+async function defaultEnrich(findingRows: Finding[]): Promise<EnrichedFinding[]> {
+  const { default: Anthropic } = await import('@anthropic-ai/sdk');
+  const client = new Anthropic();
+
+  const response = await client.messages.create({
+    model: ENRICH_MODEL,
+    max_tokens: 16000,
+    thinking: { type: 'adaptive' },
+    tools: [ENRICH_TOOL],
+    tool_choice: { type: 'tool', name: ENRICH_TOOL.name },
+    messages: [
+      {
+        role: 'user',
+        content:
+          'Explain each of these web security scan findings for the site owner, and suggest a fix. ' +
+          'Return exactly one entry per input category, reusing the category string verbatim.\n\n' +
+          JSON.stringify(
+            findingRows.map((f) => ({
+              category: f.category,
+              severity: f.severity,
+              confidence: f.confidence,
+              cve_id: f.cveId,
+            })),
+          ),
+      },
+    ],
+  });
+
+  const toolUse = response.content.find((block) => block.type === 'tool_use');
+  if (toolUse === undefined) throw new Error('enrichment response contained no tool_use block');
+
+  const { findings: entries } = toolUse.input as {
+    findings: { category: string; explanation: string; suggested_fix: string }[];
+  };
+  return entries.map((e) => ({
+    category: e.category,
+    explanation: e.explanation,
+    suggestedFix: e.suggested_fix,
+  }));
 }
 
 export type FetchImpl = (url: string, init: RequestInit) => Promise<Response>;
@@ -389,6 +471,9 @@ export class ScannerService {
   async startScan(urls: string[], options: StartScanOptions = {}): Promise<Scan> {
     if (urls.length === 0) throw new ScanValidationError('urls must not be empty');
     if (urls.length > MAX_URLS) throw new ScanValidationError(`urls must not exceed ${MAX_URLS}`);
+    if (options.mode === 'active' && options.confirmAuthorized !== true) {
+      throw new ScanValidationError('mode "active" requires confirmAuthorized: true');
+    }
 
     const deduped = dedupe(urls);
     const valid = deduped.filter(isAllowedUrl);
@@ -403,6 +488,9 @@ export class ScannerService {
         name: options.name ?? defaultScanName(now),
         status: hasValid ? 'pending' : 'failed',
         urls: deduped,
+        mode: options.mode ?? 'passive',
+        confirmAuthorized: options.confirmAuthorized ?? null,
+        authorizationNote: options.authorizationNote ?? null,
         userAgent: options.userAgent ?? null,
         error: hasValid ? null : 'no valid URLs to scan',
         createdAt: now,
@@ -431,7 +519,7 @@ export class ScannerService {
         .get(),
     );
 
-    void this.#runScan(scan.id, targetRows);
+    void this.#runScan(scan.id, scan.mode, targetRows);
 
     return scan;
   }
@@ -453,7 +541,7 @@ export class ScannerService {
     return this.#db.select().from(scans).orderBy(scans.createdAt).all().reverse();
   }
 
-  async #runScan(scanId: number, targetRows: ScanTarget[]): Promise<void> {
+  async #runScan(scanId: number, mode: ScanMode, targetRows: ScanTarget[]): Promise<void> {
     this.#db.update(scans).set({ status: 'running' }).where(eq(scans.id, scanId)).run();
 
     // Cached per scan run, not on the instance: the PRD requires CVE lookups to be
@@ -462,6 +550,12 @@ export class ScannerService {
     // Same rationale, for LLM enrichment: identical finding-sets within one scan
     // reuse a single call, keyed by a fingerprint of the sorted finding-set.
     const llmCache = new Map<string, Promise<EnrichedFinding[]>>();
+
+    // Same per-scan (never cross-scan) rule as cveCache: keyed on the finding *set*, since
+    // that set is the entire input to the LLM call — two targets with the same findings get
+    // the same explanations, so the second one costs nothing. Holds the in-flight promise so
+    // targets running concurrently in the same batch share one call rather than racing.
+    const enrichCache = new Map<string, Promise<EnrichedFinding[] | null>>();
 
     for (let i = 0; i < targetRows.length; i += this.#concurrency) {
       const batch = targetRows.slice(i, i + this.#concurrency);
@@ -512,6 +606,7 @@ export class ScannerService {
       const status: ScanTargetStatus = 'ok';
       const redirectLocation = response.headers.get('location');
       const responseHeaders = lowercaseHeaders(response.headers);
+      const injectionAttempts = mode === 'active' ? enumerateInjectionAttempts(target.url) : undefined;
 
       this.#db
         .update(scanTargets)
@@ -521,6 +616,7 @@ export class ScannerService {
           responseHeaders,
           responseTimeMs: elapsed,
           redirectLocation: redirectLocation ?? null,
+          ...(injectionAttempts !== undefined ? { injectionAttempts } : {}),
         })
         .where(eq(scanTargets.id, target.id))
         .run();

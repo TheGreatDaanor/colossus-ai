@@ -1,6 +1,7 @@
 import { sqliteTable, integer, text } from 'drizzle-orm/sqlite-core';
 
 export type ScanStatus = 'pending' | 'running' | 'completed' | 'failed';
+export type ScanMode = 'passive' | 'active';
 export type ScanTargetStatus = 'pending' | 'ok' | 'unreachable' | 'timeout' | 'invalid';
 export type FindingSeverity = 'critical' | 'high' | 'medium' | 'low' | 'info';
 export type FindingConfidence = 'definitive' | 'possible';
@@ -10,6 +11,9 @@ export const scans = sqliteTable('scans', {
   name: text('name').notNull(),
   status: text('status').$type<ScanStatus>().notNull(),
   urls: text('urls', { mode: 'json' }).$type<string[]>().notNull(),
+  mode: text('mode').$type<ScanMode>().notNull().default('passive'),
+  confirmAuthorized: integer('confirm_authorized', { mode: 'boolean' }),
+  authorizationNote: text('authorization_note'),
   userAgent: text('user_agent'),
   error: text('error'),
   createdAt: integer('created_at', { mode: 'timestamp' }).notNull(),
@@ -30,6 +34,9 @@ export const scanTargets = sqliteTable('scan_targets', {
   tlsCertExpiresAt: integer('tls_cert_expires_at', { mode: 'timestamp' }),
   redirectLocation: text('redirect_location'),
   error: text('error'),
+  injectionAttempts: text('injection_attempts', { mode: 'json' }).$type<
+    { param: string; payload: string; url: string }[]
+  >(),
 });
 
 export const findings = sqliteTable('findings', {

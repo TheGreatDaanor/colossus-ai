@@ -68,6 +68,41 @@ describe('POST /scans', () => {
 
     expect(res.status).toBe(400);
   });
+
+  it('rejects mode "active" without confirmAuthorized', async () => {
+    const { app } = buildApp();
+
+    const res = await app.request('/scans', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ urls: ['https://example.com'], mode: 'active' }),
+    });
+
+    expect(res.status).toBe(400);
+    const body = await json<ErrorBody>(res);
+    expect(body.error).toEqual(expect.any(String));
+  });
+
+  it('accepts mode "active" with confirmAuthorized and surfaces mode/confirmAuthorized on the scan', async () => {
+    const { app } = buildApp();
+
+    const res = await app.request('/scans', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        urls: ['https://example.com'],
+        mode: 'active',
+        confirmAuthorized: true,
+        authorizationNote: 'pentest engagement #42',
+      }),
+    });
+
+    expect(res.status).toBe(201);
+    const body = await json<ScanBody & { mode: string; confirmAuthorized: boolean; authorizationNote: string }>(res);
+    expect(body.mode).toBe('active');
+    expect(body.confirmAuthorized).toBe(true);
+    expect(body.authorizationNote).toBe('pentest engagement #42');
+  });
 });
 
 describe('GET /scans', () => {
