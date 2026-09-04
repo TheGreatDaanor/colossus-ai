@@ -1,6 +1,7 @@
 import { lookup } from 'node:dns/promises';
 import { isIP } from 'node:net';
 import { connect as tlsConnect } from 'node:tls';
+import Anthropic from '@anthropic-ai/sdk';
 import { eq } from 'drizzle-orm';
 import type { Db } from '../db/client.js';
 import {
@@ -372,12 +373,77 @@ const CVE_FINDING_CATEGORY = 'known-vulnerability';
 // a known, matched CVE is a serious signal even without a parsed CVSS score.
 const CVE_FINDING_SEVERITY: FindingSeverity = 'high';
 
+export type LlmEnrichInput = {
+  category: string;
+  severity: FindingSeverity;
+  confidence: FindingConfidence;
+  cveId: string | null;
+};
+export type LlmEnrichment = { explanation: string; suggestedFix: string };
+export type EnrichedFinding = { explanation: string | null; suggestedFix: string | null };
+export type LlmEnrichImpl = (findings: LlmEnrichInput[]) => Promise<LlmEnrichment[]>;
+
+const ENRICHMENT_TOOL_NAME = 'report_finding_explanations';
+const LLM_RETRY_DELAY_MS = 1000;
+
+async function defaultLlmEnrich(findings: LlmEnrichInput[]): Promise<LlmEnrichment[]> {
+  const client = new Anthropic();
+  const response = await client.messages.create({
+    model: 'claude-sonnet-5',
+    max_tokens: 4096,
+    tool_choice: { type: 'tool', name: ENRICHMENT_TOOL_NAME },
+    tools: [
+      {
+        name: ENRICHMENT_TOOL_NAME,
+        description:
+          'Report a plain-English explanation and a suggested fix for each security finding, one entry per finding, in the same order as the input list.',
+        input_schema: {
+          type: 'object',
+          properties: {
+            findings: {
+              type: 'array',
+              items: {
+                type: 'object',
+                properties: {
+                  explanation: { type: 'string', description: 'Plain-English explanation of the risk.' },
+                  suggestedFix: { type: 'string', description: 'A concrete suggested fix.' },
+                },
+                required: ['explanation', 'suggestedFix'],
+              },
+            },
+          },
+          required: ['findings'],
+        },
+      },
+    ],
+    messages: [
+      {
+        role: 'user',
+        content: `For each of these security findings, give a short plain-English explanation and a suggested fix. Findings:\n${JSON.stringify(findings)}`,
+      },
+    ],
+  });
+
+  const toolUse = response.content.find((block) => block.type === 'tool_use');
+  if (toolUse === undefined || toolUse.type !== 'tool_use') {
+    throw new Error('LLM enrichment response did not include a tool_use block');
+  }
+
+  const input = toolUse.input as { findings?: unknown };
+  if (!Array.isArray(input.findings)) throw new Error('LLM enrichment response is missing a findings array');
+  return input.findings as LlmEnrichment[];
+}
+
+function findingFingerprint(finding: LlmEnrichInput): string {
+  return `${finding.category}|${finding.severity}|${finding.confidence}|${finding.cveId ?? ''}`;
+}
+
 export class ScannerService {
   readonly #db: Db;
   readonly #fetchImpl: FetchImpl;
   readonly #tlsCheckImpl: TlsCheckImpl;
   readonly #osvCheckImpl: OsvCheckImpl;
-  readonly #enrichImpl: EnrichImpl;
+  readonly #llmEnrichImpl: LlmEnrichImpl;
   readonly #timeoutMs: number;
   readonly #concurrency: number;
 
@@ -387,7 +453,7 @@ export class ScannerService {
       fetchImpl?: FetchImpl;
       tlsCheckImpl?: TlsCheckImpl;
       osvCheckImpl?: OsvCheckImpl;
-      enrichImpl?: EnrichImpl;
+      llmEnrichImpl?: LlmEnrichImpl;
       timeoutMs?: number;
       concurrency?: number;
     } = {},
@@ -399,7 +465,7 @@ export class ScannerService {
     this.#tlsCheckImpl =
       options.tlsCheckImpl ?? ((hostname, port) => defaultTlsCheck(hostname, port, this.#timeoutMs));
     this.#osvCheckImpl = options.osvCheckImpl ?? defaultOsvCheck;
-    this.#enrichImpl = options.enrichImpl ?? defaultEnrich;
+    this.#llmEnrichImpl = options.llmEnrichImpl ?? defaultLlmEnrich;
   }
 
   async startScan(urls: string[], options: StartScanOptions = {}): Promise<Scan> {
@@ -481,6 +547,9 @@ export class ScannerService {
     // Cached per scan run, not on the instance: the PRD requires CVE lookups to be
     // cached per unique version string *within a scan* and never reused across scans.
     const cveCache = new Map<string, OsvMatch | null>();
+    // Same rationale, for LLM enrichment: identical finding-sets within one scan
+    // reuse a single call, keyed by a fingerprint of the sorted finding-set.
+    const llmCache = new Map<string, Promise<EnrichedFinding[]>>();
 
     // Same per-scan (never cross-scan) rule as cveCache: keyed on the finding *set*, since
     // that set is the entire input to the LLM call — two targets with the same findings get
@@ -490,9 +559,7 @@ export class ScannerService {
 
     for (let i = 0; i < targetRows.length; i += this.#concurrency) {
       const batch = targetRows.slice(i, i + this.#concurrency);
-      await Promise.all(
-        batch.map((target) => this.#processTarget(target, mode, cveCache, enrichCache)),
-      );
+      await Promise.all(batch.map((target) => this.#processTarget(target, cveCache, llmCache)));
     }
 
     this.#db
@@ -504,9 +571,8 @@ export class ScannerService {
 
   async #processTarget(
     target: ScanTarget,
-    mode: ScanMode,
     cveCache: Map<string, OsvMatch | null>,
-    enrichCache: Map<string, Promise<EnrichedFinding[] | null>>,
+    llmCache: Map<string, Promise<EnrichedFinding[]>>,
   ): Promise<void> {
     console.warn(`[scan ${target.scanId}] ${target.url} started`);
 
@@ -555,18 +621,17 @@ export class ScannerService {
         .where(eq(scanTargets.id, target.id))
         .run();
 
+      // Findings are collected here rather than inserted immediately so that
+      // #enrichFindings sees the target's whole finding-set at once — the LLM
+      // dedup cache is keyed on the full set, not per-individual-finding.
+      const targetFindings: LlmEnrichInput[] = [];
+
       for (const finding of detectHeaderFindings(responseHeaders)) {
-        this.#db
-          .insert(findings)
-          .values({ scanTargetId: target.id, ...finding })
-          .run();
+        targetFindings.push({ ...finding, cveId: null });
       }
 
       if (targetUrl.protocol === 'http:') {
-        this.#db
-          .insert(findings)
-          .values({ scanTargetId: target.id, ...NO_TLS_FINDING })
-          .run();
+        targetFindings.push({ ...NO_TLS_FINDING, cveId: null });
       } else {
         // TLS-check failures degrade gracefully (target stays `ok`, TLS columns/findings
         // are just skipped) rather than failing the target — mirrors the CVE-lookup
@@ -583,10 +648,7 @@ export class ScannerService {
             .run();
 
           for (const finding of detectTlsFindings(tlsInfo)) {
-            this.#db
-              .insert(findings)
-              .values({ scanTargetId: target.id, ...finding })
-              .run();
+            targetFindings.push({ ...finding, cveId: null });
           }
         } catch (tlsErr) {
           const message = tlsErr instanceof Error ? tlsErr.message : String(tlsErr);
@@ -599,20 +661,23 @@ export class ScannerService {
       if (banner !== null) {
         const match = await this.#lookupCve(banner, cveCache, target.scanId, target.url);
         if (match !== null) {
-          this.#db
-            .insert(findings)
-            .values({
-              scanTargetId: target.id,
-              category: CVE_FINDING_CATEGORY,
-              severity: CVE_FINDING_SEVERITY,
-              confidence: 'possible',
-              cveId: match.cveId,
-            })
-            .run();
+          targetFindings.push({
+            category: CVE_FINDING_CATEGORY,
+            severity: CVE_FINDING_SEVERITY,
+            confidence: 'possible',
+            cveId: match.cveId,
+          });
         }
       }
 
-      await this.#enrichTargetFindings(target, enrichCache);
+      const enrichments = await this.#enrichFindings(targetFindings, llmCache, target.scanId, target.url);
+      targetFindings.forEach((finding, index) => {
+        const enrichment = enrichments[index] ?? { explanation: null, suggestedFix: null };
+        this.#db
+          .insert(findings)
+          .values({ scanTargetId: target.id, ...finding, ...enrichment })
+          .run();
+      });
 
       console.warn(`[scan ${target.scanId}] ${target.url} succeeded`);
     } catch (err) {
@@ -673,52 +738,55 @@ export class ScannerService {
     return match;
   }
 
-  async #enrichTargetFindings(
-    target: ScanTarget,
-    cache: Map<string, Promise<EnrichedFinding[] | null>>,
-  ): Promise<void> {
-    const rows = this.#db.select().from(findings).where(eq(findings.scanTargetId, target.id)).all();
-    if (rows.length === 0) return;
+  async #enrichFindings(
+    targetFindings: LlmEnrichInput[],
+    cache: Map<string, Promise<EnrichedFinding[]>>,
+    scanId: number,
+    url: string,
+  ): Promise<EnrichedFinding[]> {
+    if (targetFindings.length === 0) return [];
 
-    const key = rows
-      .map((r) => `${r.category}|${r.severity}|${r.cveId ?? ''}`)
-      .sort()
-      .join(',');
+    // Sorted by fingerprint so two targets with the same findings in a different
+    // insertion order still hit the cache under the same key.
+    const withIndex = targetFindings.map((finding, index) => ({ finding, index }));
+    const sorted = [...withIndex].sort((a, b) =>
+      findingFingerprint(a.finding).localeCompare(findingFingerprint(b.finding)),
+    );
+    const key = sorted.map(({ finding }) => findingFingerprint(finding)).join('|');
 
-    let pending = cache.get(key);
-    if (pending === undefined) {
-      pending = this.#enrich(rows, target.scanId, target.url);
-      cache.set(key, pending);
-    }
-
-    const enriched = await pending;
-    if (enriched === null) return;
-
-    const byCategory = new Map(enriched.map((e) => [e.category, e]));
-    for (const row of rows) {
-      const match = byCategory.get(row.category);
-      if (match === undefined) continue;
-      this.#db
-        .update(findings)
-        .set({ explanation: match.explanation, suggestedFix: match.suggestedFix })
-        .where(eq(findings.id, row.id))
-        .run();
-    }
-  }
-
-  // Retries once, then degrades to null (leaving explanation/suggested_fix unset) rather
-  // than failing the target — detection results are useful without the LLM commentary.
-  async #enrich(rows: Finding[], scanId: number, url: string): Promise<EnrichedFinding[] | null> {
-    for (let attempt = 1; attempt <= 2; attempt++) {
-      try {
-        return await this.#enrichImpl(rows);
-      } catch (err) {
-        if (attempt === 2) {
-          const message = err instanceof Error ? err.message : String(err);
-          console.warn(`[scan ${scanId}] ${url} finding enrichment failed after retry: ${message}`);
+    // The promise itself (not its resolved value) is cached synchronously,
+    // before any await — so a second target reaching this key while the first
+    // call is still in flight awaits the same promise instead of firing its
+    // own concurrent LLM call.
+    let inFlight = cache.get(key);
+    if (!inFlight) {
+      inFlight = (async () => {
+        for (let attempt = 1; attempt <= 2; attempt++) {
+          try {
+            const result = await this.#llmEnrichImpl(sorted.map(({ finding }) => finding));
+            if (result.length !== sorted.length) throw new Error('LLM enrichment returned a mismatched result count');
+            return result;
+          } catch (err) {
+            if (attempt === 2) {
+              const message = err instanceof Error ? err.message : String(err);
+              console.warn(`[scan ${scanId}] ${url} LLM enrichment failed after retry: ${message}`);
+            } else {
+              await new Promise((resolve) => setTimeout(resolve, LLM_RETRY_DELAY_MS));
+            }
+          }
         }
-      }
+        return sorted.map(() => ({ explanation: null, suggestedFix: null }));
+      })();
+      cache.set(key, inFlight);
     }
-    return null;
+
+    const sortedResult = await inFlight;
+
+    const result: EnrichedFinding[] = targetFindings.map(() => ({ explanation: null, suggestedFix: null }));
+    sorted.forEach(({ index }, position) => {
+      const enriched = sortedResult[position];
+      if (enriched) result[index] = enriched;
+    });
+    return result;
   }
 }

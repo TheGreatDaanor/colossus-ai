@@ -4,6 +4,9 @@ import { createDb } from './db/client.js';
 import { createDashboardRoutes } from './routes/dashboard.js';
 import { createScansRoutes } from './routes/scans.js';
 import { ScannerService } from './services/scanner.js';
+import { assertAnthropicApiKey } from './startup.js';
+
+assertAnthropicApiKey(process.env);
 
 const port = Number(process.env['PORT'] ?? 3000);
 const dbPath = process.env['DB_PATH'] ?? './data/scanner.db';
