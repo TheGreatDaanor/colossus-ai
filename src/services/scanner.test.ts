@@ -10,6 +10,7 @@ import {
   type FetchImpl,
   type TlsCheckImpl,
   type OsvCheckImpl,
+  type LlmEnrichImpl,
 } from './scanner.js';
 
 function deferred<T>(): { promise: Promise<T>; resolve: (v: T) => void } {
@@ -29,6 +30,41 @@ function okResponse(body: Record<string, string> = { 'x-test': '1' }): Response 
 function okTlsCheckImpl(): TlsCheckImpl {
   return vi.fn(async () => ({ version: 'TLSv1.3', certExpiresAt: new Date('2099-01-01T00:00:00Z') }));
 }
+
+describe('ScannerService active mode', () => {
+  it('rejects mode: "active" without confirmAuthorized', async () => {
+    const svc = new ScannerService(createDb(':memory:'));
+    await expect(svc.startScan(['https://example.com'], { mode: 'active' })).rejects.toThrow(ScanValidationError);
+  });
+
+  it('rejects mode: "active" with confirmAuthorized: false', async () => {
+    const svc = new ScannerService(createDb(':memory:'));
+    await expect(
+      svc.startScan(['https://example.com'], { mode: 'active', confirmAuthorized: false }),
+    ).rejects.toThrow(ScanValidationError);
+  });
+
+  it('accepts mode: "active" with confirmAuthorized: true and persists mode/attestation', async () => {
+    const svc = new ScannerService(createDb(':memory:'), { fetchImpl: vi.fn(async () => okResponse()) });
+    const scan = await svc.startScan(['https://example.com'], {
+      mode: 'active',
+      confirmAuthorized: true,
+      authorizationNote: 'own domain',
+    });
+
+    expect(scan.mode).toBe('active');
+    expect(scan.confirmAuthorized).toBe(true);
+    expect(scan.authorizationNote).toBe('own domain');
+  });
+
+  it('defaults to passive mode when mode is omitted', async () => {
+    const svc = new ScannerService(createDb(':memory:'), { fetchImpl: vi.fn(async () => okResponse()) });
+    const scan = await svc.startScan(['https://example.com']);
+
+    expect(scan.mode).toBe('passive');
+    expect(scan.confirmAuthorized).toBeNull();
+  });
+});
 
 describe('ScannerService', () => {
   it('rejects an empty URL list', async () => {
@@ -713,5 +749,152 @@ describe('detectTlsFindings', () => {
     const result = detectTlsFindings({ version: 'TLSv1.3', certExpiresAt }, now);
 
     expect(result.find((f) => f.category === 'cert-expiring-soon')).toBeUndefined();
+  });
+});
+
+describe('ScannerService LLM finding enrichment', () => {
+  it('populates explanation and suggestedFix on findings from the LLM enrichment call', async () => {
+    const fetchImpl: FetchImpl = vi.fn(async () => okResponse());
+    const llmEnrichImpl: LlmEnrichImpl = vi.fn(async (toEnrich) =>
+      toEnrich.map(() => ({ explanation: 'plain-english explanation', suggestedFix: 'add the header' })),
+    );
+    const svc = new ScannerService(createDb(':memory:'), {
+      fetchImpl,
+      tlsCheckImpl: okTlsCheckImpl(),
+      llmEnrichImpl,
+    });
+
+    const scan = await svc.startScan(['https://example.com']);
+
+    const completed = await vi.waitFor(async () => {
+      const s = await svc.getScan(scan.id);
+      if (!s || s.status !== 'completed') throw new Error('not yet completed');
+      return s;
+    });
+
+    const [target] = completed.targets;
+    expect(target?.findings.length).toBeGreaterThan(0);
+    for (const finding of target?.findings ?? []) {
+      expect(finding.explanation).toBe('plain-english explanation');
+      expect(finding.suggestedFix).toBe('add the header');
+    }
+  });
+
+  it('does not call the LLM a second time for an identical finding-set within the same scan', async () => {
+    const fetchImpl: FetchImpl = vi.fn(async () => okResponse());
+    const llmEnrichImpl: LlmEnrichImpl = vi.fn(async (toEnrich) =>
+      toEnrich.map(() => ({ explanation: 'plain-english explanation', suggestedFix: 'add the header' })),
+    );
+    const svc = new ScannerService(createDb(':memory:'), {
+      fetchImpl,
+      tlsCheckImpl: okTlsCheckImpl(),
+      llmEnrichImpl,
+    });
+
+    const scan = await svc.startScan(['https://a.example.com', 'https://b.example.com']);
+
+    const completed = await vi.waitFor(async () => {
+      const s = await svc.getScan(scan.id);
+      if (!s || s.status !== 'completed') throw new Error('not yet completed');
+      return s;
+    });
+
+    for (const target of completed.targets) {
+      expect(target.findings.length).toBeGreaterThan(0);
+      for (const finding of target.findings) {
+        expect(finding.explanation).toBe('plain-english explanation');
+      }
+    }
+    expect(llmEnrichImpl).toHaveBeenCalledTimes(1);
+  });
+
+  it('retries the LLM call once before degrading findings to null explanation/suggestedFix', async () => {
+    const fetchImpl: FetchImpl = vi.fn(async () => okResponse());
+    const llmEnrichImpl: LlmEnrichImpl = vi.fn(async () => {
+      throw new Error('LLM unavailable');
+    });
+    const svc = new ScannerService(createDb(':memory:'), {
+      fetchImpl,
+      tlsCheckImpl: okTlsCheckImpl(),
+      llmEnrichImpl,
+    });
+
+    const scan = await svc.startScan(['https://example.com']);
+
+    const completed = await vi.waitFor(async () => {
+      const s = await svc.getScan(scan.id);
+      if (!s || s.status !== 'completed') throw new Error('not yet completed');
+      return s;
+    });
+
+    const [target] = completed.targets;
+    expect(target?.status).toBe('ok');
+    expect(target?.findings.length).toBeGreaterThan(0);
+    for (const finding of target?.findings ?? []) {
+      expect(finding.explanation).toBeNull();
+      expect(finding.suggestedFix).toBeNull();
+    }
+    expect(llmEnrichImpl).toHaveBeenCalledTimes(2);
+  });
+
+  it('recovers explanations when the LLM call succeeds on retry', async () => {
+    const fetchImpl: FetchImpl = vi.fn(async () => okResponse());
+    const llmEnrichImpl: LlmEnrichImpl = vi
+      .fn<LlmEnrichImpl>()
+      .mockRejectedValueOnce(new Error('transient failure'))
+      .mockImplementationOnce(async (toEnrich) =>
+        toEnrich.map(() => ({ explanation: 'plain-english explanation', suggestedFix: 'add the header' })),
+      );
+    const svc = new ScannerService(createDb(':memory:'), {
+      fetchImpl,
+      tlsCheckImpl: okTlsCheckImpl(),
+      llmEnrichImpl,
+    });
+
+    const scan = await svc.startScan(['https://example.com']);
+
+    const completed = await vi.waitFor(async () => {
+      const s = await svc.getScan(scan.id);
+      if (!s || s.status !== 'completed') throw new Error('not yet completed');
+      return s;
+    });
+
+    const [target] = completed.targets;
+    for (const finding of target?.findings ?? []) {
+      expect(finding.explanation).toBe('plain-english explanation');
+    }
+  });
+
+  it('does not call the LLM when a target produces no findings', async () => {
+    const fetchImpl: FetchImpl = vi.fn(async () =>
+      okResponse({
+        'content-security-policy': "default-src 'self'",
+        'strict-transport-security': 'max-age=31536000',
+        'x-frame-options': 'DENY',
+        'x-content-type-options': 'nosniff',
+        'referrer-policy': 'no-referrer',
+        'permissions-policy': 'geolocation=()',
+      }),
+    );
+    const llmEnrichImpl: LlmEnrichImpl = vi.fn(async (toEnrich) =>
+      toEnrich.map(() => ({ explanation: 'plain-english explanation', suggestedFix: 'add the header' })),
+    );
+    const svc = new ScannerService(createDb(':memory:'), {
+      fetchImpl,
+      tlsCheckImpl: okTlsCheckImpl(),
+      llmEnrichImpl,
+    });
+
+    const scan = await svc.startScan(['https://example.com']);
+
+    const completed = await vi.waitFor(async () => {
+      const s = await svc.getScan(scan.id);
+      if (!s || s.status !== 'completed') throw new Error('not yet completed');
+      return s;
+    });
+
+    const [target] = completed.targets;
+    expect(target?.findings.length).toBe(0);
+    expect(llmEnrichImpl).not.toHaveBeenCalled();
   });
 });

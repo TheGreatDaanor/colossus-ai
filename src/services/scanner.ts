@@ -24,6 +24,9 @@ export type ScanWithTargets = Scan & { targets: (ScanTarget & { findings: Findin
 export type StartScanOptions = {
   name?: string;
   userAgent?: string;
+  mode?: 'passive' | 'active';
+  confirmAuthorized?: boolean;
+  authorizationNote?: string;
 };
 
 function defaultScanName(now: Date): string {
@@ -285,6 +288,76 @@ async function defaultOsvCheck(banner: VersionBanner): Promise<OsvMatch | null> 
   return first !== undefined ? { cveId: first.id } : null;
 }
 
+export type PendingFinding = {
+  category: string;
+  severity: FindingSeverity;
+  confidence: FindingConfidence;
+  cveId?: string;
+};
+
+export type LlmEnrichment = { explanation: string; suggestedFix: string };
+export type LlmEnrichImpl = (findingsToEnrich: PendingFinding[]) => Promise<LlmEnrichment[]>;
+
+// Mirrors defaultOsvCheck's approach: a raw call against the provider's HTTP API
+// rather than pulling in `@anthropic-ai/sdk` as a dependency, keeping runtime deps
+// minimal per the coding-standards skill. Structured tool-use forces the model to
+// return exactly one { explanation, suggestedFix } pair per finding, in order.
+async function defaultLlmEnrich(findingsToEnrich: PendingFinding[]): Promise<LlmEnrichment[]> {
+  const response = await fetch('https://api.anthropic.com/v1/messages', {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      'x-api-key': process.env.ANTHROPIC_API_KEY ?? '',
+      'anthropic-version': '2023-06-01',
+    },
+    body: JSON.stringify({
+      model: 'claude-sonnet-5',
+      max_tokens: 1024,
+      tools: [
+        {
+          name: 'submit_finding_enrichment',
+          description:
+            'Submit a plain-English explanation and suggested fix for each finding, in the same order given.',
+          input_schema: {
+            type: 'object',
+            properties: {
+              enrichments: {
+                type: 'array',
+                items: {
+                  type: 'object',
+                  properties: {
+                    explanation: { type: 'string' },
+                    suggestedFix: { type: 'string' },
+                  },
+                  required: ['explanation', 'suggestedFix'],
+                },
+              },
+            },
+            required: ['enrichments'],
+          },
+        },
+      ],
+      tool_choice: { type: 'tool', name: 'submit_finding_enrichment' },
+      messages: [
+        {
+          role: 'user',
+          content: `Explain each of these security scan findings in plain English and suggest a fix. Findings: ${JSON.stringify(findingsToEnrich)}`,
+        },
+      ],
+    }),
+  });
+  if (!response.ok) throw new Error(`Anthropic API call failed with status ${response.status}`);
+
+  const data = (await response.json()) as {
+    content?: { type: string; input?: { enrichments?: LlmEnrichment[] } }[];
+  };
+  const toolUse = data.content?.find((block) => block.type === 'tool_use');
+  const enrichments = toolUse?.input?.enrichments;
+  if (enrichments === undefined) throw new Error('Anthropic API did not return structured enrichment output');
+
+  return enrichments;
+}
+
 const CVE_FINDING_CATEGORY = 'known-vulnerability';
 // A version-string match doesn't prove a fix wasn't backported, so CVE findings stay
 // `possible` confidence (per the PRD) rather than `definitive`. Severity isn't reported
@@ -297,6 +370,7 @@ export class ScannerService {
   readonly #fetchImpl: FetchImpl;
   readonly #tlsCheckImpl: TlsCheckImpl;
   readonly #osvCheckImpl: OsvCheckImpl;
+  readonly #llmEnrichImpl: LlmEnrichImpl;
   readonly #timeoutMs: number;
   readonly #concurrency: number;
 
@@ -306,6 +380,7 @@ export class ScannerService {
       fetchImpl?: FetchImpl;
       tlsCheckImpl?: TlsCheckImpl;
       osvCheckImpl?: OsvCheckImpl;
+      llmEnrichImpl?: LlmEnrichImpl;
       timeoutMs?: number;
       concurrency?: number;
     } = {},
@@ -317,11 +392,15 @@ export class ScannerService {
     this.#tlsCheckImpl =
       options.tlsCheckImpl ?? ((hostname, port) => defaultTlsCheck(hostname, port, this.#timeoutMs));
     this.#osvCheckImpl = options.osvCheckImpl ?? defaultOsvCheck;
+    this.#llmEnrichImpl = options.llmEnrichImpl ?? defaultLlmEnrich;
   }
 
   async startScan(urls: string[], options: StartScanOptions = {}): Promise<Scan> {
     if (urls.length === 0) throw new ScanValidationError('urls must not be empty');
     if (urls.length > MAX_URLS) throw new ScanValidationError(`urls must not exceed ${MAX_URLS}`);
+    if (options.mode === 'active' && options.confirmAuthorized !== true) {
+      throw new ScanValidationError('mode: "active" requires confirmAuthorized: true');
+    }
 
     const deduped = dedupe(urls);
     const valid = deduped.filter(isAllowedUrl);
@@ -337,6 +416,9 @@ export class ScannerService {
         status: hasValid ? 'pending' : 'failed',
         urls: deduped,
         userAgent: options.userAgent ?? null,
+        mode: options.mode ?? 'passive',
+        confirmAuthorized: options.confirmAuthorized ?? null,
+        authorizationNote: options.authorizationNote ?? null,
         error: hasValid ? null : 'no valid URLs to scan',
         createdAt: now,
         completedAt: hasValid ? null : now,
@@ -392,10 +474,14 @@ export class ScannerService {
     // Cached per scan run, not on the instance: the PRD requires CVE lookups to be
     // cached per unique version string *within a scan* and never reused across scans.
     const cveCache = new Map<string, OsvMatch | null>();
+    // Cached per scan run too: identical finding-sets within one scan share a single
+    // LLM call, but explanations are never reused across scans (findings differ by
+    // target and time even when the category/severity shape repeats).
+    const llmCache = new Map<string, (LlmEnrichment | null)[]>();
 
     for (let i = 0; i < targetRows.length; i += this.#concurrency) {
       const batch = targetRows.slice(i, i + this.#concurrency);
-      await Promise.all(batch.map((target) => this.#processTarget(target, cveCache)));
+      await Promise.all(batch.map((target) => this.#processTarget(target, cveCache, llmCache)));
     }
 
     this.#db
@@ -405,7 +491,11 @@ export class ScannerService {
       .run();
   }
 
-  async #processTarget(target: ScanTarget, cveCache: Map<string, OsvMatch | null>): Promise<void> {
+  async #processTarget(
+    target: ScanTarget,
+    cveCache: Map<string, OsvMatch | null>,
+    llmCache: Map<string, (LlmEnrichment | null)[]>,
+  ): Promise<void> {
     console.warn(`[scan ${target.scanId}] ${target.url} started`);
 
     const targetUrl = new URL(target.url);
@@ -451,18 +541,10 @@ export class ScannerService {
         .where(eq(scanTargets.id, target.id))
         .run();
 
-      for (const finding of detectHeaderFindings(responseHeaders)) {
-        this.#db
-          .insert(findings)
-          .values({ scanTargetId: target.id, ...finding })
-          .run();
-      }
+      const pendingFindings: PendingFinding[] = [...detectHeaderFindings(responseHeaders)];
 
       if (targetUrl.protocol === 'http:') {
-        this.#db
-          .insert(findings)
-          .values({ scanTargetId: target.id, ...NO_TLS_FINDING })
-          .run();
+        pendingFindings.push(NO_TLS_FINDING);
       } else {
         // TLS-check failures degrade gracefully (target stays `ok`, TLS columns/findings
         // are just skipped) rather than failing the target — mirrors the CVE-lookup
@@ -478,12 +560,7 @@ export class ScannerService {
             .where(eq(scanTargets.id, target.id))
             .run();
 
-          for (const finding of detectTlsFindings(tlsInfo)) {
-            this.#db
-              .insert(findings)
-              .values({ scanTargetId: target.id, ...finding })
-              .run();
-          }
+          pendingFindings.push(...detectTlsFindings(tlsInfo));
         } catch (tlsErr) {
           const message = tlsErr instanceof Error ? tlsErr.message : String(tlsErr);
           console.warn(`[scan ${target.scanId}] ${target.url} TLS check failed: ${message}`);
@@ -495,17 +572,33 @@ export class ScannerService {
       if (banner !== null) {
         const match = await this.#lookupCve(banner, cveCache, target.scanId, target.url);
         if (match !== null) {
-          this.#db
-            .insert(findings)
-            .values({
-              scanTargetId: target.id,
-              category: CVE_FINDING_CATEGORY,
-              severity: CVE_FINDING_SEVERITY,
-              confidence: 'possible',
-              cveId: match.cveId,
-            })
-            .run();
+          pendingFindings.push({
+            category: CVE_FINDING_CATEGORY,
+            severity: CVE_FINDING_SEVERITY,
+            confidence: 'possible',
+            cveId: match.cveId,
+          });
         }
+      }
+
+      const enrichments =
+        pendingFindings.length > 0
+          ? await this.#enrichFindings(pendingFindings, llmCache, target.scanId, target.url)
+          : [];
+
+      for (let i = 0; i < pendingFindings.length; i++) {
+        const finding = pendingFindings[i];
+        if (finding === undefined) continue;
+        const enrichment = enrichments[i] ?? null;
+        this.#db
+          .insert(findings)
+          .values({
+            scanTargetId: target.id,
+            ...finding,
+            explanation: enrichment?.explanation ?? null,
+            suggestedFix: enrichment?.suggestedFix ?? null,
+          })
+          .run();
       }
 
       console.warn(`[scan ${target.scanId}] ${target.url} succeeded`);
@@ -565,5 +658,39 @@ export class ScannerService {
 
     cache.set(key, match);
     return match;
+  }
+
+  async #enrichFindings(
+    findingsToEnrich: PendingFinding[],
+    cache: Map<string, (LlmEnrichment | null)[]>,
+    scanId: number,
+    url: string,
+  ): Promise<(LlmEnrichment | null)[]> {
+    const key = JSON.stringify(
+      findingsToEnrich.map((f) => ({
+        category: f.category,
+        severity: f.severity,
+        confidence: f.confidence,
+        cveId: f.cveId ?? null,
+      })),
+    );
+    const cached = cache.get(key);
+    if (cached !== undefined) return cached;
+
+    let result: (LlmEnrichment | null)[] = findingsToEnrich.map(() => null);
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      try {
+        result = await this.#llmEnrichImpl(findingsToEnrich);
+        break;
+      } catch (err) {
+        if (attempt === 2) {
+          const message = err instanceof Error ? err.message : String(err);
+          console.warn(`[scan ${scanId}] ${url} LLM enrichment failed after retry: ${message}`);
+        }
+      }
+    }
+
+    cache.set(key, result);
+    return result;
   }
 }

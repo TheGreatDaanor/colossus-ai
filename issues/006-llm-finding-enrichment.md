@@ -1,7 +1,7 @@
 ---
 id: 006
 title: Enrich findings with LLM-generated explanation and suggested fix
-status: open
+status: done
 type: afk
 blocked-by: [001]
 ---
