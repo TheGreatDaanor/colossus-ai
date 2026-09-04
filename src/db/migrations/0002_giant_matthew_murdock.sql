@@ -1,0 +1,1 @@
+ALTER TABLE `scan_targets` ADD `injection_attempts` text;

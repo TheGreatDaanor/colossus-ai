@@ -6,6 +6,10 @@ export type ScanTargetStatus = 'pending' | 'ok' | 'unreachable' | 'timeout' | 'i
 export type FindingSeverity = 'critical' | 'high' | 'medium' | 'low' | 'info';
 export type FindingConfidence = 'definitive' | 'possible';
 
+// An active-mode canary injection attempt against one query parameter. Recorded per
+// target; execution confirmation (turning an attempt into a finding) lands in 011.
+export type InjectionAttempt = { injectionPoint: string; payload: string };
+
 export const scans = sqliteTable('scans', {
   id: integer('id').primaryKey({ autoIncrement: true }),
   name: text('name').notNull(),
@@ -33,6 +37,7 @@ export const scanTargets = sqliteTable('scan_targets', {
   tlsVersion: text('tls_version'),
   tlsCertExpiresAt: integer('tls_cert_expires_at', { mode: 'timestamp' }),
   redirectLocation: text('redirect_location'),
+  injectionAttempts: text('injection_attempts', { mode: 'json' }).$type<InjectionAttempt[]>(),
   error: text('error'),
 });
 

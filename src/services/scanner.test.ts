@@ -1092,3 +1092,68 @@ describe('ScannerService LLM finding enrichment', () => {
     expect(llmEnrichImpl).not.toHaveBeenCalled();
   });
 });
+
+describe('ScannerService active-mode query-param injection', () => {
+  it('records one injection attempt per query parameter on an active-mode target', async () => {
+    const fetchImpl: FetchImpl = vi.fn(async () => okResponse(FULLY_HARDENED_HEADERS));
+    const svc = new ScannerService(createDb(':memory:'), { fetchImpl, tlsCheckImpl: okTlsCheckImpl() });
+    const scan = await svc.startScan(['https://example.com/search?q=test&page=1'], {
+      mode: 'active',
+      confirmAuthorized: true,
+    });
+
+    await vi.waitFor(async () => {
+      const s = await svc.getScan(scan.id);
+      if (!s || s.status !== 'completed') throw new Error('not yet completed');
+    });
+
+    const target = (await svc.getScan(scan.id))?.targets[0];
+    expect(target?.injectionAttempts?.map((a) => a.injectionPoint)).toEqual(['q', 'page']);
+  });
+
+  it('records a unique canary marker payload per injection point', async () => {
+    const fetchImpl: FetchImpl = vi.fn(async () => okResponse(FULLY_HARDENED_HEADERS));
+    const svc = new ScannerService(createDb(':memory:'), { fetchImpl, tlsCheckImpl: okTlsCheckImpl() });
+    const scan = await svc.startScan(['https://example.com/search?q=test&page=1'], {
+      mode: 'active',
+      confirmAuthorized: true,
+    });
+
+    await vi.waitFor(async () => {
+      const s = await svc.getScan(scan.id);
+      if (!s || s.status !== 'completed') throw new Error('not yet completed');
+    });
+
+    const attempts = (await svc.getScan(scan.id))?.targets[0]?.injectionAttempts ?? [];
+    const payloads = attempts.map((a) => a.payload);
+    for (const payload of payloads) {
+      expect(payload).toMatch(/^<script>window\.__colossus_xss_marker='[0-9a-f-]{36}'<\/script>$/);
+    }
+    // Each attempt gets a fresh marker — no reuse across injection points.
+    expect(new Set(payloads).size).toBe(payloads.length);
+    // The mutated URL carrying the canary was actually fetched for each point.
+    expect(fetchImpl).toHaveBeenCalledWith(
+      expect.stringContaining('__colossus_xss_marker'),
+      expect.anything(),
+    );
+  });
+
+  it('records zero injection attempts for an active-mode target with no query parameters', async () => {
+    const fetchImpl: FetchImpl = vi.fn(async () => okResponse(FULLY_HARDENED_HEADERS));
+    const svc = new ScannerService(createDb(':memory:'), { fetchImpl, tlsCheckImpl: okTlsCheckImpl() });
+    const scan = await svc.startScan(['https://example.com/'], { mode: 'active', confirmAuthorized: true });
+
+    await vi.waitFor(async () => {
+      const s = await svc.getScan(scan.id);
+      if (!s || s.status !== 'completed') throw new Error('not yet completed');
+    });
+
+    const target = (await svc.getScan(scan.id))?.targets[0];
+    expect(target?.status).toBe('ok');
+    expect(target?.injectionAttempts ?? []).toEqual([]);
+    expect(fetchImpl).not.toHaveBeenCalledWith(
+      expect.stringContaining('__colossus_xss_marker'),
+      expect.anything(),
+    );
+  });
+});

@@ -15,6 +15,13 @@
       "when": 1786226900000,
       "tag": "0001_tearful_colleen_wing",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "6",
+      "when": 1788540159372,
+      "tag": "0002_giant_matthew_murdock",
+      "breakpoints": true
     }
   ]
 }

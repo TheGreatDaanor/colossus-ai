@@ -3,6 +3,7 @@ import { isIP } from 'node:net';
 import { connect as tlsConnect } from 'node:tls';
 import { eq } from 'drizzle-orm';
 import type { Db } from '../db/client.js';
+import { enumerateInjectionPoints } from './active-scanner.js';
 import {
   scans,
   scanTargets,
@@ -10,6 +11,7 @@ import {
   type ScanTargetStatus,
   type FindingSeverity,
   type FindingConfidence,
+  type ScanMode,
 } from '../db/schema.js';
 
 export class ScanValidationError extends Error {}
@@ -495,7 +497,7 @@ export class ScannerService {
         .get(),
     );
 
-    void this.#runScan(scan.id, targetRows, scan.userAgent ?? this.#defaultUserAgent);
+    void this.#runScan(scan.id, targetRows, scan.userAgent ?? this.#defaultUserAgent, scan.mode);
 
     return scan;
   }
@@ -519,7 +521,7 @@ export class ScannerService {
     return this.#db.select().from(scans).orderBy(scans.createdAt).all().reverse();
   }
 
-  async #runScan(scanId: number, targetRows: ScanTarget[], userAgent: string): Promise<void> {
+  async #runScan(scanId: number, targetRows: ScanTarget[], userAgent: string, mode: ScanMode): Promise<void> {
     this.#db.update(scans).set({ status: 'running' }).where(eq(scans.id, scanId)).run();
 
     // Cached per scan run, not on the instance: the PRD requires CVE lookups to be
@@ -532,7 +534,7 @@ export class ScannerService {
 
     for (let i = 0; i < targetRows.length; i += this.#concurrency) {
       const batch = targetRows.slice(i, i + this.#concurrency);
-      await Promise.all(batch.map((target) => this.#processTarget(target, cveCache, llmCache, userAgent)));
+      await Promise.all(batch.map((target) => this.#processTarget(target, cveCache, llmCache, userAgent, mode)));
     }
 
     this.#db
@@ -547,6 +549,7 @@ export class ScannerService {
     cveCache: Map<string, OsvMatch | null>,
     llmCache: Map<string, (LlmEnrichment | null)[]>,
     userAgent: string,
+    mode: ScanMode,
   ): Promise<void> {
     console.warn(`[scan ${target.scanId}] ${target.url} started`);
 
@@ -655,6 +658,10 @@ export class ScannerService {
           .run();
       }
 
+      if (mode === 'active') {
+        await this.#injectQueryParams(target, targetUrl, userAgent);
+      }
+
       console.warn(`[scan ${target.scanId}] ${target.url} succeeded`);
     } catch (err) {
       const timedOut = err instanceof Error && err.name === 'AbortError';
@@ -674,6 +681,32 @@ export class ScannerService {
     } finally {
       clearTimeout(timer);
     }
+  }
+
+  // Active-mode only: for each query parameter, substitute a unique canary payload
+  // as its value and fetch the mutated URL. The attempts are recorded on the target
+  // so the injection points are inspectable; execution confirmation — turning a
+  // recorded attempt into an `xss` finding — lands in 011. A target with no query
+  // parameters produces zero attempts. The mutated URLs share the target's host,
+  // which the SSRF guard already cleared; per-navigation redirect guarding is 012.
+  async #injectQueryParams(target: ScanTarget, targetUrl: URL, userAgent: string): Promise<void> {
+    const points = enumerateInjectionPoints(targetUrl);
+    if (points.length === 0) return;
+
+    for (const point of points) {
+      try {
+        await this.#fetchImpl(point.url, { redirect: 'manual', headers: { 'user-agent': userAgent } });
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        console.warn(`[scan ${target.scanId}] ${point.url} injection fetch failed: ${message}`);
+      }
+    }
+
+    this.#db
+      .update(scanTargets)
+      .set({ injectionAttempts: points.map(({ injectionPoint, payload }) => ({ injectionPoint, payload })) })
+      .where(eq(scanTargets.id, target.id))
+      .run();
   }
 
   async #fetchRobotsTxt(targetUrl: URL, userAgent: string): Promise<string | null> {
