@@ -62,6 +62,39 @@ describe('POST /scans', () => {
 
     expect(res.status).toBe(400);
   });
+
+  it('returns 400 when mode is "active" without confirmAuthorized', async () => {
+    const { app } = buildApp();
+
+    const res = await app.request('/scans', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ urls: ['https://example.com'], mode: 'active' }),
+    });
+
+    expect(res.status).toBe(400);
+    const body = await json<ErrorBody>(res);
+    expect(body.error).toEqual(expect.any(String));
+  });
+
+  it('accepts mode: "active" with confirmAuthorized: true and reports mode on the created scan', async () => {
+    const { app } = buildApp();
+
+    const res = await app.request('/scans', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        urls: ['https://example.com'],
+        mode: 'active',
+        confirmAuthorized: true,
+        authorizationNote: 'own domain',
+      }),
+    });
+
+    expect(res.status).toBe(201);
+    const body = await json<ScanBody & { mode: string }>(res);
+    expect(body.mode).toBe('active');
+  });
 });
 
 describe('GET /scans', () => {

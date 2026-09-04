@@ -1,6 +1,7 @@
 import { sqliteTable, integer, text } from 'drizzle-orm/sqlite-core';
 
 export type ScanStatus = 'pending' | 'running' | 'completed' | 'failed';
+export type ScanMode = 'passive' | 'active';
 export type ScanTargetStatus = 'pending' | 'ok' | 'unreachable' | 'timeout' | 'invalid';
 export type FindingSeverity = 'critical' | 'high' | 'medium' | 'low' | 'info';
 export type FindingConfidence = 'definitive' | 'possible';
@@ -11,6 +12,9 @@ export const scans = sqliteTable('scans', {
   status: text('status').$type<ScanStatus>().notNull(),
   urls: text('urls', { mode: 'json' }).$type<string[]>().notNull(),
   userAgent: text('user_agent'),
+  mode: text('mode').$type<ScanMode>().notNull().default('passive'),
+  confirmAuthorized: integer('confirm_authorized', { mode: 'boolean' }),
+  authorizationNote: text('authorization_note'),
   error: text('error'),
   createdAt: integer('created_at', { mode: 'timestamp' }).notNull(),
   completedAt: integer('completed_at', { mode: 'timestamp' }),
