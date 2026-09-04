@@ -447,6 +447,9 @@ export class ScannerService {
     if (options.mode === 'active' && options.confirmAuthorized !== true) {
       throw new ScanValidationError('mode: "active" requires confirmAuthorized: true');
     }
+    if (options.userAgent !== undefined && options.userAgent.trim() === '') {
+      throw new ScanValidationError('userAgent must not be blank');
+    }
 
     const deduped = dedupe(urls);
     const valid = deduped.filter(isAllowedUrl);

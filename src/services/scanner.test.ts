@@ -117,6 +117,18 @@ describe('ScannerService User-Agent', () => {
       expect.objectContaining({ headers: { 'user-agent': 'custom-agent/2.0' } }),
     );
   });
+
+  it('rejects a blank userAgent override rather than scanning unidentified', async () => {
+    const svc = new ScannerService(createDb(':memory:'), {
+      fetchImpl: vi.fn(async () => okResponse()),
+      tlsCheckImpl: okTlsCheckImpl(),
+      defaultUserAgent: 'colossus-scanner/1.0',
+    });
+
+    await expect(svc.startScan(['https://example.com'], { userAgent: '   ' })).rejects.toThrow(
+      ScanValidationError,
+    );
+  });
 });
 
 describe('ScannerService', () => {

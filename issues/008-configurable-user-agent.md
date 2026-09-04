@@ -1,7 +1,7 @@
 ---
 id: 008
 title: Support configurable scanner User-Agent
-status: open
+status: done
 type: afk
 blocked-by: [001]
 ---
@@ -29,10 +29,10 @@ submission may override it for that scan only.
 
 ## Definition of done
 
-- [ ] Failing test written first, confirmed red
-- [ ] Implementation makes it green
-- [ ] `test`, `typecheck`, `lint` all pass
-- [ ] Visible at: `curl -X POST localhost:PORT/scans -d '{"urls":["https://example.com"],"userAgent":"my-scanner/1.0"}'` — test asserts the mocked fetch for that scan is called with that header; a scan submitted without `userAgent` uses the configured global default.
+- [x] Failing test written first, confirmed red
+- [x] Implementation makes it green
+- [x] `test`, `typecheck`, `lint` all pass
+- [x] Visible at: `curl -X POST localhost:PORT/scans -d '{"urls":["https://example.com"],"userAgent":"my-scanner/1.0"}'` — test asserts the mocked fetch for that scan is called with that header; a scan submitted without `userAgent` uses the configured global default.
 
 ## Out of scope
 
