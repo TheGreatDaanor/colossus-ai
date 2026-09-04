@@ -7,9 +7,10 @@ import { ScannerService } from './services/scanner.js';
 
 const port = Number(process.env['PORT'] ?? 3000);
 const dbPath = process.env['DB_PATH'] ?? './data/scanner.db';
+const defaultUserAgent = process.env['SCANNER_USER_AGENT'] ?? 'colossus-scanner/1.0';
 
 const db = createDb(dbPath);
-const service = new ScannerService(db);
+const service = new ScannerService(db, { defaultUserAgent });
 
 const app = new Hono();
 app.route('/', createScansRoutes(service));

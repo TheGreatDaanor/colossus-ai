@@ -77,6 +77,48 @@ describe('ScannerService active mode', () => {
   });
 });
 
+describe('ScannerService User-Agent', () => {
+  it('sends the constructor-configured default User-Agent on every fetch', async () => {
+    const fetchImpl: FetchImpl = vi.fn(async () => okResponse());
+    const svc = new ScannerService(createDb(':memory:'), {
+      fetchImpl,
+      tlsCheckImpl: okTlsCheckImpl(),
+      defaultUserAgent: 'colossus-scanner/1.0',
+    });
+    const scan = await svc.startScan(['https://example.com']);
+
+    await vi.waitFor(async () => {
+      const s = await svc.getScan(scan.id);
+      if (!s || s.status !== 'completed') throw new Error('not yet completed');
+    });
+
+    expect(fetchImpl).toHaveBeenCalledWith(
+      'https://example.com',
+      expect.objectContaining({ headers: { 'user-agent': 'colossus-scanner/1.0' } }),
+    );
+  });
+
+  it('overrides the default User-Agent with a per-scan value', async () => {
+    const fetchImpl: FetchImpl = vi.fn(async () => okResponse());
+    const svc = new ScannerService(createDb(':memory:'), {
+      fetchImpl,
+      tlsCheckImpl: okTlsCheckImpl(),
+      defaultUserAgent: 'colossus-scanner/1.0',
+    });
+    const scan = await svc.startScan(['https://example.com'], { userAgent: 'custom-agent/2.0' });
+
+    await vi.waitFor(async () => {
+      const s = await svc.getScan(scan.id);
+      if (!s || s.status !== 'completed') throw new Error('not yet completed');
+    });
+
+    expect(fetchImpl).toHaveBeenCalledWith(
+      'https://example.com',
+      expect.objectContaining({ headers: { 'user-agent': 'custom-agent/2.0' } }),
+    );
+  });
+});
+
 describe('ScannerService', () => {
   it('rejects an empty URL list', async () => {
     const svc = new ScannerService(createDb(':memory:'));
