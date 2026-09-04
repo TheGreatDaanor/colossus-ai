@@ -4,6 +4,7 @@ import { connect as tlsConnect } from 'node:tls';
 import { eq } from 'drizzle-orm';
 import type { Db } from '../db/client.js';
 import { enumerateInjectionPoints } from './active-scanner.js';
+import { discoverLinks } from './discovery.js';
 import {
   scans,
   scanTargets,
@@ -410,6 +411,65 @@ async function defaultLlmEnrich(findingsToEnrich: EnrichmentRequest[]): Promise<
   return enrichments;
 }
 
+// Same-origin discovery bounds, per the roadmap: depth-2, 25 discovered pages per
+// operator-submitted root, regardless of how much depth remains.
+const MAX_DISCOVERY_DEPTH = 2;
+const MAX_DISCOVERED_PER_ROOT = 25;
+
+// Discovery only parses HTML, and #concurrency of these bodies sit in memory at
+// once, so a body is read only when the server says it is HTML, and only up to
+// MAX_HTML_BYTES — a 500 MB octet-stream target is never buffered. A read that
+// fails mid-stream (socket dropped) degrades to "no links found"; that catch is
+// deliberately around the stream read alone, so a programming error elsewhere —
+// e.g. reading a body something upstream already consumed — still surfaces
+// instead of silently turning discovery off.
+const MAX_HTML_BYTES = 2 * 1024 * 1024;
+
+async function readHtmlBody(response: Response): Promise<string> {
+  const contentType = response.headers.get('content-type') ?? '';
+  if (!/^\s*(text\/html|application\/xhtml\+xml)\b/i.test(contentType)) return '';
+
+  const body = response.body;
+  if (body === null) return '';
+
+  const reader = body.getReader();
+  const decoder = new TextDecoder();
+  let html = '';
+  let bytes = 0;
+
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (value === undefined) continue;
+
+      bytes += value.byteLength;
+      if (bytes > MAX_HTML_BYTES) {
+        html += decoder.decode(value.subarray(0, value.byteLength - (bytes - MAX_HTML_BYTES)));
+        break;
+      }
+      html += decoder.decode(value, { stream: true });
+    }
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    console.warn(`body read failed: ${message}`);
+  } finally {
+    void reader.cancel().catch(() => {});
+  }
+
+  return html;
+}
+
+// Scoped to a single #runScan call, not the instance: discovery bookkeeping (depth,
+// root, per-root count, and which URLs are already a target) only makes sense for the
+// scan currently running, mirroring how cveCache/llmCache are scan-scoped.
+type DiscoveryContext = {
+  seenUrls: Set<string>;
+  depthOf: Map<number, number>;
+  rootOf: Map<number, number>;
+  discoveredCount: Map<number, number>;
+};
+
 const CVE_FINDING_CATEGORY = 'known-vulnerability';
 // A version-string match doesn't prove a fix wasn't backported, so CVE findings stay
 // `possible` confidence (per the PRD) rather than `definitive`. Severity isn't reported
@@ -539,9 +599,23 @@ export class ScannerService {
     // target and time even when the category/severity shape repeats).
     const llmCache = new Map<string, (LlmEnrichment | null)[]>();
 
-    for (let i = 0; i < targetRows.length; i += this.#concurrency) {
-      const batch = targetRows.slice(i, i + this.#concurrency);
-      await Promise.all(batch.map((target) => this.#processTarget(target, cveCache, llmCache, userAgent, mode)));
+    // Roots are the operator-submitted targets: depth 0, and their own discovery
+    // budget. Discovery can add new rows to the queue mid-run, so this loop drains a
+    // growing queue rather than iterating the fixed initial batch.
+    const discovery: DiscoveryContext = {
+      seenUrls: new Set(targetRows.map((t) => t.url)),
+      depthOf: new Map(targetRows.map((t) => [t.id, 0])),
+      rootOf: new Map(targetRows.map((t) => [t.id, t.id])),
+      discoveredCount: new Map(targetRows.map((t) => [t.id, 0])),
+    };
+
+    const queue = [...targetRows];
+    while (queue.length > 0) {
+      const batch = queue.splice(0, this.#concurrency);
+      const discoveredBatches = await Promise.all(
+        batch.map((target) => this.#processTarget(target, cveCache, llmCache, userAgent, mode, discovery)),
+      );
+      for (const discovered of discoveredBatches) queue.push(...discovered);
     }
 
     this.#db
@@ -557,7 +631,8 @@ export class ScannerService {
     llmCache: Map<string, (LlmEnrichment | null)[]>,
     userAgent: string,
     mode: ScanMode,
-  ): Promise<void> {
+    discovery: DiscoveryContext,
+  ): Promise<ScanTarget[]> {
     console.warn(`[scan ${target.scanId}] ${target.url} started`);
 
     const targetUrl = new URL(target.url);
@@ -574,7 +649,7 @@ export class ScannerService {
         .run();
 
       console.warn(`[scan ${target.scanId}] ${target.url} rejected (disallowed address)`);
-      return;
+      return [];
     }
 
     const controller = new AbortController();
@@ -592,6 +667,12 @@ export class ScannerService {
       const redirectLocation = response.headers.get('location');
       const responseHeaders = lowercaseHeaders(response.headers);
       const setCookies = response.headers.getSetCookie();
+
+      // Read the body here, immediately after the fetch and while the abort timer
+      // still bounds it. Discovery is the last step of the pipeline, so deferring
+      // the read until then would let a throw from any intervening step (TLS, CVE,
+      // enrichment, active-mode injection) silently skip discovery.
+      const html = await readHtmlBody(response);
 
       this.#db
         .update(scanTargets)
@@ -669,7 +750,12 @@ export class ScannerService {
         await this.#injectQueryParams(target, targetUrl, userAgent);
       }
 
+      // Discovery runs regardless of mode — it's non-intrusive HTML parsing, not a
+      // payload-sending check, so it isn't gated behind the active-mode attestation.
+      const discovered = this.#discoverTargets(target, targetUrl, html, discovery);
+
       console.warn(`[scan ${target.scanId}] ${target.url} succeeded`);
+      return discovered;
     } catch (err) {
       const timedOut = err instanceof Error && err.name === 'AbortError';
       const status: ScanTargetStatus = timedOut ? 'timeout' : 'unreachable';
@@ -685,9 +771,52 @@ export class ScannerService {
         .run();
 
       console.warn(`[scan ${target.scanId}] ${target.url} ${timedOut ? 'timed-out' : 'failed'}`);
+      return [];
     } finally {
       clearTimeout(timer);
     }
+  }
+
+  // A discovered link becomes a real `scan_targets` row, run through the identical
+  // pipeline as a submitted URL, bounded to depth-2 and 25 discovered pages per
+  // operator-submitted root (walking `discoveredFrom` back to the root would also
+  // work but requires a DB round-trip per target; the in-memory maps are scoped to
+  // one #runScan call and cost nothing extra).
+  #discoverTargets(target: ScanTarget, targetUrl: URL, html: string, discovery: DiscoveryContext): ScanTarget[] {
+    const depth = discovery.depthOf.get(target.id) ?? 0;
+    if (depth >= MAX_DISCOVERY_DEPTH) return [];
+
+    const rootId = discovery.rootOf.get(target.id) ?? target.id;
+    const links = discoverLinks({ url: targetUrl, html });
+    const rows: (typeof scanTargets.$inferInsert)[] = [];
+
+    for (const url of links) {
+      if (discovery.seenUrls.has(url)) continue;
+
+      const countForRoot = discovery.discoveredCount.get(rootId) ?? 0;
+      // Breaking here leaves the rest of this page's links out of `seenUrls`, so a
+      // sibling page under another root can still reach them — intended: the cap is
+      // per root, not a global "never visit this URL again".
+      if (countForRoot >= MAX_DISCOVERED_PER_ROOT) break;
+
+      discovery.seenUrls.add(url);
+      discovery.discoveredCount.set(rootId, countForRoot + 1);
+      rows.push({ scanId: target.scanId, url, status: 'pending', discoveredFrom: target.id });
+    }
+
+    if (rows.length === 0) return [];
+
+    // One insert for the whole page rather than one per link: up to 25 round-trips
+    // per page otherwise, and #concurrency pages are in flight at once.
+    const created = this.#db.insert(scanTargets).values(rows).returning().all();
+    if (created.length !== rows.length) throw new Error('failed to insert discovered scan targets');
+
+    for (const row of created) {
+      discovery.depthOf.set(row.id, depth + 1);
+      discovery.rootOf.set(row.id, rootId);
+    }
+
+    return created;
   }
 
   // Active-mode only: for each query parameter, substitute a unique canary payload

@@ -1,4 +1,4 @@
-import { sqliteTable, integer, text } from 'drizzle-orm/sqlite-core';
+import { sqliteTable, integer, text, type AnySQLiteColumn } from 'drizzle-orm/sqlite-core';
 
 export type ScanStatus = 'pending' | 'running' | 'completed' | 'failed';
 export type ScanMode = 'passive' | 'active';
@@ -39,6 +39,7 @@ export const scanTargets = sqliteTable('scan_targets', {
   redirectLocation: text('redirect_location'),
   injectionAttempts: text('injection_attempts', { mode: 'json' }).$type<InjectionAttempt[]>(),
   error: text('error'),
+  discoveredFrom: integer('discovered_from').references((): AnySQLiteColumn => scanTargets.id),
 });
 
 export const findings = sqliteTable('findings', {

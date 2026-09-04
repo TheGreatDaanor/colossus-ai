@@ -1228,3 +1228,123 @@ describe('ScannerService active-mode query-param injection', () => {
     );
   });
 });
+
+describe('ScannerService same-origin link discovery', () => {
+  // Discovery reads a body only when the server says it is HTML, so these fixtures
+  // set content-type the way a real page would.
+  const HTML_HEADERS = { ...FULLY_HARDENED_HEADERS, 'content-type': 'text/html; charset=utf-8' };
+
+  function htmlResponse(html: string): Response {
+    return new Response(html, { status: 200, headers: HTML_HEADERS });
+  }
+
+  async function runScanToCompletion(fetchImpl: FetchImpl, roots: string[], timeout = 5000) {
+    const svc = new ScannerService(createDb(':memory:'), { fetchImpl, tlsCheckImpl: okTlsCheckImpl() });
+    const scan = await svc.startScan(roots);
+
+    return vi.waitFor(
+      async () => {
+        const s = await svc.getScan(scan.id);
+        if (!s || s.status !== 'completed') throw new Error('not yet completed');
+        return s;
+      },
+      { timeout },
+    );
+  }
+
+  it('adds a same-origin link found in a target page as a new scan target, tracing it back to the source', async () => {
+    const fetchImpl: FetchImpl = vi.fn(async (url) =>
+      String(url) === 'https://example.com/' ? htmlResponse('<a href="/about">About</a>') : htmlResponse(''),
+    );
+
+    const completed = await runScanToCompletion(fetchImpl, ['https://example.com/']);
+
+    expect(completed.targets.map((t) => t.url).sort()).toEqual([
+      'https://example.com/',
+      'https://example.com/about',
+    ]);
+    const root = completed.targets.find((t) => t.url === 'https://example.com/');
+    const discovered = completed.targets.find((t) => t.url === 'https://example.com/about');
+    expect(discovered?.discoveredFrom).toBe(root?.id);
+  });
+
+  // The security property the whole feature rests on: an operator attested for the
+  // URLs they submitted, so a page they control must not be able to point the
+  // scanner at a third party. discovery.test.ts covers the parser; this asserts the
+  // boundary survives end-to-end, including that no request is ever made off-origin.
+  it('never turns a cross-origin, off-port or off-scheme link into a target', async () => {
+    const fetchImpl: FetchImpl = vi.fn(async (url) =>
+      String(url) === 'https://example.com/'
+        ? htmlResponse(
+            `<a href="https://evil.example/steal">x</a>
+             <a href="https://example.com:8443/admin">x</a>
+             <a href="http://example.com/insecure">x</a>
+             <form action="https://evil.example/post"></form>
+             <a href="/about">ok</a>`,
+          )
+        : htmlResponse(''),
+    );
+
+    const completed = await runScanToCompletion(fetchImpl, ['https://example.com/']);
+
+    expect(completed.targets.map((t) => t.url).sort()).toEqual([
+      'https://example.com/',
+      'https://example.com/about',
+    ]);
+    const fetched = vi.mocked(fetchImpl).mock.calls.map(([url]) => new URL(String(url)).origin);
+    expect(fetched.every((origin) => origin === 'https://example.com')).toBe(true);
+  });
+
+  it('caps discovery at 25 pages per root, counted separately for each submitted root', async () => {
+    const fetchImpl: FetchImpl = vi.fn(async (url) => {
+      const parsed = new URL(String(url));
+      if (parsed.pathname !== '/') return htmlResponse('');
+      const links = Array.from({ length: 30 }, (_, i) => `<a href="/page${i}">p</a>`).join('');
+      return htmlResponse(links);
+    });
+
+    const completed = await runScanToCompletion(fetchImpl, ['https://a.example/', 'https://b.example/']);
+
+    for (const host of ['a.example', 'b.example']) {
+      const discovered = completed.targets.filter(
+        (t) => new URL(t.url).hostname === host && new URL(t.url).pathname !== '/',
+      );
+      expect(discovered.length).toBe(25);
+    }
+  });
+
+  it('never crawls deeper than 2 hops from the root, chaining discoveredFrom to the page each link came from', async () => {
+    const fetchImpl: FetchImpl = vi.fn(async (url) => {
+      const nextByPath: Record<string, string> = { '/': '/a', '/a': '/b', '/b': '/c' };
+      const next = nextByPath[new URL(String(url)).pathname];
+      return htmlResponse(next !== undefined ? `<a href="${next}">next</a>` : '');
+    });
+
+    const completed = await runScanToCompletion(fetchImpl, ['https://example.com/']);
+
+    const byUrl = new Map(completed.targets.map((t) => [t.url, t]));
+    expect([...byUrl.keys()].sort()).toEqual([
+      'https://example.com/',
+      'https://example.com/a',
+      'https://example.com/b',
+    ]);
+    // /b was found on /a, not on the root — the field the rootOf/depthOf split
+    // could plausibly get wrong.
+    expect(byUrl.get('https://example.com/a')?.discoveredFrom).toBe(byUrl.get('https://example.com/')?.id);
+    expect(byUrl.get('https://example.com/b')?.discoveredFrom).toBe(byUrl.get('https://example.com/a')?.id);
+  });
+
+  it('does not read or parse a body the server did not label as HTML', async () => {
+    const fetchImpl: FetchImpl = vi.fn(
+      async () =>
+        new Response('<a href="/about">About</a>', {
+          status: 200,
+          headers: { ...FULLY_HARDENED_HEADERS, 'content-type': 'application/octet-stream' },
+        }),
+    );
+
+    const completed = await runScanToCompletion(fetchImpl, ['https://example.com/']);
+
+    expect(completed.targets.map((t) => t.url)).toEqual(['https://example.com/']);
+  });
+});
