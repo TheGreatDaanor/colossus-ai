@@ -1,9 +1,9 @@
 ---
 id: 021
 title: Key LLM enrichment responses by category instead of array position
-status: open
+status: done
 type: afk
-blocked-by: [017]
+blocked-by: []
 ---
 
 ## Slice
