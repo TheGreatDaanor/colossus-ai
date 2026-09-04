@@ -10,6 +10,7 @@ import {
   type ScanTargetStatus,
   type FindingSeverity,
   type FindingConfidence,
+  type ScanMode,
 } from '../db/schema.js';
 
 export class ScanValidationError extends Error {}
@@ -24,6 +25,9 @@ export type ScanWithTargets = Scan & { targets: (ScanTarget & { findings: Findin
 export type StartScanOptions = {
   name?: string;
   userAgent?: string;
+  mode?: ScanMode;
+  confirmAuthorized?: boolean;
+  authorizationNote?: string;
 };
 
 function defaultScanName(now: Date): string {
@@ -322,6 +326,9 @@ export class ScannerService {
   async startScan(urls: string[], options: StartScanOptions = {}): Promise<Scan> {
     if (urls.length === 0) throw new ScanValidationError('urls must not be empty');
     if (urls.length > MAX_URLS) throw new ScanValidationError(`urls must not exceed ${MAX_URLS}`);
+    if (options.mode === 'active' && options.confirmAuthorized !== true) {
+      throw new ScanValidationError('mode "active" requires confirmAuthorized: true');
+    }
 
     const deduped = dedupe(urls);
     const valid = deduped.filter(isAllowedUrl);
@@ -336,6 +343,9 @@ export class ScannerService {
         name: options.name ?? defaultScanName(now),
         status: hasValid ? 'pending' : 'failed',
         urls: deduped,
+        mode: options.mode ?? 'passive',
+        confirmAuthorized: options.confirmAuthorized ?? null,
+        authorizationNote: options.authorizationNote ?? null,
         userAgent: options.userAgent ?? null,
         error: hasValid ? null : 'no valid URLs to scan',
         createdAt: now,

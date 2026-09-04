@@ -1,7 +1,7 @@
 ---
 id: 009
 title: Add active scan mode with required attestation gate
-status: open
+status: done
 type: afk
 blocked-by: []
 ---

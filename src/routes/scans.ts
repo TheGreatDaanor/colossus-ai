@@ -5,15 +5,21 @@ type StartScanBody = { urls: string[] } & StartScanOptions;
 
 function parseStartScanBody(body: unknown): StartScanBody | null {
   if (typeof body !== 'object' || body === null) return null;
-  const { urls, name, userAgent } = body as Record<string, unknown>;
+  const { urls, name, userAgent, mode, confirmAuthorized, authorizationNote } = body as Record<string, unknown>;
 
   if (!Array.isArray(urls) || !urls.every((u): u is string => typeof u === 'string')) return null;
   if (name !== undefined && typeof name !== 'string') return null;
   if (userAgent !== undefined && typeof userAgent !== 'string') return null;
+  if (mode !== undefined && mode !== 'passive' && mode !== 'active') return null;
+  if (confirmAuthorized !== undefined && typeof confirmAuthorized !== 'boolean') return null;
+  if (authorizationNote !== undefined && typeof authorizationNote !== 'string') return null;
 
   const parsed: StartScanBody = { urls };
   if (typeof name === 'string') parsed.name = name;
   if (typeof userAgent === 'string') parsed.userAgent = userAgent;
+  if (mode === 'passive' || mode === 'active') parsed.mode = mode;
+  if (typeof confirmAuthorized === 'boolean') parsed.confirmAuthorized = confirmAuthorized;
+  if (typeof authorizationNote === 'string') parsed.authorizationNote = authorizationNote;
   return parsed;
 }
 
