@@ -1,7 +1,7 @@
 ---
 id: 006
 title: Enrich findings with LLM-generated explanation and suggested fix
-status: open
+status: done
 type: afk
 blocked-by: [001]
 ---
@@ -38,10 +38,10 @@ findings exist, regardless of which detector made them).
 
 ## Definition of done
 
-- [ ] Failing test written first, confirmed red
-- [ ] Implementation makes it green
-- [ ] `test`, `typecheck`, `lint` all pass
-- [ ] Visible at: test seeds a scan with fixture Finding rows, mocks the
+- [x] Failing test written first, confirmed red
+- [x] Implementation makes it green
+- [x] `test`, `typecheck`, `lint` all pass
+- [x] Visible at: test seeds a scan with fixture Finding rows, mocks the
       Anthropic call, and `curl localhost:PORT/scans/:id` shows
       `explanation`/`suggested_fix` populated — same text renders in the
       findings sub-table on the dashboard ([[001]]); a second identical
