@@ -532,6 +532,46 @@ describe('ScannerService', () => {
 
     expect(maxInFlight).toBeLessThanOrEqual(3);
   });
+
+  it('records an injection attempt per query param for an active-mode target', async () => {
+    const fetchImpl: FetchImpl = vi.fn(async () => okResponse());
+    const svc = new ScannerService(createDb(':memory:'), { fetchImpl, tlsCheckImpl: okTlsCheckImpl() });
+
+    const scan = await svc.startScan(['https://example.com/search?q=test'], {
+      mode: 'active',
+      confirmAuthorized: true,
+    });
+
+    const completed = await vi.waitFor(async () => {
+      const s = await svc.getScan(scan.id);
+      if (!s || s.status !== 'completed') throw new Error('not yet completed');
+      return s;
+    });
+
+    const [target] = completed.targets;
+    expect(target?.injectionAttempts).toHaveLength(1);
+    expect(target?.injectionAttempts?.[0]?.param).toBe('q');
+    expect(target?.injectionAttempts?.[0]?.payload).toEqual(expect.any(String));
+  });
+
+  it('records zero injection attempts for an active-mode target with no query params', async () => {
+    const fetchImpl: FetchImpl = vi.fn(async () => okResponse());
+    const svc = new ScannerService(createDb(':memory:'), { fetchImpl, tlsCheckImpl: okTlsCheckImpl() });
+
+    const scan = await svc.startScan(['https://example.com/search'], {
+      mode: 'active',
+      confirmAuthorized: true,
+    });
+
+    const completed = await vi.waitFor(async () => {
+      const s = await svc.getScan(scan.id);
+      if (!s || s.status !== 'completed') throw new Error('not yet completed');
+      return s;
+    });
+
+    const [target] = completed.targets;
+    expect(target?.injectionAttempts).toEqual([]);
+  });
 });
 
 describe('isDisallowedAddress', () => {

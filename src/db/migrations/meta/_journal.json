@@ -15,6 +15,13 @@
       "when": 1788506598474,
       "tag": "0001_nifty_giant_man",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "6",
+      "when": 1788506925685,
+      "tag": "0002_real_dust",
+      "breakpoints": true
     }
   ]
 }

@@ -12,6 +12,7 @@ import {
   type FindingConfidence,
   type ScanMode,
 } from '../db/schema.js';
+import { enumerateInjectionAttempts } from './active-scanner.js';
 
 export class ScanValidationError extends Error {}
 
@@ -374,7 +375,7 @@ export class ScannerService {
         .get(),
     );
 
-    void this.#runScan(scan.id, targetRows);
+    void this.#runScan(scan.id, scan.mode, targetRows);
 
     return scan;
   }
@@ -396,7 +397,7 @@ export class ScannerService {
     return this.#db.select().from(scans).orderBy(scans.createdAt).all().reverse();
   }
 
-  async #runScan(scanId: number, targetRows: ScanTarget[]): Promise<void> {
+  async #runScan(scanId: number, mode: ScanMode, targetRows: ScanTarget[]): Promise<void> {
     this.#db.update(scans).set({ status: 'running' }).where(eq(scans.id, scanId)).run();
 
     // Cached per scan run, not on the instance: the PRD requires CVE lookups to be
@@ -405,7 +406,7 @@ export class ScannerService {
 
     for (let i = 0; i < targetRows.length; i += this.#concurrency) {
       const batch = targetRows.slice(i, i + this.#concurrency);
-      await Promise.all(batch.map((target) => this.#processTarget(target, cveCache)));
+      await Promise.all(batch.map((target) => this.#processTarget(target, mode, cveCache)));
     }
 
     this.#db
@@ -415,7 +416,11 @@ export class ScannerService {
       .run();
   }
 
-  async #processTarget(target: ScanTarget, cveCache: Map<string, OsvMatch | null>): Promise<void> {
+  async #processTarget(
+    target: ScanTarget,
+    mode: ScanMode,
+    cveCache: Map<string, OsvMatch | null>,
+  ): Promise<void> {
     console.warn(`[scan ${target.scanId}] ${target.url} started`);
 
     const targetUrl = new URL(target.url);
@@ -448,6 +453,7 @@ export class ScannerService {
       const status: ScanTargetStatus = 'ok';
       const redirectLocation = response.headers.get('location');
       const responseHeaders = lowercaseHeaders(response.headers);
+      const injectionAttempts = mode === 'active' ? enumerateInjectionAttempts(target.url) : undefined;
 
       this.#db
         .update(scanTargets)
@@ -457,6 +463,7 @@ export class ScannerService {
           responseHeaders,
           responseTimeMs: elapsed,
           redirectLocation: redirectLocation ?? null,
+          ...(injectionAttempts !== undefined ? { injectionAttempts } : {}),
         })
         .where(eq(scanTargets.id, target.id))
         .run();

@@ -1,7 +1,7 @@
 ---
 id: 010
 title: Inject canary payload into query params for active-mode targets
-status: open
+status: done
 type: afk
 blocked-by: [009]
 ---

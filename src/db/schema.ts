@@ -34,6 +34,9 @@ export const scanTargets = sqliteTable('scan_targets', {
   tlsCertExpiresAt: integer('tls_cert_expires_at', { mode: 'timestamp' }),
   redirectLocation: text('redirect_location'),
   error: text('error'),
+  injectionAttempts: text('injection_attempts', { mode: 'json' }).$type<
+    { param: string; payload: string; url: string }[]
+  >(),
 });
 
 export const findings = sqliteTable('findings', {
