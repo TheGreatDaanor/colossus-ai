@@ -3,7 +3,7 @@ id: 022
 title: Probe a small fixed wordlist for exposed sensitive files
 status: open
 type: human
-blocked-by: [017]
+blocked-by: []
 ---
 
 ## Slice
