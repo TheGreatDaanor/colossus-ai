@@ -341,13 +341,19 @@ export type PendingFinding = {
 };
 
 export type LlmEnrichment = { explanation: string; suggestedFix: string };
-export type LlmEnrichImpl = (findingsToEnrich: PendingFinding[]) => Promise<LlmEnrichment[]>;
+// The id is a synthetic per-call discriminator (f0, f1, ...), not stored anywhere —
+// it exists so a short, reordered, or truncated LLM response can still be matched
+// back to the finding it belongs to instead of relying on array position.
+export type EnrichmentRequest = PendingFinding & { id: string };
+export type LlmEnrichmentResult = LlmEnrichment & { id: string };
+export type LlmEnrichImpl = (findingsToEnrich: EnrichmentRequest[]) => Promise<LlmEnrichmentResult[]>;
 
 // Mirrors defaultOsvCheck's approach: a raw call against the provider's HTTP API
 // rather than pulling in `@anthropic-ai/sdk` as a dependency, keeping runtime deps
-// minimal per the coding-standards skill. Structured tool-use forces the model to
-// return exactly one { explanation, suggestedFix } pair per finding, in order.
-async function defaultLlmEnrich(findingsToEnrich: PendingFinding[]): Promise<LlmEnrichment[]> {
+// minimal per the coding-standards skill. Structured tool-use asks the model to
+// return one { id, explanation, suggestedFix } tuple per finding it can address;
+// a short or reordered response is matched back to findings by id, not position.
+async function defaultLlmEnrich(findingsToEnrich: EnrichmentRequest[]): Promise<LlmEnrichmentResult[]> {
   const response = await fetch('https://api.anthropic.com/v1/messages', {
     method: 'POST',
     headers: {
@@ -362,7 +368,7 @@ async function defaultLlmEnrich(findingsToEnrich: PendingFinding[]): Promise<Llm
         {
           name: 'submit_finding_enrichment',
           description:
-            'Submit a plain-English explanation and suggested fix for each finding, in the same order given.',
+            'Submit a plain-English explanation and suggested fix for each finding, echoing back the id given for each one.',
           input_schema: {
             type: 'object',
             properties: {
@@ -371,10 +377,11 @@ async function defaultLlmEnrich(findingsToEnrich: PendingFinding[]): Promise<Llm
                 items: {
                   type: 'object',
                   properties: {
+                    id: { type: 'string' },
                     explanation: { type: 'string' },
                     suggestedFix: { type: 'string' },
                   },
-                  required: ['explanation', 'suggestedFix'],
+                  required: ['id', 'explanation', 'suggestedFix'],
                 },
               },
             },
@@ -386,7 +393,7 @@ async function defaultLlmEnrich(findingsToEnrich: PendingFinding[]): Promise<Llm
       messages: [
         {
           role: 'user',
-          content: `Explain each of these security scan findings in plain English and suggest a fix. Findings: ${JSON.stringify(findingsToEnrich)}`,
+          content: `Explain each of these security scan findings in plain English and suggest a fix. Echo back each finding's "id" in your response. Findings: ${JSON.stringify(findingsToEnrich)}`,
         },
       ],
     }),
@@ -394,7 +401,7 @@ async function defaultLlmEnrich(findingsToEnrich: PendingFinding[]): Promise<Llm
   if (!response.ok) throw new Error(`Anthropic API call failed with status ${response.status}`);
 
   const data = (await response.json()) as {
-    content?: { type: string; input?: { enrichments?: LlmEnrichment[] } }[];
+    content?: { type: string; input?: { enrichments?: LlmEnrichmentResult[] } }[];
   };
   const toolUse = data.content?.find((block) => block.type === 'tool_use');
   const enrichments = toolUse?.input?.enrichments;
@@ -652,7 +659,7 @@ export class ScannerService {
           .values({
             scanTargetId: target.id,
             ...finding,
-            explanation: enrichment?.explanation ?? finding.explanation ?? null,
+            explanation: finding.explanation ?? enrichment?.explanation ?? null,
             suggestedFix: enrichment?.suggestedFix ?? null,
           })
           .run();
@@ -764,10 +771,16 @@ export class ScannerService {
     const cached = cache.get(key);
     if (cached !== undefined) return cached;
 
-    let result: (LlmEnrichment | null)[] = findingsToEnrich.map(() => null);
+    const requests: EnrichmentRequest[] = findingsToEnrich.map((finding, i) => ({
+      ...finding,
+      id: `f${i}`,
+    }));
+
+    let byId = new Map<string, LlmEnrichmentResult>();
     for (let attempt = 1; attempt <= 2; attempt++) {
       try {
-        result = await this.#llmEnrichImpl(findingsToEnrich);
+        const enrichments = await this.#llmEnrichImpl(requests);
+        byId = new Map(enrichments.map((e) => [e.id, e]));
         break;
       } catch (err) {
         if (attempt === 2) {
@@ -776,6 +789,14 @@ export class ScannerService {
         }
       }
     }
+
+    // Matched by synthetic id, not array position: a short, reordered, or truncated
+    // response leaves the unmatched findings null instead of misattributing another
+    // finding's explanation/suggestedFix to them.
+    const result: (LlmEnrichment | null)[] = requests.map((request) => {
+      const match = byId.get(request.id);
+      return match !== undefined ? { explanation: match.explanation, suggestedFix: match.suggestedFix } : null;
+    });
 
     cache.set(key, result);
     return result;

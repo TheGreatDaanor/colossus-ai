@@ -950,7 +950,7 @@ describe('ScannerService LLM finding enrichment', () => {
   it('populates explanation and suggestedFix on findings from the LLM enrichment call', async () => {
     const fetchImpl: FetchImpl = vi.fn(async () => okResponse());
     const llmEnrichImpl: LlmEnrichImpl = vi.fn(async (toEnrich) =>
-      toEnrich.map(() => ({ explanation: 'plain-english explanation', suggestedFix: 'add the header' })),
+      toEnrich.map((f) => ({ id: f.id, explanation: 'plain-english explanation', suggestedFix: 'add the header' })),
     );
     const svc = new ScannerService(createDb(':memory:'), {
       fetchImpl,
@@ -977,7 +977,7 @@ describe('ScannerService LLM finding enrichment', () => {
   it('does not call the LLM a second time for an identical finding-set within the same scan', async () => {
     const fetchImpl: FetchImpl = vi.fn(async () => okResponse());
     const llmEnrichImpl: LlmEnrichImpl = vi.fn(async (toEnrich) =>
-      toEnrich.map(() => ({ explanation: 'plain-english explanation', suggestedFix: 'add the header' })),
+      toEnrich.map((f) => ({ id: f.id, explanation: 'plain-english explanation', suggestedFix: 'add the header' })),
     );
     const svc = new ScannerService(createDb(':memory:'), {
       fetchImpl,
@@ -1037,7 +1037,7 @@ describe('ScannerService LLM finding enrichment', () => {
       .fn<LlmEnrichImpl>()
       .mockRejectedValueOnce(new Error('transient failure'))
       .mockImplementationOnce(async (toEnrich) =>
-        toEnrich.map(() => ({ explanation: 'plain-english explanation', suggestedFix: 'add the header' })),
+        toEnrich.map((f) => ({ id: f.id, explanation: 'plain-english explanation', suggestedFix: 'add the header' })),
       );
     const svc = new ScannerService(createDb(':memory:'), {
       fetchImpl,
@@ -1071,7 +1071,7 @@ describe('ScannerService LLM finding enrichment', () => {
       }),
     );
     const llmEnrichImpl: LlmEnrichImpl = vi.fn(async (toEnrich) =>
-      toEnrich.map(() => ({ explanation: 'plain-english explanation', suggestedFix: 'add the header' })),
+      toEnrich.map((f) => ({ id: f.id, explanation: 'plain-english explanation', suggestedFix: 'add the header' })),
     );
     const svc = new ScannerService(createDb(':memory:'), {
       fetchImpl,
@@ -1090,6 +1090,77 @@ describe('ScannerService LLM finding enrichment', () => {
     const [target] = completed.targets;
     expect(target?.findings.length).toBe(0);
     expect(llmEnrichImpl).not.toHaveBeenCalled();
+  });
+
+  it('enriches only the findings the LLM actually returns, keyed by id, when the response is a reordered subset', async () => {
+    const fetchImpl: FetchImpl = vi.fn(async () => okResponse());
+    // okResponse() with no security headers set produces six missing-header findings,
+    // sent to the LLM as f0..f5. This mock returns results for only two of them
+    // (f4 and f1), out of order, simulating a truncated/reordered LLM response.
+    const llmEnrichImpl: LlmEnrichImpl = vi.fn(async () => [
+      { id: 'f4', explanation: 'explanation for f4', suggestedFix: 'fix for f4' },
+      { id: 'f1', explanation: 'explanation for f1', suggestedFix: 'fix for f1' },
+    ]);
+    const svc = new ScannerService(createDb(':memory:'), {
+      fetchImpl,
+      tlsCheckImpl: okTlsCheckImpl(),
+      llmEnrichImpl,
+    });
+
+    const scan = await svc.startScan(['https://example.com']);
+
+    const completed = await vi.waitFor(async () => {
+      const s = await svc.getScan(scan.id);
+      if (!s || s.status !== 'completed') throw new Error('not yet completed');
+      return s;
+    });
+
+    const [target] = completed.targets;
+    expect(target?.findings.length).toBe(6);
+
+    const byCategory = new Map(target?.findings.map((f) => [f.category, f]) ?? []);
+    // f4 is the 5th pending finding (index 4): missing-referrer-policy.
+    expect(byCategory.get('missing-referrer-policy')?.explanation).toBe('explanation for f4');
+    expect(byCategory.get('missing-referrer-policy')?.suggestedFix).toBe('fix for f4');
+    // f1 is the 2nd pending finding (index 1): missing-hsts.
+    expect(byCategory.get('missing-hsts')?.explanation).toBe('explanation for f1');
+    expect(byCategory.get('missing-hsts')?.suggestedFix).toBe('fix for f1');
+
+    const enrichedCount = target?.findings.filter((f) => f.explanation !== null).length;
+    expect(enrichedCount).toBe(2);
+    for (const finding of target?.findings ?? []) {
+      if (finding.explanation === null) {
+        expect(finding.suggestedFix).toBeNull();
+      }
+    }
+  });
+
+  it('lets a detector-provided explanation take precedence over the LLM explanation', async () => {
+    const fetchImpl: FetchImpl = vi.fn(async () =>
+      okResponse({ 'set-cookie': 'session=abc123' }),
+    );
+    const llmEnrichImpl: LlmEnrichImpl = vi.fn(async (toEnrich) =>
+      toEnrich.map((f) => ({ id: f.id, explanation: 'LLM paraphrase', suggestedFix: 'LLM fix' })),
+    );
+    const svc = new ScannerService(createDb(':memory:'), {
+      fetchImpl,
+      tlsCheckImpl: okTlsCheckImpl(),
+      llmEnrichImpl,
+    });
+
+    const scan = await svc.startScan(['https://example.com']);
+
+    const completed = await vi.waitFor(async () => {
+      const s = await svc.getScan(scan.id);
+      if (!s || s.status !== 'completed') throw new Error('not yet completed');
+      return s;
+    });
+
+    const [target] = completed.targets;
+    const cookieFinding = target?.findings.find((f) => f.category === 'cookie-missing-secure');
+    expect(cookieFinding?.explanation).toContain('session');
+    expect(cookieFinding?.explanation).not.toBe('LLM paraphrase');
+    expect(cookieFinding?.suggestedFix).toBe('LLM fix');
   });
 });
 
