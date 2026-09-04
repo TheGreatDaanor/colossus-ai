@@ -180,7 +180,7 @@ describe('ScannerService', () => {
     expect(target?.redirectLocation).toBe('https://example.com/new');
   });
 
-  it('records a Finding per missing security header and one for an insecure cookie', async () => {
+  it('records a Finding per missing security header and one per missing cookie attribute', async () => {
     const fetchImpl: FetchImpl = vi.fn(
       async () =>
         new Response(null, {
@@ -198,10 +198,12 @@ describe('ScannerService', () => {
     });
 
     const [target] = completed.targets;
-    expect(target?.findings).toHaveLength(7);
+    expect(target?.findings).toHaveLength(9);
     expect(target?.findings.map((f) => f.category).sort()).toEqual(
       [
-        'insecure-cookie',
+        'cookie-missing-httponly',
+        'cookie-missing-samesite',
+        'cookie-missing-secure',
         'missing-csp',
         'missing-hsts',
         'missing-permissions-policy',
@@ -232,16 +234,16 @@ describe('ScannerService', () => {
       return s;
     });
 
-    // Both targets get the same response — no security headers, plus an insecure
-    // session cookie — which yields seven findings each: 2 high (missing CSP,
-    // missing HSTS), 2 medium (missing X-Frame-Options, insecure cookie), 3 low
-    // (missing X-Content-Type-Options, Referrer-Policy, Permissions-Policy).
-    // The summary is therefore exactly double a single target's counts.
+    // Both targets get the same response — no security headers, plus a cookie missing
+    // all three tracked attributes — which yields nine findings each: 2 high (missing
+    // CSP, missing HSTS), 4 medium (missing X-Frame-Options, and one per missing cookie
+    // attribute), 3 low (missing X-Content-Type-Options, Referrer-Policy,
+    // Permissions-Policy). The summary is therefore exactly double a single target's counts.
     expect(completed.targets).toHaveLength(2);
     expect(completed.findingsBySeverity).toEqual({
       critical: 0,
       high: 4,
-      medium: 4,
+      medium: 8,
       low: 6,
       info: 0,
     });
@@ -765,23 +767,51 @@ describe('detectHeaderFindings', () => {
     expect(result.find((f) => f.category === 'missing-permissions-policy')).toMatchObject({ severity: 'low' });
   });
 
-  it('flags a Set-Cookie header missing Secure, HttpOnly, and SameSite as insecure', () => {
-    const result = detectHeaderFindings({ 'set-cookie': 'session=abc123' });
+  it('flags a cookie missing Secure, HttpOnly, and SameSite as three separate findings', () => {
+    const result = detectHeaderFindings({}, ['session=abc123']);
 
-    const cookieFinding = result.find((f) => f.category === 'insecure-cookie');
-    expect(cookieFinding).toMatchObject({ severity: 'medium', confidence: 'definitive' });
+    const categories = result
+      .filter((f) => f.category.startsWith('cookie-missing-'))
+      .map((f) => f.category)
+      .sort();
+    expect(categories).toEqual(['cookie-missing-httponly', 'cookie-missing-samesite', 'cookie-missing-secure']);
+    for (const finding of result.filter((f) => f.category.startsWith('cookie-missing-'))) {
+      expect(finding).toMatchObject({ severity: 'medium', confidence: 'definitive' });
+      expect(finding.explanation).toContain('session');
+    }
   });
 
-  it('does not flag a Set-Cookie header that has Secure, HttpOnly, and SameSite set', () => {
-    const result = detectHeaderFindings({ 'set-cookie': 'session=abc123; Secure; HttpOnly; SameSite=Strict' });
+  it('does not flag a cookie that has Secure, HttpOnly, and SameSite set', () => {
+    const result = detectHeaderFindings({}, ['session=abc123; Secure; HttpOnly; SameSite=Strict']);
 
-    expect(result.find((f) => f.category === 'insecure-cookie')).toBeUndefined();
+    expect(result.filter((f) => f.category.startsWith('cookie-missing-'))).toHaveLength(0);
   });
 
-  it('does not flag a cookie when no Set-Cookie header is present', () => {
+  it('does not flag any cookie finding when no Set-Cookie header is present', () => {
     const result = detectHeaderFindings({ 'content-security-policy': "default-src 'self'" });
 
-    expect(result.find((f) => f.category === 'insecure-cookie')).toBeUndefined();
+    expect(result.filter((f) => f.category.startsWith('cookie-missing-'))).toHaveLength(0);
+  });
+
+  it('reports one finding per offending attribute, per cookie, naming each cookie', () => {
+    const result = detectHeaderFindings({}, [
+      'session=abc123; Secure; HttpOnly; SameSite=Strict',
+      'csrf=xyz789; Secure',
+      'tracker=t1',
+    ]);
+
+    const cookieFindings = result.filter((f) => f.category.startsWith('cookie-missing-'));
+    expect(cookieFindings).toHaveLength(5);
+
+    const csrfFindings = cookieFindings.filter((f) => f.explanation?.includes('csrf'));
+    expect(csrfFindings.map((f) => f.category).sort()).toEqual(['cookie-missing-httponly', 'cookie-missing-samesite']);
+
+    const trackerFindings = cookieFindings.filter((f) => f.explanation?.includes('tracker'));
+    expect(trackerFindings.map((f) => f.category).sort()).toEqual([
+      'cookie-missing-httponly',
+      'cookie-missing-samesite',
+      'cookie-missing-secure',
+    ]);
   });
 });
 

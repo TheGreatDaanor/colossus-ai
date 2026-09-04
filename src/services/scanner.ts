@@ -157,6 +157,7 @@ export type HeaderFinding = {
   category: string;
   severity: FindingSeverity;
   confidence: FindingConfidence;
+  explanation?: string;
 };
 
 // Severity is not pinned by the PRD beyond the five-value scale, so this is a
@@ -172,23 +173,48 @@ const MISSING_HEADER_FINDINGS: { header: string; category: string; severity: Fin
   { header: 'permissions-policy', category: 'missing-permissions-policy', severity: 'low' },
 ];
 
-function isCookieSecure(setCookie: string): boolean {
-  const attributes = setCookie.split(';').map((part) => part.trim().toLowerCase());
-  const hasSecure = attributes.includes('secure');
-  const hasHttpOnly = attributes.includes('httponly');
-  const hasSameSite = attributes.some((attr) => attr.startsWith('samesite='));
-  return hasSecure && hasHttpOnly && hasSameSite;
+// One finding per missing attribute, per cookie — a `Record<string,string>` can only
+// ever hold the last of several `Set-Cookie` headers, so this takes the raw multi-value
+// list (from `Headers.getSetCookie()`) rather than the collapsed header record.
+const COOKIE_ATTRIBUTE_CHECKS: { category: string; label: string; isMissing: (attrs: string[]) => boolean }[] = [
+  { category: 'cookie-missing-secure', label: 'Secure', isMissing: (attrs) => !attrs.includes('secure') },
+  { category: 'cookie-missing-httponly', label: 'HttpOnly', isMissing: (attrs) => !attrs.includes('httponly') },
+  {
+    category: 'cookie-missing-samesite',
+    label: 'SameSite',
+    isMissing: (attrs) => !attrs.some((attr) => attr.startsWith('samesite=')),
+  },
+];
+
+function detectCookieFindings(setCookies: string[]): HeaderFinding[] {
+  const result: HeaderFinding[] = [];
+
+  for (const setCookie of setCookies) {
+    const [nameValue, ...attrParts] = setCookie.split(';');
+    const name = nameValue?.split('=')[0]?.trim() || 'unknown';
+    const attrs = attrParts.map((part) => part.trim().toLowerCase());
+
+    for (const check of COOKIE_ATTRIBUTE_CHECKS) {
+      if (check.isMissing(attrs)) {
+        result.push({
+          category: check.category,
+          severity: 'medium',
+          confidence: 'definitive',
+          explanation: `Cookie "${name}" is missing the ${check.label} attribute.`,
+        });
+      }
+    }
+  }
+
+  return result;
 }
 
-export function detectHeaderFindings(headers: Record<string, string>): HeaderFinding[] {
+export function detectHeaderFindings(headers: Record<string, string>, setCookies: string[] = []): HeaderFinding[] {
   const result: HeaderFinding[] = MISSING_HEADER_FINDINGS.filter(({ header }) => !(header in headers)).map(
     ({ category, severity }) => ({ category, severity, confidence: 'definitive' }),
   );
 
-  const setCookie = headers['set-cookie'];
-  if (setCookie !== undefined && !isCookieSecure(setCookie)) {
-    result.push({ category: 'insecure-cookie', severity: 'medium', confidence: 'definitive' });
-  }
+  result.push(...detectCookieFindings(setCookies));
 
   return result;
 }
@@ -309,6 +335,7 @@ export type PendingFinding = {
   severity: FindingSeverity;
   confidence: FindingConfidence;
   cveId?: string;
+  explanation?: string;
 };
 
 export type LlmEnrichment = { explanation: string; suggestedFix: string };
@@ -546,6 +573,7 @@ export class ScannerService {
       const status: ScanTargetStatus = 'ok';
       const redirectLocation = response.headers.get('location');
       const responseHeaders = lowercaseHeaders(response.headers);
+      const setCookies = response.headers.getSetCookie();
 
       this.#db
         .update(scanTargets)
@@ -559,7 +587,7 @@ export class ScannerService {
         .where(eq(scanTargets.id, target.id))
         .run();
 
-      const pendingFindings: PendingFinding[] = [...detectHeaderFindings(responseHeaders)];
+      const pendingFindings: PendingFinding[] = [...detectHeaderFindings(responseHeaders, setCookies)];
 
       if (targetUrl.protocol === 'http:') {
         pendingFindings.push(NO_TLS_FINDING);
@@ -613,7 +641,7 @@ export class ScannerService {
           .values({
             scanTargetId: target.id,
             ...finding,
-            explanation: enrichment?.explanation ?? null,
+            explanation: enrichment?.explanation ?? finding.explanation ?? null,
             suggestedFix: enrichment?.suggestedFix ?? null,
           })
           .run();
