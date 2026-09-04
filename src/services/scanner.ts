@@ -19,7 +19,10 @@ const MAX_URLS = 100;
 export type Scan = typeof scans.$inferSelect;
 export type ScanTarget = typeof scanTargets.$inferSelect;
 export type Finding = typeof findings.$inferSelect;
-export type ScanWithTargets = Scan & { targets: (ScanTarget & { findings: Finding[] })[] };
+export type ScanWithTargets = Scan & {
+  targets: (ScanTarget & { findings: Finding[] })[];
+  findingsBySeverity: Record<FindingSeverity, number>;
+};
 
 export type StartScanOptions = {
   name?: string;
@@ -212,6 +215,19 @@ export function detectTlsFindings(info: TlsInfo, now: Date = new Date()): TlsFin
   }
 
   return result;
+}
+
+// Module-private: the only caller is `getScan`, and it is covered through that
+// public seam rather than directly.
+function summarizeFindingsBySeverity(rows: { severity: FindingSeverity }[]): Record<FindingSeverity, number> {
+  const summary: Record<FindingSeverity, number> = { critical: 0, high: 0, medium: 0, low: 0, info: 0 };
+  for (const row of rows) {
+    // `severity` is a compile-time cast over a plain text column, so a row can carry
+    // a value outside the union. `hasOwn`, not `in`: `in` walks the prototype chain,
+    // so a severity of `constructor` or `toString` would slip past and corrupt the block.
+    if (Object.hasOwn(summary, row.severity)) summary[row.severity] += 1;
+  }
+  return summary;
 }
 
 export type VersionBanner = { software: string; version: string };
@@ -461,7 +477,9 @@ export class ScannerService {
       findings: this.#db.select().from(findings).where(eq(findings.scanTargetId, target.id)).all(),
     }));
 
-    return { ...scan, targets };
+    const allFindings = targets.flatMap((target) => target.findings);
+
+    return { ...scan, targets, findingsBySeverity: summarizeFindingsBySeverity(allFindings) };
   }
 
   async listScans(): Promise<Scan[]> {

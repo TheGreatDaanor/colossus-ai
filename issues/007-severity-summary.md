@@ -1,7 +1,7 @@
 ---
 id: 007
 title: Add findings-by-severity summary to scan results
-status: open
+status: done
 type: afk
 blocked-by: [001]
 ---
@@ -22,13 +22,16 @@ per-finding detail.
 
 - Service: `src/services/scanner.ts` — aggregate existing findings by
   `severity` when serializing `getScan`'s result.
+- Route: `src/routes/scans.ts` — map the service's camelCase
+  `findingsBySeverity` to the `findings_by_severity` wire key.
 
 ## Definition of done
 
-- [ ] Failing test written first, confirmed red
-- [ ] Implementation makes it green
-- [ ] `test`, `typecheck`, `lint` all pass
-- [ ] Visible at: test seeds fixture findings of mixed severities on a scan;
+- [x] Failing test written first, confirmed red
+- [x] Implementation makes it green
+- [x] `test`, `typecheck`, `lint` all pass
+- [x] Visible at: test drives real findings of mixed severities through the
+      scanner against a stubbed fetch (rather than seeding fixture rows);
       `curl localhost:PORT/scans/:id` response includes a
       `findings_by_severity` block with correct counts per level. (This
       summary block isn't rendered on the dashboard — [[001]]'s template only

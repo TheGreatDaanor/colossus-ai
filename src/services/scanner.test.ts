@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 import { createDb } from '../db/client.js';
+import { findings } from '../db/schema.js';
 import {
   ScannerService,
   ScanValidationError,
@@ -18,6 +19,16 @@ function deferred<T>(): { promise: Promise<T>; resolve: (v: T) => void } {
   const promise = new Promise<T>((r) => (resolve = r));
   return { promise, resolve };
 }
+
+// A response that trips none of the header checks — used to pin the zero-findings shape.
+const FULLY_HARDENED_HEADERS: Record<string, string> = {
+  'content-security-policy': "default-src 'self'",
+  'x-frame-options': 'DENY',
+  'x-content-type-options': 'nosniff',
+  'strict-transport-security': 'max-age=63072000',
+  'referrer-policy': 'no-referrer',
+  'permissions-policy': 'geolocation=()',
+};
 
 function okResponse(body: Record<string, string> = { 'x-test': '1' }): Response {
   return new Response(null, { status: 200, headers: body });
@@ -202,6 +213,105 @@ describe('ScannerService', () => {
     for (const finding of target?.findings ?? []) {
       expect(finding.confidence).toBe('definitive');
     }
+  });
+
+  it('counts findings by severity across all targets in the scan', async () => {
+    const fetchImpl: FetchImpl = vi.fn(
+      async () =>
+        new Response(null, {
+          status: 200,
+          headers: { 'set-cookie': 'session=abc123' },
+        }),
+    );
+    const svc = new ScannerService(createDb(':memory:'), { fetchImpl, tlsCheckImpl: okTlsCheckImpl() });
+    const scan = await svc.startScan(['https://example.com', 'https://example.org']);
+
+    const completed = await vi.waitFor(async () => {
+      const s = await svc.getScan(scan.id);
+      if (!s || s.status !== 'completed') throw new Error('not yet completed');
+      return s;
+    });
+
+    // Both targets get the same response — no security headers, plus an insecure
+    // session cookie — which yields seven findings each: 2 high (missing CSP,
+    // missing HSTS), 2 medium (missing X-Frame-Options, insecure cookie), 3 low
+    // (missing X-Content-Type-Options, Referrer-Policy, Permissions-Policy).
+    // The summary is therefore exactly double a single target's counts.
+    expect(completed.targets).toHaveLength(2);
+    expect(completed.findingsBySeverity).toEqual({
+      critical: 0,
+      high: 4,
+      medium: 4,
+      low: 6,
+      info: 0,
+    });
+  });
+
+  it('reports all-zero severity counts for a scan with no findings', async () => {
+    const fetchImpl: FetchImpl = vi.fn(async () => okResponse(FULLY_HARDENED_HEADERS));
+    const svc = new ScannerService(createDb(':memory:'), { fetchImpl, tlsCheckImpl: okTlsCheckImpl() });
+    const scan = await svc.startScan(['https://example.com']);
+
+    const completed = await vi.waitFor(async () => {
+      const s = await svc.getScan(scan.id);
+      if (!s || s.status !== 'completed') throw new Error('not yet completed');
+      return s;
+    });
+
+    expect(completed.targets.flatMap((t) => t.findings)).toHaveLength(0);
+    expect(completed.findingsBySeverity).toEqual({
+      critical: 0,
+      high: 0,
+      medium: 0,
+      low: 0,
+      info: 0,
+    });
+  });
+
+  it('ignores a stored severity outside the known set instead of poisoning the counts', async () => {
+    const fetchImpl: FetchImpl = vi.fn(async () => okResponse(FULLY_HARDENED_HEADERS));
+    const db = createDb(':memory:');
+    const svc = new ScannerService(db, { fetchImpl, tlsCheckImpl: okTlsCheckImpl() });
+    const scan = await svc.startScan(['https://example.com']);
+
+    const completed = await vi.waitFor(async () => {
+      const s = await svc.getScan(scan.id);
+      if (!s || s.status !== 'completed') throw new Error('not yet completed');
+      return s;
+    });
+
+    // `severity` is `text().$type<FindingSeverity>()` — a compile-time cast with no
+    // runtime constraint, so a row can carry a value outside the union. Write one
+    // directly to prove the summary stays a valid count block.
+    const target = completed.targets[0];
+    if (!target) throw new Error('expected a scan target');
+    db.insert(findings)
+      .values({
+        scanTargetId: target.id,
+        category: 'from-the-future',
+        severity: 'catastrophic' as never,
+        confidence: 'definitive',
+      })
+      .run();
+    // `constructor` is the interesting case: it is truthy under `in` because it
+    // lives on Object.prototype, so a prototype-chain guard lets it through.
+    db.insert(findings)
+      .values({
+        scanTargetId: target.id,
+        category: 'prototype-shaped',
+        severity: 'constructor' as never,
+        confidence: 'definitive',
+      })
+      .run();
+
+    const reread = await svc.getScan(scan.id);
+    expect(reread?.findingsBySeverity).toEqual({
+      critical: 0,
+      high: 0,
+      medium: 0,
+      low: 0,
+      info: 0,
+    });
   });
 
   it('records tls_version and tls_cert_expires_at on an https target from the TLS check', async () => {

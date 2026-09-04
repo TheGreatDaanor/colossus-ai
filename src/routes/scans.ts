@@ -52,7 +52,11 @@ export function createScansRoutes(service: ScannerService): Hono {
 
     const scan = await service.getScan(id);
     if (!scan) return c.json({ error: 'scan not found' }, 404);
-    return c.json(scan);
+
+    // The issue pins the wire key as snake_case; the service keeps the camelCase
+    // domain name, so the rename happens here at the response boundary.
+    const { findingsBySeverity, ...rest } = scan;
+    return c.json({ ...rest, findings_by_severity: findingsBySeverity });
   });
 
   return app;
