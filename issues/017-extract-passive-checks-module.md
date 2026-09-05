@@ -1,7 +1,7 @@
 ---
 id: 017
 title: Extract pure passive detectors into src/services/passive-checks.ts
-status: open
+status: done
 type: afk
 blocked-by: [016]
 ---
@@ -51,10 +51,10 @@ being pure. Leave them; they are their own issue, later.
 
 ## Definition of done
 
-- [ ] Failing test written first, confirmed red
-- [ ] Implementation makes it green
-- [ ] `test`, `typecheck`, `lint` all pass
-- [ ] Visible at: `npx vitest run src/services` is green with no test
+- [x] Failing test written first, confirmed red
+- [x] Implementation makes it green
+- [x] `test`, `typecheck`, `lint` all pass
+- [x] Visible at: `npx vitest run src/services` is green with no test
       *assertions* changed — only their file location. A diff review shows
       no behavioral change.
 
