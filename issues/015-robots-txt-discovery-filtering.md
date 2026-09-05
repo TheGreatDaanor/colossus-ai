@@ -1,7 +1,7 @@
 ---
 id: 015
 title: Filter discovered links against robots.txt Disallow rules
-status: open
+status: done
 type: afk
 blocked-by: [014]
 ---
@@ -29,10 +29,10 @@ same page still are.
 
 ## Definition of done
 
-- [ ] Failing test written first, confirmed red
-- [ ] Implementation makes it green
-- [ ] `test`, `typecheck`, `lint` all pass
-- [ ] Visible at: a scan against a fixture target whose `robots.txt` disallows `/admin` and whose page links to both `/admin/settings` and `/contact` results in `/contact` appearing as a discovered target and `/admin/settings` not appearing at all.
+- [x] Failing test written first, confirmed red
+- [x] Implementation makes it green
+- [x] `test`, `typecheck`, `lint` all pass
+- [x] Visible at: a scan against a fixture target whose `robots.txt` disallows `/admin` and whose page links to both `/admin/settings` and `/contact` results in `/contact` appearing as a discovered target and `/admin/settings` not appearing at all.
 
 ## Out of scope
 

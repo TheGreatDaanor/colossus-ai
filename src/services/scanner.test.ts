@@ -1262,6 +1262,24 @@ describe('ScannerService same-origin link discovery', () => {
     expect(fetched.every((origin) => origin === 'https://example.com')).toBe(true);
   });
 
+  it('skips a discovered link whose path is disallowed by the target robots.txt', async () => {
+    const fetchImpl: FetchImpl = vi.fn(async (url) => {
+      if (String(url) === 'https://example.com/robots.txt') {
+        return new Response('User-agent: *\nDisallow: /admin\n', { status: 200 });
+      }
+      return String(url) === 'https://example.com/'
+        ? htmlResponse('<a href="/admin/settings">Admin</a><a href="/contact">Contact</a>')
+        : htmlResponse('');
+    });
+
+    const completed = await runScanToCompletion(fetchImpl, ['https://example.com/']);
+
+    expect(completed.targets.map((t) => t.url).sort()).toEqual([
+      'https://example.com/',
+      'https://example.com/contact',
+    ]);
+  });
+
   it('caps discovery at 25 pages per root, counted separately for each submitted root', async () => {
     const fetchImpl: FetchImpl = vi.fn(async (url) => {
       const parsed = new URL(String(url));

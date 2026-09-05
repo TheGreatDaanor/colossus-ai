@@ -8,10 +8,33 @@ function isSameOrigin(candidate: URL, origin: URL): boolean {
 const HREF_PATTERN = /<a\b[^>]*\bhref\s*=\s*["']([^"']*)["']/gi;
 const FORM_ACTION_PATTERN = /<form\b[^>]*\baction\s*=\s*["']([^"']*)["']/gi;
 
+// Only `Disallow` is honoured — `Allow`, crawl-delay and sitemap directives are
+// deliberately out of scope for this phase.
+function disallowedPrefixes(robotsTxt: string | null): string[] {
+  if (robotsTxt === null) return [];
+
+  const prefixes: string[] = [];
+  for (const line of robotsTxt.split(/\r?\n/)) {
+    const withoutComment = line.split('#')[0] ?? '';
+    const match = /^\s*disallow\s*:\s*(\S*)\s*$/i.exec(withoutComment);
+    if (match === null) continue;
+
+    // `Disallow:` with an empty value means "nothing is disallowed" — not a
+    // prefix that matches every path.
+    const prefix = match[1] ?? '';
+    if (prefix === '') continue;
+
+    prefixes.push(prefix);
+  }
+
+  return prefixes;
+}
+
 // Pure, no I/O: takes a page's already-fetched HTML and its URL, and returns the
 // same-origin `<a href>`/`<form action>` links found in it, resolved to absolute
-// URLs and deduped. No robots.txt filtering yet (that's 015).
-export function discoverLinks(page: { url: URL; html: string }): string[] {
+// URLs and deduped, minus anything the target's robots.txt disallows.
+export function discoverLinks(page: { url: URL; html: string }, robotsTxt: string | null): string[] {
+  const disallowed = disallowedPrefixes(robotsTxt);
   const found = new Set<string>();
 
   for (const pattern of [HREF_PATTERN, FORM_ACTION_PATTERN]) {
@@ -28,6 +51,7 @@ export function discoverLinks(page: { url: URL; html: string }): string[] {
         continue;
       }
       if (!isSameOrigin(resolved, page.url)) continue;
+      if (disallowed.some((prefix) => resolved.pathname.startsWith(prefix))) continue;
 
       resolved.hash = '';
       found.add(resolved.toString());

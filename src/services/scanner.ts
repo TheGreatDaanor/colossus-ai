@@ -712,7 +712,7 @@ export class ScannerService {
 
       // Discovery runs regardless of mode — it's non-intrusive HTML parsing, not a
       // payload-sending check, so it isn't gated behind the active-mode attestation.
-      const discovered = this.#discoverTargets(target, targetUrl, html, discovery);
+      const discovered = this.#discoverTargets(target, targetUrl, html, robotsBody, discovery);
 
       console.warn(`[scan ${target.scanId}] ${target.url} succeeded`);
       return discovered;
@@ -742,12 +742,18 @@ export class ScannerService {
   // operator-submitted root (walking `discoveredFrom` back to the root would also
   // work but requires a DB round-trip per target; the in-memory maps are scoped to
   // one #runScan call and cost nothing extra).
-  #discoverTargets(target: ScanTarget, targetUrl: URL, html: string, discovery: DiscoveryContext): ScanTarget[] {
+  #discoverTargets(
+    target: ScanTarget,
+    targetUrl: URL,
+    html: string,
+    robotsTxt: string | null,
+    discovery: DiscoveryContext,
+  ): ScanTarget[] {
     const depth = discovery.depthOf.get(target.id) ?? 0;
     if (depth >= MAX_DISCOVERY_DEPTH) return [];
 
     const rootId = discovery.rootOf.get(target.id) ?? target.id;
-    const links = discoverLinks({ url: targetUrl, html });
+    const links = discoverLinks({ url: targetUrl, html }, robotsTxt);
     const rows: (typeof scanTargets.$inferInsert)[] = [];
 
     for (const url of links) {
