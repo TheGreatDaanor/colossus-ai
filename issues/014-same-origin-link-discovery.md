@@ -1,7 +1,7 @@
 ---
 id: 014
 title: Discover same-origin links/forms and add them as new scan targets
-status: open
+status: done
 type: afk
 blocked-by: []
 ---
