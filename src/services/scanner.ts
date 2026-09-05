@@ -3,7 +3,7 @@ import { isIP } from 'node:net';
 import { connect as tlsConnect } from 'node:tls';
 import { eq } from 'drizzle-orm';
 import type { Db } from '../db/client.js';
-import { enumerateInjectionPoints } from './active-scanner.js';
+import { confirmXss, enumerateInjectionPoints, type XssConfirmImpl } from './active-scanner.js';
 import { discoverLinks } from './discovery.js';
 import {
   detectHeaderFindings,
@@ -23,6 +23,7 @@ import {
   type FindingSeverity,
   type FindingConfidence,
   type ScanMode,
+  type InjectionAttempt,
 } from '../db/schema.js';
 
 export { detectHeaderFindings, detectTlsFindings, extractVersionBanner, NO_TLS_FINDING };
@@ -440,6 +441,12 @@ export class ScannerService {
   readonly #maxExtraRequests: number;
   readonly #concurrency: number;
   readonly #defaultUserAgent: string;
+  readonly #xssConfirmImpl: XssConfirmImpl;
+  // Hostnames the SSRF guard is told to permit even though they resolve to a
+  // disallowed (e.g. loopback) address. Empty in production and set only by tests
+  // that serve a fixture on 127.0.0.1 — deliberately a constructor option, not an
+  // env var, so nothing in production can accidentally disable the guard.
+  readonly #allowedHosts: Set<string>;
 
   constructor(
     db: Db,
@@ -452,6 +459,8 @@ export class ScannerService {
       maxExtraRequests?: number;
       concurrency?: number;
       defaultUserAgent?: string;
+      xssConfirmImpl?: XssConfirmImpl;
+      allowedHosts?: string[];
     } = {},
   ) {
     this.#db = db;
@@ -462,6 +471,8 @@ export class ScannerService {
     this.#maxExtraRequests = options.maxExtraRequests ?? 6;
     this.#concurrency = options.concurrency ?? 10;
     this.#defaultUserAgent = options.defaultUserAgent ?? 'colossus-scanner/1.0';
+    this.#xssConfirmImpl = options.xssConfirmImpl ?? confirmXss;
+    this.#allowedHosts = new Set(options.allowedHosts ?? []);
     this.#tlsCheckImpl =
       options.tlsCheckImpl ?? ((hostname, port) => defaultTlsCheck(hostname, port, this.#timeoutMs));
     this.#osvCheckImpl = options.osvCheckImpl ?? defaultOsvCheck;
@@ -595,7 +606,7 @@ export class ScannerService {
 
     const targetUrl = new URL(target.url);
     const hostname = targetUrl.hostname;
-    const disallowedAddress = await findDisallowedAddress(hostname);
+    const disallowedAddress = this.#allowedHosts.has(hostname) ? null : await findDisallowedAddress(hostname);
     if (disallowedAddress !== null) {
       this.#db
         .update(scanTargets)
@@ -783,16 +794,19 @@ export class ScannerService {
     return created;
   }
 
-  // Active-mode only: for each query parameter, substitute a unique canary payload
-  // as its value and fetch the mutated URL. The attempts are recorded on the target
-  // so the injection points are inspectable; execution confirmation — turning a
-  // recorded attempt into an `xss` finding — lands in 011. A target with no query
-  // parameters produces zero attempts. The mutated URLs share the target's host,
-  // which the SSRF guard already cleared; per-navigation redirect guarding is 012.
+  // Active-mode only: for each query parameter, substitute a unique canary payload,
+  // fetch the mutated URL, then load it in a headless browser to see whether the
+  // marker executes. Each attempt records its confirmation outcome so a
+  // `not_vulnerable` (page escaped it) is visibly distinct from an `unavailable`
+  // (we couldn't test it); a `confirmed` outcome also writes a definitive `xss`
+  // finding. A target with no query parameters produces zero attempts. The mutated
+  // URLs share the target's host, which the SSRF guard already cleared;
+  // per-navigation redirect guarding is 012.
   async #injectQueryParams(target: ScanTarget, targetUrl: URL, userAgent: string): Promise<void> {
     const points = enumerateInjectionPoints(targetUrl);
     if (points.length === 0) return;
 
+    const attempts: InjectionAttempt[] = [];
     for (const point of points) {
       try {
         await this.#fetchImpl(point.url, { redirect: 'manual', headers: { 'user-agent': userAgent } });
@@ -800,13 +814,26 @@ export class ScannerService {
         const message = err instanceof Error ? err.message : String(err);
         console.warn(`[scan ${target.scanId}] ${point.url} injection fetch failed: ${message}`);
       }
+
+      const result = await this.#xssConfirmImpl(point.url, point.payload);
+      attempts.push({ injectionPoint: point.injectionPoint, payload: point.payload, ...result });
+
+      if (result.outcome === 'confirmed') {
+        this.#db
+          .insert(findings)
+          .values({
+            scanTargetId: target.id,
+            category: 'xss',
+            severity: 'high',
+            confidence: 'definitive',
+            injectionPoint: point.injectionPoint,
+            payload: point.payload,
+          })
+          .run();
+      }
     }
 
-    this.#db
-      .update(scanTargets)
-      .set({ injectionAttempts: points.map(({ injectionPoint, payload }) => ({ injectionPoint, payload })) })
-      .where(eq(scanTargets.id, target.id))
-      .run();
+    this.#db.update(scanTargets).set({ injectionAttempts: attempts }).where(eq(scanTargets.id, target.id)).run();
   }
 
   async #fetchRobotsTxt(targetUrl: URL, userAgent: string, budget: Budget): Promise<string | null> {

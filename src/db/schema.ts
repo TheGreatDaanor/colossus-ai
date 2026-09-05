@@ -6,9 +6,17 @@ export type ScanTargetStatus = 'pending' | 'ok' | 'unreachable' | 'timeout' | 'i
 export type FindingSeverity = 'critical' | 'high' | 'medium' | 'low' | 'info';
 export type FindingConfidence = 'definitive' | 'possible';
 
-// An active-mode canary injection attempt against one query parameter. Recorded per
-// target; execution confirmation (turning an attempt into a finding) lands in 011.
-export type InjectionAttempt = { injectionPoint: string; payload: string };
+export type XssOutcome = 'confirmed' | 'not_vulnerable' | 'unavailable';
+
+// An active-mode canary injection attempt against one query parameter, recorded per
+// target. `outcome` is the browser-confirmation result from 011; `error` carries the
+// reason a `not_vulnerable`/`unavailable` attempt could not be confirmed, when known.
+export type InjectionAttempt = {
+  injectionPoint: string;
+  payload: string;
+  outcome?: XssOutcome;
+  error?: string;
+};
 
 export const scans = sqliteTable('scans', {
   id: integer('id').primaryKey({ autoIncrement: true }),
@@ -53,4 +61,8 @@ export const findings = sqliteTable('findings', {
   cveId: text('cve_id'),
   explanation: text('explanation'),
   suggestedFix: text('suggested_fix'),
+  // Set only on browser-confirmed XSS findings (category 'xss'): which query
+  // parameter was injected and the canary payload that executed.
+  injectionPoint: text('injection_point'),
+  payload: text('payload'),
 });

@@ -1,4 +1,6 @@
-import { describe, expect, it, vi } from 'vitest';
+import { createServer, type Server } from 'node:http';
+import type { AddressInfo } from 'node:net';
+import { afterAll, describe, expect, it, vi } from 'vitest';
 import { createDb } from '../db/client.js';
 import { findings } from '../db/schema.js';
 import {
@@ -1332,4 +1334,126 @@ describe('ScannerService same-origin link discovery', () => {
 
     expect(completed.targets.map((t) => t.url)).toEqual(['https://example.com/']);
   });
+});
+
+describe('ScannerService active-mode XSS confirmation', () => {
+  it('writes an xss finding and records a confirmed outcome when the browser confirms execution', async () => {
+    const fetchImpl: FetchImpl = vi.fn(async () => okResponse(FULLY_HARDENED_HEADERS));
+    const xssConfirmImpl = vi.fn(async () => ({ outcome: 'confirmed' as const }));
+    const svc = new ScannerService(createDb(':memory:'), {
+      fetchImpl,
+      tlsCheckImpl: okTlsCheckImpl(),
+      xssConfirmImpl,
+    });
+    const scan = await svc.startScan(['https://example.com/search?q=test'], {
+      mode: 'active',
+      confirmAuthorized: true,
+    });
+
+    await vi.waitFor(async () => {
+      const s = await svc.getScan(scan.id);
+      if (!s || s.status !== 'completed') throw new Error('not yet completed');
+    });
+
+    const target = (await svc.getScan(scan.id))?.targets[0];
+    const xss = target?.findings.find((f) => f.category === 'xss');
+    expect(xss?.severity).toBe('high');
+    expect(xss?.confidence).toBe('definitive');
+    expect(xss?.injectionPoint).toBe('q');
+    expect(xss?.payload).toContain('__colossus_xss_marker');
+    expect(target?.injectionAttempts?.map((a) => a.outcome)).toEqual(['confirmed']);
+  });
+
+  it('records a not_vulnerable outcome and writes no finding when execution is not confirmed', async () => {
+    const fetchImpl: FetchImpl = vi.fn(async () => okResponse(FULLY_HARDENED_HEADERS));
+    const xssConfirmImpl = vi.fn(async () => ({ outcome: 'not_vulnerable' as const }));
+    const svc = new ScannerService(createDb(':memory:'), {
+      fetchImpl,
+      tlsCheckImpl: okTlsCheckImpl(),
+      xssConfirmImpl,
+    });
+    const scan = await svc.startScan(['https://example.com/search?q=test'], {
+      mode: 'active',
+      confirmAuthorized: true,
+    });
+
+    await vi.waitFor(async () => {
+      const s = await svc.getScan(scan.id);
+      if (!s || s.status !== 'completed') throw new Error('not yet completed');
+    });
+
+    const target = (await svc.getScan(scan.id))?.targets[0];
+    expect(target?.findings.some((f) => f.category === 'xss')).toBe(false);
+    expect(target?.injectionAttempts?.map((a) => a.outcome)).toEqual(['not_vulnerable']);
+  });
+});
+
+// End-to-end through the real Playwright browser (default confirmXss, no mock) against
+// a real loopback fixture — the one place the whole active-scan pipeline is exercised
+// for real. Everywhere else confirmXss is mocked at its boundary.
+describe('ScannerService active-mode XSS confirmation (real browser)', () => {
+  const servers: Server[] = [];
+  afterAll(async () => {
+    await Promise.all(servers.map((srv) => new Promise((r) => srv.close(r))));
+  });
+
+  function startFixture(render: (q: string) => string): Promise<string> {
+    return new Promise((resolve) => {
+      const server = createServer((req, res) => {
+        const url = new URL(req.url ?? '/', 'http://localhost');
+        res.writeHead(200, { 'content-type': 'text/html' });
+        res.end(render(url.searchParams.get('q') ?? ''));
+      });
+      servers.push(server);
+      server.listen(0, '127.0.0.1', () => {
+        const { port } = server.address() as AddressInfo;
+        resolve(`http://127.0.0.1:${port}`);
+      });
+    });
+  }
+
+  it('produces a definitive xss finding for a page that reflects the param unescaped', async () => {
+    const origin = await startFixture((q) => `<html><body>${q}</body></html>`);
+    const svc = new ScannerService(createDb(':memory:'), {
+      tlsCheckImpl: okTlsCheckImpl(),
+      allowedHosts: ['127.0.0.1'],
+    });
+    const scan = await svc.startScan([`${origin}/?q=test`], { mode: 'active', confirmAuthorized: true });
+
+    await vi.waitFor(
+      async () => {
+        const s = await svc.getScan(scan.id);
+        if (!s || s.status !== 'completed') throw new Error('not yet completed');
+      },
+      { timeout: 30_000 },
+    );
+
+    const target = (await svc.getScan(scan.id))?.targets[0];
+    const xss = target?.findings.find((f) => f.category === 'xss');
+    expect(xss?.confidence).toBe('definitive');
+    expect(target?.injectionAttempts?.[0]?.outcome).toBe('confirmed');
+  }, 40_000);
+
+  it('records not_vulnerable and no finding for a page that escapes the param', async () => {
+    const origin = await startFixture(
+      (q) => `<html><body>${q.replace(/</g, '&lt;').replace(/>/g, '&gt;')}</body></html>`,
+    );
+    const svc = new ScannerService(createDb(':memory:'), {
+      tlsCheckImpl: okTlsCheckImpl(),
+      allowedHosts: ['127.0.0.1'],
+    });
+    const scan = await svc.startScan([`${origin}/?q=test`], { mode: 'active', confirmAuthorized: true });
+
+    await vi.waitFor(
+      async () => {
+        const s = await svc.getScan(scan.id);
+        if (!s || s.status !== 'completed') throw new Error('not yet completed');
+      },
+      { timeout: 30_000 },
+    );
+
+    const target = (await svc.getScan(scan.id))?.targets[0];
+    expect(target?.findings.some((f) => f.category === 'xss')).toBe(false);
+    expect(target?.injectionAttempts?.[0]?.outcome).toBe('not_vulnerable');
+  }, 40_000);
 });

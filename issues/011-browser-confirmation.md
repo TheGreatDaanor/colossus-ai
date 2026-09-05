@@ -1,7 +1,7 @@
 ---
 id: 011
 title: Confirm XSS execution via Playwright and emit findings
-status: open
+status: done
 type: afk
 blocked-by: [010]
 ---
@@ -93,10 +93,10 @@ waiting to happen.
 
 ## Definition of done
 
-- [ ] Failing test written first, confirmed red
-- [ ] Implementation makes it green
-- [ ] `test`, `typecheck`, `lint` all pass
-- [ ] Visible at: an active-mode scan against a locally-served fixture page that reflects the query param unescaped produces a `findings` row with `category: "xss"`, `confidence: "definitive"`; the same scan against a fixture that escapes the param produces no finding but a visible `not_vulnerable` outcome on the target.
+- [x] Failing test written first, confirmed red
+- [x] Implementation makes it green
+- [x] `test`, `typecheck`, `lint` all pass
+- [x] Visible at: an active-mode scan against a locally-served fixture page that reflects the query param unescaped produces a `findings` row with `category: "xss"`, `confidence: "definitive"`; the same scan against a fixture that escapes the param produces no finding but a visible `not_vulnerable` outcome on the target.
 
 ## Out of scope
 
