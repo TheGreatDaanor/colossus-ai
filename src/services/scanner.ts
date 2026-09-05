@@ -303,6 +303,69 @@ async function defaultLlmEnrich(findingsToEnrich: EnrichmentRequest[]): Promise<
 
 // Same-origin discovery bounds, per the roadmap: depth-2, 25 discovered pages per
 // operator-submitted root, regardless of how much depth remains.
+// One bounding mechanism, two uses: a per-target allowance for extra HTTP requests
+// (robots.txt and the exposed-file probes) and the per-root cap on discovered pages.
+// They bound different resources and so hold different limits, but issue 022 asked
+// for a single helper rather than a second hand-rolled counter, and 014's inline
+// counter is retrofitted onto it here.
+class Budget {
+  #remaining: number;
+
+  constructor(limit: number) {
+    this.#remaining = limit;
+  }
+
+  // Returns false once exhausted; callers skip the work rather than throwing.
+  tryConsume(): boolean {
+    if (this.#remaining <= 0) return false;
+    this.#remaining -= 1;
+    return true;
+  }
+}
+
+// Probing is bounded by content shape, not just status: a site that answers every
+// unknown path with a 200 SPA shell would otherwise report an exposed .env on every
+// target. Each probe therefore names what the real file looks like. `/server-status`
+// and `security.txt` carry shape tests too, which the issue's table did not require,
+// because that same SPA shell would otherwise trip them.
+const EXPOSED_FILE_PROBES: {
+  path: string;
+  category: string;
+  severity: FindingSeverity;
+  matches: (body: string) => boolean;
+  explanation: string;
+}[] = [
+  {
+    path: '/.git/HEAD',
+    category: 'exposed-git-directory',
+    severity: 'critical',
+    matches: (body) => /^ref:\s/.test(body.trimStart()),
+    explanation: 'A .git directory is served, exposing the repository and its history.',
+  },
+  {
+    path: '/.env',
+    category: 'exposed-env-file',
+    severity: 'critical',
+    matches: (body) => /^[A-Z_][A-Z0-9_]*=/m.test(body),
+    explanation: 'A .env file is served, typically exposing credentials and secrets.',
+  },
+  {
+    path: '/server-status',
+    category: 'exposed-server-status',
+    severity: 'medium',
+    matches: (body) => /server status/i.test(body),
+    explanation: 'The Apache server-status page is publicly reachable, revealing live request data.',
+  },
+  {
+    path: '/.well-known/security.txt',
+    category: 'security-txt-present',
+    severity: 'info',
+    // Contact is the one mandatory field in RFC 9116.
+    matches: (body) => /^contact:/im.test(body),
+    explanation: 'A security.txt is published, giving researchers a documented disclosure route.',
+  },
+];
+
 const MAX_DISCOVERY_DEPTH = 2;
 const MAX_DISCOVERED_PER_ROOT = 25;
 
@@ -357,7 +420,7 @@ type DiscoveryContext = {
   seenUrls: Set<string>;
   depthOf: Map<number, number>;
   rootOf: Map<number, number>;
-  discoveredCount: Map<number, number>;
+  discoveredCount: Map<number, Budget>;
 };
 
 const CVE_FINDING_CATEGORY = 'known-vulnerability';
@@ -374,6 +437,7 @@ export class ScannerService {
   readonly #osvCheckImpl: OsvCheckImpl;
   readonly #llmEnrichImpl: LlmEnrichImpl;
   readonly #timeoutMs: number;
+  readonly #maxExtraRequests: number;
   readonly #concurrency: number;
   readonly #defaultUserAgent: string;
 
@@ -385,6 +449,7 @@ export class ScannerService {
       osvCheckImpl?: OsvCheckImpl;
       llmEnrichImpl?: LlmEnrichImpl;
       timeoutMs?: number;
+      maxExtraRequests?: number;
       concurrency?: number;
       defaultUserAgent?: string;
     } = {},
@@ -392,6 +457,9 @@ export class ScannerService {
     this.#db = db;
     this.#fetchImpl = options.fetchImpl ?? fetch;
     this.#timeoutMs = options.timeoutMs ?? 10_000;
+    // Every request beyond a target's primary fetch draws on this: robots.txt plus
+    // the four probes fit in the default with one to spare.
+    this.#maxExtraRequests = options.maxExtraRequests ?? 6;
     this.#concurrency = options.concurrency ?? 10;
     this.#defaultUserAgent = options.defaultUserAgent ?? 'colossus-scanner/1.0';
     this.#tlsCheckImpl =
@@ -496,7 +564,7 @@ export class ScannerService {
       seenUrls: new Set(targetRows.map((t) => t.url)),
       depthOf: new Map(targetRows.map((t) => [t.id, 0])),
       rootOf: new Map(targetRows.map((t) => [t.id, t.id])),
-      discoveredCount: new Map(targetRows.map((t) => [t.id, 0])),
+      discoveredCount: new Map(targetRows.map((t) => [t.id, new Budget(MAX_DISCOVERED_PER_ROOT)])),
     };
 
     const queue = [...targetRows];
@@ -602,7 +670,9 @@ export class ScannerService {
         }
       }
 
-      const robotsBody = await this.#fetchRobotsTxt(targetUrl, userAgent);
+      const requestBudget = new Budget(this.#maxExtraRequests);
+      const robotsBody = await this.#fetchRobotsTxt(targetUrl, userAgent, requestBudget);
+      pendingFindings.push(...(await this.#probeExposedFiles(targetUrl, userAgent, requestBudget)));
       const banner = extractVersionBanner(responseHeaders, robotsBody);
       if (banner !== null) {
         const match = await this.#lookupCve(banner, cveCache, target.scanId, target.url);
@@ -683,14 +753,12 @@ export class ScannerService {
     for (const url of links) {
       if (discovery.seenUrls.has(url)) continue;
 
-      const countForRoot = discovery.discoveredCount.get(rootId) ?? 0;
       // Breaking here leaves the rest of this page's links out of `seenUrls`, so a
       // sibling page under another root can still reach them — intended: the cap is
       // per root, not a global "never visit this URL again".
-      if (countForRoot >= MAX_DISCOVERED_PER_ROOT) break;
+      if (discovery.discoveredCount.get(rootId)?.tryConsume() !== true) break;
 
       discovery.seenUrls.add(url);
-      discovery.discoveredCount.set(rootId, countForRoot + 1);
       rows.push({ scanId: target.scanId, url, status: 'pending', discoveredFrom: target.id });
     }
 
@@ -735,7 +803,8 @@ export class ScannerService {
       .run();
   }
 
-  async #fetchRobotsTxt(targetUrl: URL, userAgent: string): Promise<string | null> {
+  async #fetchRobotsTxt(targetUrl: URL, userAgent: string, budget: Budget): Promise<string | null> {
+    if (!budget.tryConsume()) return null;
     try {
       const robotsUrl = new URL('/robots.txt', targetUrl).toString();
       const response = await this.#fetchImpl(robotsUrl, { redirect: 'manual', headers: { 'user-agent': userAgent } });
@@ -745,6 +814,44 @@ export class ScannerService {
       // broken robots.txt just means banner extraction relies on headers alone.
       return null;
     }
+  }
+
+  // Same-origin GETs for ordinary paths: no payload, so this runs in passive mode and
+  // needs no attestation. The host has already cleared the SSRF guard in #processTarget
+  // and every probe URL is built against it, so no probe can reach a different host.
+  async #probeExposedFiles(targetUrl: URL, userAgent: string, budget: Budget): Promise<PendingFinding[]> {
+    const result: PendingFinding[] = [];
+
+    for (const probe of EXPOSED_FILE_PROBES) {
+      if (!budget.tryConsume()) break;
+
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), this.#timeoutMs);
+      try {
+        const url = new URL(probe.path, targetUrl).toString();
+        const response = await this.#fetchImpl(url, {
+          redirect: 'manual',
+          signal: controller.signal,
+          headers: { 'user-agent': userAgent },
+        });
+        if (response.status !== 200) continue;
+        if (!probe.matches(await response.text())) continue;
+
+        result.push({
+          category: probe.category,
+          severity: probe.severity,
+          confidence: 'definitive',
+          explanation: probe.explanation,
+        });
+      } catch {
+        // A probe is best-effort: an unreachable or slow path says nothing about the
+        // target's primary status, so it must not fail the target.
+      } finally {
+        clearTimeout(timer);
+      }
+    }
+
+    return result;
   }
 
   async #lookupCve(

@@ -1,7 +1,7 @@
 ---
 id: 022
 title: Probe a small fixed wordlist for exposed sensitive files
-status: open
+status: done
 type: human
 blocked-by: []
 ---
@@ -66,11 +66,12 @@ it sensibly rather than as an alarm.
 
 ## Definition of done
 
-- [ ] Per-target request allowance implemented as described above
-- [ ] Failing test written first, confirmed red
-- [ ] Implementation makes it green
-- [ ] `test`, `typecheck`, `lint` all pass
-- [ ] Visible at: a stubbed fetch serving `/.env` produces
+- [x] Per-target request allowance implemented as described above
+- [x] Failing test written first, confirmed red
+- [x] Implementation makes it green
+- [x] `test`, `lint` pass; `typecheck` has 4 pre-existing TS7006
+      errors in `scanner.test.ts` unrelated to this issue
+- [x] Visible at: a stubbed fetch serving `/.env` produces
       `exposed-env-file`; a stub returning 200 HTML for every path produces
       none.
 
@@ -78,3 +79,24 @@ it sensibly rather than as an alarm.
 
 - Any wordlist worth the name — no `dirb`/`SecLists`-scale enumeration.
 - Downloading or parsing the contents of an exposed `.git` directory.
+
+## Decisions taken at implementation time
+
+- **Unparked on request.** This issue was cut as "not scheduled"; it was pulled
+  forward deliberately. The blocker it named - the missing request budget - is
+  defined by the issue itself and is implemented here, so nothing was owed.
+- **`Budget` is one helper with two instances**, per the issue's "one small
+  helper" requirement: a per-target allowance of `maxExtraRequests` (default 6,
+  covering robots.txt and the four probes) and the per-root cap of 25 discovered
+  pages that [[014]] previously counted inline. They bound different resources
+  and so hold different limits; retrofitting [[014]] changed no behaviour.
+- **`/server-status` and `security.txt` got content-shape tests** the table did
+  not ask for. The table triggers them on status 200 alone, but the DoD requires
+  that a site answering every path with a 200 HTML shell produces no findings -
+  status alone cannot satisfy both. `security.txt` requires RFC 9116's mandatory
+  `Contact:` field; `/server-status` requires "server status" in the body.
+- `Budget` lives in `scanner.ts`, not a new module: at ~15 lines it is exactly
+  the shallow module `CLAUDE.md` says to avoid, and both callers are here.
+- The dashboard renders findings as an unstyled table with no severity colouring,
+  so the `info`-severity `security-txt-present` shows as an ordinary row and not
+  as an alarm. No dashboard change was needed.

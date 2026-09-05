@@ -779,6 +779,112 @@ describe('isDisallowedAddress', () => {
   });
 });
 
+describe('ScannerService exposed-file probing', () => {
+  // Serves a distinct body per path; anything unlisted 404s.
+  function pathServer(bodies: Record<string, string>): FetchImpl {
+    return vi.fn(async (url: string | URL) => {
+      const path = new URL(url).pathname;
+      const body = bodies[path];
+      if (body === undefined) return new Response('not found', { status: 404 });
+      return new Response(body, { status: 200, headers: FULLY_HARDENED_HEADERS });
+    }) as unknown as FetchImpl;
+  }
+
+  async function categoriesFor(fetchImpl: FetchImpl): Promise<string[]> {
+    const svc = new ScannerService(createDb(':memory:'), { fetchImpl, tlsCheckImpl: okTlsCheckImpl() });
+    const scan = await svc.startScan(['https://example.com']);
+    const completed = await vi.waitFor(async () => {
+      const s = await svc.getScan(scan.id);
+      if (!s || s.status !== 'completed') throw new Error('not yet completed');
+      return s;
+    });
+    return completed.targets.flatMap((t) => t.findings).map((f) => f.category);
+  }
+
+  it('reports an exposed .git directory as critical', async () => {
+    const result = await categoriesFor(pathServer({ '/': 'ok', '/.git/HEAD': 'ref: refs/heads/main\n' }));
+
+    expect(result).toContain('exposed-git-directory');
+  });
+
+  it('reports an exposed .env file', async () => {
+    const result = await categoriesFor(pathServer({ '/': 'ok', '/.env': 'DB_PASSWORD=hunter2\nAPI_KEY=abc\n' }));
+
+    expect(result).toContain('exposed-env-file');
+  });
+
+  it('reports an exposed server-status page', async () => {
+    const result = await categoriesFor(
+      pathServer({ '/': 'ok', '/server-status': '<h1>Apache Server Status for example.com</h1>' }),
+    );
+
+    expect(result).toContain('exposed-server-status');
+  });
+
+  it('records a present security.txt as an info finding', async () => {
+    const result = await categoriesFor(
+      pathServer({ '/': 'ok', '/.well-known/security.txt': 'Contact: mailto:security@example.com\n' }),
+    );
+
+    expect(result).toContain('security-txt-present');
+  });
+
+  it('produces no probe findings when every path returns a 200 HTML shell', async () => {
+    const shell = '<!doctype html><html><body><div id="app"></div></body></html>';
+    const fetchImpl = vi.fn(async () =>
+      new Response(shell, { status: 200, headers: FULLY_HARDENED_HEADERS }),
+    ) as unknown as FetchImpl;
+
+    const result = await categoriesFor(fetchImpl);
+
+    expect(result.filter((c) => c.startsWith('exposed-') || c === 'security-txt-present')).toEqual([]);
+  });
+
+  it('produces no probe findings when the paths 404', async () => {
+    const result = await categoriesFor(pathServer({ '/': 'ok' }));
+
+    expect(result.filter((c) => c.startsWith('exposed-') || c === 'security-txt-present')).toEqual([]);
+  });
+
+  it('spends no more than maxExtraRequests beyond the primary fetch per target', async () => {
+    const fetchImpl = vi.fn(async () => new Response('ok', { status: 200, headers: FULLY_HARDENED_HEADERS }));
+    const svc = new ScannerService(createDb(':memory:'), {
+      fetchImpl: fetchImpl as unknown as FetchImpl,
+      tlsCheckImpl: okTlsCheckImpl(),
+      maxExtraRequests: 2,
+    });
+    const scan = await svc.startScan(['https://example.com']);
+    await vi.waitFor(async () => {
+      const s = await svc.getScan(scan.id);
+      if (!s || s.status !== 'completed') throw new Error('not yet completed');
+      return s;
+    });
+
+    // 1 primary fetch + exactly 2 extra (robots.txt and probes share the allowance);
+    // unbounded, this target would spend 1 + robots + 4 probes = 6.
+    expect(fetchImpl.mock.calls.length).toBe(3);
+  });
+
+  it('gives each target its own allowance rather than a shared global one', async () => {
+    const fetchImpl = vi.fn(async () => new Response('ok', { status: 200, headers: FULLY_HARDENED_HEADERS }));
+    const svc = new ScannerService(createDb(':memory:'), {
+      fetchImpl: fetchImpl as unknown as FetchImpl,
+      tlsCheckImpl: okTlsCheckImpl(),
+      maxExtraRequests: 2,
+    });
+    const scan = await svc.startScan(['https://a.example.com', 'https://b.example.com']);
+    await vi.waitFor(async () => {
+      const s = await svc.getScan(scan.id);
+      if (!s || s.status !== 'completed') throw new Error('not yet completed');
+      return s;
+    });
+
+    // Two targets, each allowed a primary fetch plus 2 extras: a shared global
+    // budget would cap the whole scan at 2 extras and fail this.
+    expect(fetchImpl.mock.calls.length).toBeGreaterThan(3);
+  });
+});
+
 describe('ScannerService weak security headers', () => {
   it('persists weak-header findings with their severities, visible through getScan', async () => {
     const fetchImpl: FetchImpl = vi.fn(async () =>
