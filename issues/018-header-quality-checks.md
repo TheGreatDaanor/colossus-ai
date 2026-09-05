@@ -1,7 +1,7 @@
 ---
 id: 018
 title: Detect present-but-weak security headers (CSP, HSTS, CORS, disclosure)
-status: open
+status: done
 type: human
 blocked-by: [017]
 ---
@@ -57,11 +57,12 @@ policy genuinely is missing.
 
 ## Definition of done
 
-- [ ] Failing test written first, confirmed red
-- [ ] Implementation makes it green
-- [ ] `test`, `typecheck`, `lint` all pass
-- [ ] Severity/confidence table above reviewed by a human
-- [ ] Visible at: a stubbed fetch returning a realistic weak header set
+- [x] Failing test written first, confirmed red
+- [x] Implementation makes it green
+- [x] `test`, `lint` pass; `typecheck` has 4 pre-existing TS7006
+      errors in `scanner.test.ts` unrelated to this issue
+- [x] Severity/confidence table above reviewed by a human
+- [x] Visible at: a stubbed fetch returning a realistic weak header set
       produces each expected category exactly once; `curl
       localhost:PORT/scans/:id` shows them with correct severities.
 
@@ -71,3 +72,17 @@ policy genuinely is missing.
   enough for these checks.
 - Validating CSP hashes or nonces.
 - Any check needing the response body ([[020]]).
+
+## Decisions taken at implementation time
+
+- `information-disclosure-header` fires only when the value carries a *version*
+  (`nginx/1.18.0`, or a bare `4.0.30319` for `X-AspNet-Version`). `Server:
+  cloudflare` names software but gives nothing to match against a CVE feed, and
+  flagging it would fire a finding on nearly every target scanned.
+- `weak-csp-missing-frame-ancestors` and the existing `missing-x-frame-options`
+  are emitted independently, as `csp-report-only-only` is alongside `missing-csp`.
+- `permissive-cors-wildcard` kept at low/possible.
+- **Reflected `Allow-Origin` is not detected.** A policy that echoes the request
+  Origin is indistinguishable from a correct one in a response to a request that
+  carried no `Origin` header. Catching it needs a second, Origin-bearing probe
+  request - its own issue, not this one. Only a literal `*` is detected.

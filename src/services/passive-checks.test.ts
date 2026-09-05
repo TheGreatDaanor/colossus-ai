@@ -22,10 +22,10 @@ describe('detectHeaderFindings', () => {
 
   it('does not flag any of the six headers when all are present', () => {
     const result = detectHeaderFindings({
-      'content-security-policy': "default-src 'self'",
+      'content-security-policy': "default-src 'self'; frame-ancestors 'none'",
       'x-frame-options': 'DENY',
       'x-content-type-options': 'nosniff',
-      'strict-transport-security': 'max-age=63072000',
+      'strict-transport-security': 'max-age=63072000; includeSubDomains',
       'referrer-policy': 'no-referrer',
       'permissions-policy': 'geolocation=()',
     });
@@ -162,5 +162,173 @@ describe('detectTlsFindings', () => {
     const result = detectTlsFindings({ version: 'TLSv1.3', certExpiresAt }, now);
 
     expect(result.find((f) => f.category === 'cert-expiring-soon')).toBeUndefined();
+  });
+});
+
+describe('detectHeaderFindings weak-header quality checks', () => {
+  const categories = (headers: Record<string, string>): string[] =>
+    detectHeaderFindings(headers).map((f) => f.category);
+
+  const finding = (headers: Record<string, string>, category: string) =>
+    detectHeaderFindings(headers).find((f) => f.category === category);
+
+  describe('CSP', () => {
+    it('flags unsafe-inline in script-src', () => {
+      const result = finding({ 'content-security-policy': "script-src 'self' 'unsafe-inline'; frame-ancestors 'none'" }, 'weak-csp-unsafe-inline');
+
+      expect(result).toMatchObject({ severity: 'high', confidence: 'possible' });
+    });
+
+    it('flags unsafe-inline in default-src when there is no script-src', () => {
+      expect(categories({ 'content-security-policy': "default-src 'self' 'unsafe-inline'; frame-ancestors 'none'" })).toContain(
+        'weak-csp-unsafe-inline',
+      );
+    });
+
+    it('flags unsafe-eval', () => {
+      const result = finding({ 'content-security-policy': "script-src 'self' 'unsafe-eval'; frame-ancestors 'none'" }, 'weak-csp-unsafe-eval');
+
+      expect(result).toMatchObject({ severity: 'medium', confidence: 'possible' });
+    });
+
+    it('flags a wildcard default-src', () => {
+      const result = finding({ 'content-security-policy': "default-src *; frame-ancestors 'none'" }, 'weak-csp-wildcard-default-src');
+
+      expect(result).toMatchObject({ severity: 'high', confidence: 'possible' });
+    });
+
+    it('flags a policy with no frame-ancestors directive', () => {
+      const result = finding({ 'content-security-policy': "script-src 'self'" }, 'weak-csp-missing-frame-ancestors');
+
+      expect(result).toMatchObject({ severity: 'low', confidence: 'possible' });
+    });
+
+    it('emits missing-frame-ancestors independently of X-Frame-Options being set', () => {
+      expect(categories({ 'content-security-policy': "script-src 'self'", 'x-frame-options': 'DENY' })).toContain(
+        'weak-csp-missing-frame-ancestors',
+      );
+    });
+
+    it('emits no weak-csp findings for a strict policy', () => {
+      expect(categories({ 'content-security-policy': "default-src 'self'; frame-ancestors 'none'" }).filter((c) => c.startsWith('weak-csp'))).toEqual([]);
+    });
+
+    it('emits both missing-csp and csp-report-only-only when only a report-only policy is set', () => {
+      const result = categories({ 'content-security-policy-report-only': "default-src 'self'" });
+
+      expect(result).toContain('missing-csp');
+      expect(result).toContain('csp-report-only-only');
+    });
+
+    it('emits no weak-csp findings when the CSP header is absent entirely', () => {
+      expect(categories({}).filter((c) => c.startsWith('weak-csp'))).toEqual([]);
+    });
+
+    it('does not flag report-only-only when an enforcing policy is also present', () => {
+      expect(
+        categories({
+          'content-security-policy': "default-src 'self'; frame-ancestors 'none'",
+          'content-security-policy-report-only': "default-src 'self'",
+        }),
+      ).not.toContain('csp-report-only-only');
+    });
+  });
+
+  describe('HSTS', () => {
+    it('flags a max-age under 180 days', () => {
+      const result = finding({ 'strict-transport-security': 'max-age=120; includeSubDomains' }, 'weak-hsts-short-max-age');
+
+      expect(result).toMatchObject({ severity: 'medium', confidence: 'definitive' });
+    });
+
+    it('flags a policy without includeSubDomains', () => {
+      const result = finding({ 'strict-transport-security': 'max-age=31536000' }, 'weak-hsts-no-subdomains');
+
+      expect(result).toMatchObject({ severity: 'low', confidence: 'definitive' });
+    });
+
+    it('emits no weak-hsts findings for a year-long policy covering subdomains', () => {
+      expect(categories({ 'strict-transport-security': 'max-age=31536000; includeSubDomains' }).filter((c) => c.startsWith('weak-hsts'))).toEqual([]);
+    });
+
+    it('emits no weak-hsts findings when the header is absent', () => {
+      expect(categories({}).filter((c) => c.startsWith('weak-hsts'))).toEqual([]);
+    });
+  });
+
+  describe('CORS', () => {
+    it('flags a wildcard origin alongside credentials as high severity', () => {
+      const result = finding(
+        { 'access-control-allow-origin': '*', 'access-control-allow-credentials': 'true' },
+        'permissive-cors-credentialed',
+      );
+
+      expect(result).toMatchObject({ severity: 'high', confidence: 'definitive' });
+    });
+
+    it('flags a bare wildcard origin as low severity and possible', () => {
+      const result = finding({ 'access-control-allow-origin': '*' }, 'permissive-cors-wildcard');
+
+      expect(result).toMatchObject({ severity: 'low', confidence: 'possible' });
+    });
+
+    it('emits only one of the two CORS categories for a credentialed wildcard', () => {
+      expect(
+        categories({ 'access-control-allow-origin': '*', 'access-control-allow-credentials': 'true' }),
+      ).not.toContain('permissive-cors-wildcard');
+    });
+
+    it('does not flag a specific allowed origin', () => {
+      expect(categories({ 'access-control-allow-origin': 'https://app.example.com' }).filter((c) => c.startsWith('permissive-cors'))).toEqual([]);
+    });
+  });
+
+  describe('information disclosure', () => {
+    it('flags a Server header revealing a version', () => {
+      const result = finding({ server: 'nginx/1.18.0' }, 'information-disclosure-header');
+
+      expect(result).toMatchObject({ severity: 'low', confidence: 'definitive' });
+    });
+
+    it('does not flag a Server header naming software without a version', () => {
+      expect(categories({ server: 'cloudflare' })).not.toContain('information-disclosure-header');
+    });
+
+    it('flags a bare X-AspNet-Version value', () => {
+      expect(categories({ 'x-aspnet-version': '4.0.30319' })).toContain('information-disclosure-header');
+    });
+
+    it('emits one finding per disclosing header', () => {
+      const result = categories({ server: 'nginx/1.18.0', 'x-powered-by': 'PHP/7.4.3' }).filter(
+        (c) => c === 'information-disclosure-header',
+      );
+
+      expect(result).toHaveLength(2);
+    });
+  });
+
+  it('emits each expected category exactly once for a realistic weak header set', () => {
+    const result = categories({
+      'content-security-policy': "default-src *; script-src 'self' 'unsafe-inline' 'unsafe-eval'",
+      'strict-transport-security': 'max-age=120',
+      'access-control-allow-origin': '*',
+      'access-control-allow-credentials': 'true',
+      server: 'nginx/1.18.0',
+    });
+
+    const expected = [
+      'weak-csp-unsafe-inline',
+      'weak-csp-unsafe-eval',
+      'weak-csp-wildcard-default-src',
+      'weak-csp-missing-frame-ancestors',
+      'weak-hsts-short-max-age',
+      'weak-hsts-no-subdomains',
+      'permissive-cors-credentialed',
+      'information-disclosure-header',
+    ];
+
+    for (const category of expected) {
+      expect(result.filter((c) => c === category)).toHaveLength(1);
+    }
   });
 });

@@ -19,10 +19,10 @@ function deferred<T>(): { promise: Promise<T>; resolve: (v: T) => void } {
 
 // A response that trips none of the header checks — used to pin the zero-findings shape.
 const FULLY_HARDENED_HEADERS: Record<string, string> = {
-  'content-security-policy': "default-src 'self'",
+  'content-security-policy': "default-src 'self'; frame-ancestors 'none'",
   'x-frame-options': 'DENY',
   'x-content-type-options': 'nosniff',
-  'strict-transport-security': 'max-age=63072000',
+  'strict-transport-security': 'max-age=63072000; includeSubDomains',
   'referrer-policy': 'no-referrer',
   'permissions-policy': 'geolocation=()',
 };
@@ -779,6 +779,41 @@ describe('isDisallowedAddress', () => {
   });
 });
 
+describe('ScannerService weak security headers', () => {
+  it('persists weak-header findings with their severities, visible through getScan', async () => {
+    const fetchImpl: FetchImpl = vi.fn(async () =>
+      okResponse({
+        ...FULLY_HARDENED_HEADERS,
+        'content-security-policy': "default-src 'self' 'unsafe-inline'",
+        'strict-transport-security': 'max-age=120',
+        'access-control-allow-origin': '*',
+        'access-control-allow-credentials': 'true',
+        server: 'nginx/1.18.0',
+      }),
+    );
+    const svc = new ScannerService(createDb(':memory:'), { fetchImpl, tlsCheckImpl: okTlsCheckImpl() });
+    const scan = await svc.startScan(['https://example.com']);
+
+    const completed = await vi.waitFor(async () => {
+      const s = await svc.getScan(scan.id);
+      if (!s || s.status !== 'completed') throw new Error('not yet completed');
+      return s;
+    });
+
+    const bySeverity = new Map(completed.targets.flatMap((t) => t.findings).map((f) => [f.category, f.severity]));
+
+    expect(Object.fromEntries(bySeverity)).toMatchObject({
+      'weak-csp-unsafe-inline': 'high',
+      'weak-csp-missing-frame-ancestors': 'low',
+      'weak-hsts-short-max-age': 'medium',
+      'weak-hsts-no-subdomains': 'low',
+      'permissive-cors-credentialed': 'high',
+      'information-disclosure-header': 'low',
+    });
+    expect(bySeverity.has('permissive-cors-wildcard')).toBe(false);
+  });
+});
+
 describe('ScannerService LLM finding enrichment', () => {
   it('populates explanation and suggestedFix on findings from the LLM enrichment call', async () => {
     const fetchImpl: FetchImpl = vi.fn(async () => okResponse());
@@ -894,14 +929,7 @@ describe('ScannerService LLM finding enrichment', () => {
 
   it('does not call the LLM when a target produces no findings', async () => {
     const fetchImpl: FetchImpl = vi.fn(async () =>
-      okResponse({
-        'content-security-policy': "default-src 'self'",
-        'strict-transport-security': 'max-age=31536000',
-        'x-frame-options': 'DENY',
-        'x-content-type-options': 'nosniff',
-        'referrer-policy': 'no-referrer',
-        'permissions-policy': 'geolocation=()',
-      }),
+      okResponse(FULLY_HARDENED_HEADERS),
     );
     const llmEnrichImpl: LlmEnrichImpl = vi.fn(async (toEnrich) =>
       toEnrich.map((f) => ({ id: f.id, explanation: 'plain-english explanation', suggestedFix: 'add the header' })),

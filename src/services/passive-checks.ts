@@ -56,12 +56,183 @@ function detectCookieFindings(setCookies: string[]): HeaderFinding[] {
   return result;
 }
 
+// `confidence` grades the certainty of the *observation*, not of exploitability
+// (per CONTEXT), so contextual defects below are `possible` while still being
+// definitely present: a report-only CSP or a permissive CORS policy on a public
+// API can both be deliberate. The severity/confidence assignments in issue 018
+// were reviewed by a human before this landed.
+
+type CspDirectives = Map<string, string[]>;
+
+function parseCsp(policy: string): CspDirectives {
+  const directives: CspDirectives = new Map();
+  for (const part of policy.split(';')) {
+    const [name, ...values] = part.trim().split(/\s+/);
+    if (name) directives.set(name.toLowerCase(), values.map((v) => v.toLowerCase()));
+  }
+  return directives;
+}
+
+// Deliberately string/directive-level, not a full CSP model (out of scope per 018):
+// `script-src` is consulted before `default-src` because it overrides it for scripts,
+// but a keyword in either is reported once, not twice.
+function detectCspFindings(headers: Record<string, string>): HeaderFinding[] {
+  const policy = headers['content-security-policy'];
+  const reportOnly = headers['content-security-policy-report-only'];
+  const result: HeaderFinding[] = [];
+
+  if (policy === undefined) {
+    // `missing-csp` is emitted separately by MISSING_HEADER_FINDINGS; a report-only
+    // policy is additionally called out, since the enforcing policy genuinely is absent.
+    if (reportOnly !== undefined) {
+      result.push({
+        category: 'csp-report-only-only',
+        severity: 'medium',
+        confidence: 'possible',
+        explanation: 'Only a Content-Security-Policy-Report-Only header is set, so the policy is monitored but never enforced.',
+      });
+    }
+    return result;
+  }
+
+  const directives = parseCsp(policy);
+  const scriptSources = directives.get('script-src') ?? directives.get('default-src') ?? [];
+
+  if (scriptSources.includes("'unsafe-inline'")) {
+    result.push({
+      category: 'weak-csp-unsafe-inline',
+      severity: 'high',
+      confidence: 'possible',
+      explanation: "The policy allows 'unsafe-inline' scripts, which defeats most of the XSS protection a CSP provides.",
+    });
+  }
+
+  if (scriptSources.includes("'unsafe-eval'")) {
+    result.push({
+      category: 'weak-csp-unsafe-eval',
+      severity: 'medium',
+      confidence: 'possible',
+      explanation: "The policy allows 'unsafe-eval', permitting string-to-code execution.",
+    });
+  }
+
+  if (directives.get('default-src')?.includes('*') === true) {
+    result.push({
+      category: 'weak-csp-wildcard-default-src',
+      severity: 'high',
+      confidence: 'possible',
+      explanation: 'default-src * allows content to be loaded from any origin.',
+    });
+  }
+
+  if (!directives.has('frame-ancestors')) {
+    result.push({
+      category: 'weak-csp-missing-frame-ancestors',
+      severity: 'low',
+      confidence: 'possible',
+      explanation: 'The policy sets no frame-ancestors directive, so it places no CSP-level restriction on framing.',
+    });
+  }
+
+  return result;
+}
+
+// 180 days, the floor the HSTS preload list requires.
+const MIN_HSTS_MAX_AGE_SECONDS = 15552000;
+
+function detectHstsFindings(headers: Record<string, string>): HeaderFinding[] {
+  const policy = headers['strict-transport-security'];
+  if (policy === undefined) return [];
+
+  const result: HeaderFinding[] = [];
+  const normalized = policy.toLowerCase();
+  const maxAge = Number(/max-age\s*=\s*"?(\d+)/.exec(normalized)?.[1] ?? NaN);
+
+  // A malformed or absent max-age is treated as weak: it provides no enforcement window.
+  if (!Number.isFinite(maxAge) || maxAge < MIN_HSTS_MAX_AGE_SECONDS) {
+    result.push({
+      category: 'weak-hsts-short-max-age',
+      severity: 'medium',
+      confidence: 'definitive',
+      explanation: `HSTS max-age is ${Number.isFinite(maxAge) ? `${maxAge} seconds` : 'missing or unparseable'}, below the recommended ${MIN_HSTS_MAX_AGE_SECONDS} (180 days).`,
+    });
+  }
+
+  if (!normalized.includes('includesubdomains')) {
+    result.push({
+      category: 'weak-hsts-no-subdomains',
+      severity: 'low',
+      confidence: 'definitive',
+      explanation: 'HSTS does not set includeSubDomains, so subdomains are not covered.',
+    });
+  }
+
+  return result;
+}
+
+// Only a literal `*` is detected. A policy that *reflects* the request Origin is
+// indistinguishable from a correct one in a single response that carried no Origin
+// header, so catching it needs a second, Origin-bearing request — its own issue.
+function detectCorsFindings(headers: Record<string, string>): HeaderFinding[] {
+  if (headers['access-control-allow-origin'] !== '*') return [];
+
+  if (headers['access-control-allow-credentials']?.trim().toLowerCase() === 'true') {
+    return [
+      {
+        category: 'permissive-cors-credentialed',
+        severity: 'high',
+        confidence: 'definitive',
+        explanation: 'A wildcard Access-Control-Allow-Origin is combined with Access-Control-Allow-Credentials: true.',
+      },
+    ];
+  }
+
+  return [
+    {
+      category: 'permissive-cors-wildcard',
+      severity: 'low',
+      confidence: 'possible',
+      explanation: 'Access-Control-Allow-Origin is *, which is intended for public resources but exposes any non-public ones.',
+    },
+  ];
+}
+
+const DISCLOSURE_HEADER_NAMES = ['server', 'x-powered-by', 'x-aspnet-version'];
+// A bare version (`X-AspNet-Version: 4.0.30319`) discloses as much as `nginx/1.18.0`,
+// but carries no slash, so BANNER_PATTERN alone would miss it.
+const BARE_VERSION_PATTERN = /^\d[\w.-]*$/;
+
+// Naming the software is not itself the finding: `Server: cloudflare` gives an
+// attacker nothing to match against a CVE feed. A version does.
+function detectDisclosureFindings(headers: Record<string, string>): HeaderFinding[] {
+  const result: HeaderFinding[] = [];
+
+  for (const headerName of DISCLOSURE_HEADER_NAMES) {
+    const value = headers[headerName]?.trim();
+    if (value === undefined) continue;
+    if (!BANNER_PATTERN.test(value) && !BARE_VERSION_PATTERN.test(value)) continue;
+
+    result.push({
+      category: 'information-disclosure-header',
+      severity: 'low',
+      confidence: 'definitive',
+      explanation: `The ${headerName} header reveals a software version ("${value}").`,
+    });
+  }
+
+  return result;
+}
+
 export function detectHeaderFindings(headers: Record<string, string>, setCookies: string[] = []): HeaderFinding[] {
   const result: HeaderFinding[] = MISSING_HEADER_FINDINGS.filter(({ header }) => !(header in headers)).map(
     ({ category, severity }) => ({ category, severity, confidence: 'definitive' }),
   );
 
   result.push(...detectCookieFindings(setCookies));
+  result.push(...detectCspFindings(headers));
+  result.push(...detectHstsFindings(headers));
+  result.push(...detectCorsFindings(headers));
+  result.push(...detectDisclosureFindings(headers));
 
   return result;
 }
