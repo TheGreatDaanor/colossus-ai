@@ -923,7 +923,7 @@ describe('ScannerService weak security headers', () => {
 describe('ScannerService LLM finding enrichment', () => {
   it('populates explanation and suggestedFix on findings from the LLM enrichment call', async () => {
     const fetchImpl: FetchImpl = vi.fn(async () => okResponse());
-    const llmEnrichImpl: LlmEnrichImpl = vi.fn(async (toEnrich) =>
+    const llmEnrichImpl: LlmEnrichImpl = vi.fn<LlmEnrichImpl>(async (toEnrich) =>
       toEnrich.map((f) => ({ id: f.id, explanation: 'plain-english explanation', suggestedFix: 'add the header' })),
     );
     const svc = new ScannerService(createDb(':memory:'), {
@@ -950,7 +950,7 @@ describe('ScannerService LLM finding enrichment', () => {
 
   it('does not call the LLM a second time for an identical finding-set within the same scan', async () => {
     const fetchImpl: FetchImpl = vi.fn(async () => okResponse());
-    const llmEnrichImpl: LlmEnrichImpl = vi.fn(async (toEnrich) =>
+    const llmEnrichImpl: LlmEnrichImpl = vi.fn<LlmEnrichImpl>(async (toEnrich) =>
       toEnrich.map((f) => ({ id: f.id, explanation: 'plain-english explanation', suggestedFix: 'add the header' })),
     );
     const svc = new ScannerService(createDb(':memory:'), {
@@ -1037,7 +1037,7 @@ describe('ScannerService LLM finding enrichment', () => {
     const fetchImpl: FetchImpl = vi.fn(async () =>
       okResponse(FULLY_HARDENED_HEADERS),
     );
-    const llmEnrichImpl: LlmEnrichImpl = vi.fn(async (toEnrich) =>
+    const llmEnrichImpl: LlmEnrichImpl = vi.fn<LlmEnrichImpl>(async (toEnrich) =>
       toEnrich.map((f) => ({ id: f.id, explanation: 'plain-english explanation', suggestedFix: 'add the header' })),
     );
     const svc = new ScannerService(createDb(':memory:'), {
@@ -1106,7 +1106,7 @@ describe('ScannerService LLM finding enrichment', () => {
     const fetchImpl: FetchImpl = vi.fn(async () =>
       okResponse({ 'set-cookie': 'session=abc123' }),
     );
-    const llmEnrichImpl: LlmEnrichImpl = vi.fn(async (toEnrich) =>
+    const llmEnrichImpl: LlmEnrichImpl = vi.fn<LlmEnrichImpl>(async (toEnrich) =>
       toEnrich.map((f) => ({ id: f.id, explanation: 'LLM paraphrase', suggestedFix: 'LLM fix' })),
     );
     const svc = new ScannerService(createDb(':memory:'), {
