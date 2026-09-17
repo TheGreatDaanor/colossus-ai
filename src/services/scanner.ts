@@ -127,10 +127,13 @@ export type FetchImpl = (url: string, init: RequestInit) => Promise<Response>;
 export type OsvMatch = { cveId: string };
 export type OsvCheckImpl = (banner: VersionBanner) => Promise<OsvMatch | null>;
 
-async function defaultOsvCheck(banner: VersionBanner): Promise<OsvMatch | null> {
+export async function defaultOsvCheck(banner: VersionBanner): Promise<OsvMatch | null> {
   const response = await fetch('https://api.osv.dev/v1/query', {
     method: 'POST',
-    body: JSON.stringify({ version: banner.version, package: { name: banner.software, ecosystem: 'Generic' } }),
+    // OSV.dev has no "Generic" ecosystem — sending one 400s the whole query. A
+    // version + package name with the ecosystem omitted is a valid query for
+    // software OSV can't place in a package ecosystem (e.g. a server banner).
+    body: JSON.stringify({ version: banner.version, package: { name: banner.software } }),
   });
   if (!response.ok) throw new Error(`OSV.dev query failed with status ${response.status}`);
 

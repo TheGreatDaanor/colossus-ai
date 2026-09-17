@@ -8,6 +8,7 @@ import {
   ScannerService,
   ScanValidationError,
   isDisallowedAddress,
+  defaultOsvCheck,
   type FetchImpl,
   type TlsCheckImpl,
   type OsvCheckImpl,
@@ -900,7 +901,14 @@ describe('ScannerService weak security headers', () => {
         server: 'nginx/1.18.0',
       }),
     );
-    const svc = new ScannerService(createDb(':memory:'), { fetchImpl, tlsCheckImpl: okTlsCheckImpl() });
+    // Stub the OSV check: this test drives a nginx banner but is not about CVE
+    // correlation, and defaultOsvCheck now makes a real network call that would
+    // exceed the waitFor budget.
+    const svc = new ScannerService(createDb(':memory:'), {
+      fetchImpl,
+      tlsCheckImpl: okTlsCheckImpl(),
+      osvCheckImpl: vi.fn(async () => null),
+    });
     const scan = await svc.startScan(['https://example.com']);
 
     const completed = await vi.waitFor(async () => {
@@ -1767,5 +1775,25 @@ describe('ScannerService oracle-confirmed finding storage', () => {
     const finding = (await svc.getScan(scan.id))?.targets[0]?.findings.find((f) => f.category === 'ssti');
     expect(finding).toBeDefined();
     expect(finding?.evidenceSnippet).toBe('49');
+  });
+});
+
+describe('defaultOsvCheck request body', () => {
+  it('queries OSV.dev by version and package name without an ecosystem (Generic is not a valid OSV ecosystem)', async () => {
+    let capturedBody: unknown;
+    const fetchSpy = vi.fn(async (_url: string, init: RequestInit) => {
+      capturedBody = JSON.parse(String(init.body));
+      return new Response(JSON.stringify({ vulns: [] }), { status: 200 });
+    });
+    vi.stubGlobal('fetch', fetchSpy);
+
+    try {
+      await defaultOsvCheck({ software: 'nginx', version: '1.20.1' });
+    } finally {
+      vi.unstubAllGlobals();
+    }
+
+    expect(fetchSpy).toHaveBeenCalledWith('https://api.osv.dev/v1/query', expect.anything());
+    expect(capturedBody).toEqual({ version: '1.20.1', package: { name: 'nginx' } });
   });
 });
