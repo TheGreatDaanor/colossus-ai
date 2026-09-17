@@ -12,7 +12,9 @@ import {
   type TlsCheckImpl,
   type OsvCheckImpl,
   type LlmEnrichImpl,
+  type PassiveChecksImpl,
 } from './scanner.js';
+import { detectPassiveFindings } from './passive-checks.js';
 
 function deferred<T>(): { promise: Promise<T>; resolve: (v: T) => void } {
   let resolve!: (v: T) => void;
@@ -1525,4 +1527,76 @@ describe('ScannerService active-mode XSS confirmation (real browser)', () => {
     expect(target?.findings.some((f) => f.category === 'xss')).toBe(false);
     expect(target?.injectionAttempts?.[0]?.outcome).toBe('not_vulnerable');
   }, 40_000);
+});
+
+describe('ScannerService response-body threading', () => {
+  const HTML_HEADERS = { 'content-type': 'text/html; charset=utf-8' };
+
+  // The body-derived checks (020) don't exist yet, so the only way to observe the
+  // threading is to stand in for the detector boundary and record what it was handed.
+  // Only the root URL serves the fixture: robots.txt and the exposed-file probes get a
+  // 404, and enrichment is faked so the test never leaves the process.
+  async function runWithSpy(rootResponse: () => Response) {
+    const fetchImpl: FetchImpl = vi.fn(async (url) =>
+      String(url) === 'https://example.com/' ? rootResponse() : new Response(null, { status: 404 }),
+    );
+    const passiveChecksImpl = vi.fn<PassiveChecksImpl>(detectPassiveFindings);
+    const svc = new ScannerService(createDb(':memory:'), {
+      fetchImpl,
+      tlsCheckImpl: okTlsCheckImpl(),
+      llmEnrichImpl: vi.fn(async () => []),
+      passiveChecksImpl,
+    });
+    const scan = await svc.startScan(['https://example.com/']);
+    const completed = await vi.waitFor(async () => {
+      const s = await svc.getScan(scan.id);
+      if (!s || s.status !== 'completed') throw new Error('not yet completed');
+      return s;
+    });
+    return { completed, input: passiveChecksImpl.mock.calls[0]?.[0] };
+  }
+
+  it('hands the target page to the detectors as a parsed document', async () => {
+    const { input } = await runWithSpy(
+      () =>
+        new Response('<html><head><meta name="generator" content="WordPress 6.1"></head></html>', {
+          status: 200,
+          headers: HTML_HEADERS,
+        }),
+    );
+
+    expect(input?.document?.('meta[name=generator]').attr('content')).toBe('WordPress 6.1');
+  });
+
+  it('truncates a body larger than 2 MB before parsing it', async () => {
+    const big = `<p id="head">start</p>${'a'.repeat(3 * 1024 * 1024)}<p id="tail">end</p>`;
+    const { input } = await runWithSpy(() => new Response(big, { status: 200, headers: HTML_HEADERS }));
+
+    expect(input?.document?.('#head').text()).toBe('start');
+    expect(input?.document?.('#tail').length).toBe(0);
+    expect(input?.document?.root().text().length).toBeLessThanOrEqual(2 * 1024 * 1024);
+  });
+
+  it('skips the document but keeps header findings when the body read fails mid-stream', async () => {
+    const { completed, input } = await runWithSpy(() => {
+      let sent = false;
+      const stream = new ReadableStream<Uint8Array>({
+        pull(controller) {
+          if (sent) {
+            controller.error(new Error('connection reset'));
+            return;
+          }
+          sent = true;
+          controller.enqueue(new TextEncoder().encode('<html><body>'));
+        },
+      });
+      return new Response(stream, { status: 200, headers: HTML_HEADERS });
+    });
+
+    expect(input).toBeDefined();
+    expect(input?.document).toBeUndefined();
+    const target = completed.targets[0];
+    expect(target?.status).toBe('ok');
+    expect(target?.findings.map((f) => f.category)).toContain('missing-csp');
+  });
 });

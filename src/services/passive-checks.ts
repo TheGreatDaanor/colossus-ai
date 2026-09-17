@@ -1,3 +1,4 @@
+import type { CheerioAPI } from 'cheerio';
 import type { FindingConfidence, FindingSeverity } from '../db/schema.js';
 
 export type HeaderFinding = {
@@ -235,6 +236,20 @@ export function detectHeaderFindings(headers: Record<string, string>, setCookies
   result.push(...detectDisclosureFindings(headers));
 
   return result;
+}
+
+// The response body arrives already parsed so each body-derived check (020) and
+// later link/form harvesting (014) can query it without re-parsing up to 2 MB of
+// hostile HTML. `document` is absent when there is no usable body — non-HTML
+// content, or a read that failed mid-stream — and body checks are then skipped.
+export type PassiveInput = {
+  headers: Record<string, string>;
+  setCookies: string[];
+  document?: CheerioAPI;
+};
+
+export function detectPassiveFindings(input: PassiveInput): HeaderFinding[] {
+  return detectHeaderFindings(input.headers, input.setCookies);
 }
 
 export type TlsInfo = { version: string; certExpiresAt: Date };

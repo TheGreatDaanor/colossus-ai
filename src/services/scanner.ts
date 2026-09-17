@@ -4,12 +4,15 @@ import type { Db } from '../db/client.js';
 import { confirmXss, enumerateInjectionPoints, saveEvidence, type XssConfirmImpl } from './active-scanner.js';
 import { discoverLinks } from './discovery.js';
 import { findDisallowedAddress, isDisallowedAddress } from './ssrf-guard.js';
+import { load as parseHtml } from 'cheerio';
 import {
   detectHeaderFindings,
+  detectPassiveFindings,
   detectTlsFindings,
   extractVersionBanner,
   NO_TLS_FINDING,
   type HeaderFinding,
+  type PassiveInput,
   type TlsFinding,
   type TlsInfo,
   type VersionBanner,
@@ -113,6 +116,7 @@ function defaultTlsCheck(hostname: string, port: number, timeoutMs: number): Pro
 }
 
 export type FetchImpl = (url: string, init: RequestInit) => Promise<Response>;
+export type PassiveChecksImpl = (input: PassiveInput) => HeaderFinding[];
 
 export type OsvMatch = { cveId: string };
 export type OsvCheckImpl = (banner: VersionBanner) => Promise<OsvMatch | null>;
@@ -302,21 +306,23 @@ const EXPOSED_FILE_PROBES: {
 const MAX_DISCOVERY_DEPTH = 2;
 const MAX_DISCOVERED_PER_ROOT = 25;
 
-// Discovery only parses HTML, and #concurrency of these bodies sit in memory at
-// once, so a body is read only when the server says it is HTML, and only up to
+// Discovery and the body-derived passive checks only parse HTML, and #concurrency
+// of these bodies sit in memory at once, so a body is read only when the server
+// says it is HTML, and only up to
 // MAX_HTML_BYTES — a 500 MB octet-stream target is never buffered. A read that
-// fails mid-stream (socket dropped) degrades to "no links found"; that catch is
+// fails mid-stream (socket dropped) yields null — no links, no body checks — rather
+// than a half-read prefix; that catch is
 // deliberately around the stream read alone, so a programming error elsewhere —
 // e.g. reading a body something upstream already consumed — still surfaces
 // instead of silently turning discovery off.
 const MAX_HTML_BYTES = 2 * 1024 * 1024;
 
-async function readHtmlBody(response: Response): Promise<string> {
+async function readHtmlBody(response: Response): Promise<string | null> {
   const contentType = response.headers.get('content-type') ?? '';
-  if (!/^\s*(text\/html|application\/xhtml\+xml)\b/i.test(contentType)) return '';
+  if (!/^\s*(text\/html|application\/xhtml\+xml)\b/i.test(contentType)) return null;
 
   const body = response.body;
-  if (body === null) return '';
+  if (body === null) return null;
 
   const reader = body.getReader();
   const decoder = new TextDecoder();
@@ -339,6 +345,7 @@ async function readHtmlBody(response: Response): Promise<string> {
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     console.warn(`body read failed: ${message}`);
+    return null;
   } finally {
     void reader.cancel().catch(() => {});
   }
@@ -369,6 +376,7 @@ export class ScannerService {
   readonly #tlsCheckImpl: TlsCheckImpl;
   readonly #osvCheckImpl: OsvCheckImpl;
   readonly #llmEnrichImpl: LlmEnrichImpl;
+  readonly #passiveChecksImpl: PassiveChecksImpl;
   readonly #timeoutMs: number;
   readonly #maxExtraRequests: number;
   readonly #concurrency: number;
@@ -390,6 +398,7 @@ export class ScannerService {
       tlsCheckImpl?: TlsCheckImpl;
       osvCheckImpl?: OsvCheckImpl;
       llmEnrichImpl?: LlmEnrichImpl;
+      passiveChecksImpl?: PassiveChecksImpl;
       timeoutMs?: number;
       maxExtraRequests?: number;
       concurrency?: number;
@@ -414,6 +423,7 @@ export class ScannerService {
       options.tlsCheckImpl ?? ((hostname, port) => defaultTlsCheck(hostname, port, this.#timeoutMs));
     this.#osvCheckImpl = options.osvCheckImpl ?? defaultOsvCheck;
     this.#llmEnrichImpl = options.llmEnrichImpl ?? defaultLlmEnrich;
+    this.#passiveChecksImpl = options.passiveChecksImpl ?? detectPassiveFindings;
   }
 
   async startScan(urls: string[], options: StartScanOptions = {}): Promise<Scan> {
@@ -579,6 +589,8 @@ export class ScannerService {
       // the read until then would let a throw from any intervening step (TLS, CVE,
       // enrichment, active-mode injection) silently skip discovery.
       const html = await readHtmlBody(response);
+      // Parsed once, held only for this target's checks, never persisted (see 013).
+      const document = html === null ? undefined : parseHtml(html);
 
       this.#db
         .update(scanTargets)
@@ -592,7 +604,13 @@ export class ScannerService {
         .where(eq(scanTargets.id, target.id))
         .run();
 
-      const pendingFindings: PendingFinding[] = [...detectHeaderFindings(responseHeaders, setCookies)];
+      const pendingFindings: PendingFinding[] = [
+        ...this.#passiveChecksImpl({
+          headers: responseHeaders,
+          setCookies,
+          ...(document === undefined ? {} : { document }),
+        }),
+      ];
 
       if (targetUrl.protocol === 'http:') {
         pendingFindings.push(NO_TLS_FINDING);
@@ -660,7 +678,7 @@ export class ScannerService {
 
       // Discovery runs regardless of mode — it's non-intrusive HTML parsing, not a
       // payload-sending check, so it isn't gated behind the active-mode attestation.
-      const discovered = this.#discoverTargets(target, targetUrl, html, robotsBody, discovery);
+      const discovered = this.#discoverTargets(target, targetUrl, html ?? '', robotsBody, discovery);
 
       console.warn(`[scan ${target.scanId}] ${target.url} succeeded`);
       return discovered;
