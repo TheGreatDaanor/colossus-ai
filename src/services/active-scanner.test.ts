@@ -42,6 +42,22 @@ function hangingFixture(): Promise<string> {
   });
 }
 
+// A server whose only response is a redirect to `location`. Used to prove the
+// in-browser SSRF guard aborts a redirect toward a disallowed address.
+function redirectingFixture(location: string): Promise<string> {
+  return new Promise((resolve) => {
+    const server = createServer((_req, res) => {
+      res.writeHead(302, { location });
+      res.end();
+    });
+    servers.push(server);
+    server.listen(0, '127.0.0.1', () => {
+      const { port } = server.address() as AddressInfo;
+      resolve(`http://127.0.0.1:${port}`);
+    });
+  });
+}
+
 describe('confirmXss', () => {
   it('confirms execution when the page reflects the canary payload unescaped', async () => {
     const origin = await fixture((q) => `<html><body>${q}</body></html>`);
@@ -68,5 +84,17 @@ describe('confirmXss', () => {
 
     const result = await confirmXss(url, payload, { navigationTimeoutMs: 500 });
     expect(result.outcome).toBe('unavailable');
+  }, 30_000);
+
+  it('aborts a redirect toward a disallowed address and reports why', async () => {
+    const origin = await redirectingFixture('http://169.254.169.254/latest/meta-data/');
+    const payload = generateCanaryPayload();
+    const url = `${origin}/?q=${encodeURIComponent(payload)}`;
+
+    const result = await confirmXss(url, payload, { navigationTimeoutMs: 3000 });
+
+    expect(result.outcome).toBe('unavailable');
+    expect(result.error).toContain('169.254.169.254');
+    expect(result.error).toMatch(/disallowed|blocked/i);
   }, 30_000);
 });

@@ -1,6 +1,7 @@
-import { chromium, type Browser } from 'playwright';
+import { chromium, type Browser, type Page } from 'playwright';
 import { randomUUID } from 'node:crypto';
 import type { InjectionAttempt } from '../db/schema.js';
+import { findDisallowedAddress } from './ssrf-guard.js';
 
 // A single query-parameter injection point: which parameter was targeted, the
 // unique canary payload put in its place, and the resulting URL to fetch.
@@ -65,10 +66,19 @@ export async function confirmXss(
 
   try {
     const page = await browser.newPage();
+    const blockedAddress = await installNavigationGuard(page);
     try {
       await page.goto(url, { timeout: options.navigationTimeoutMs ?? 10_000 });
     } catch (err) {
+      const blocked = blockedAddress();
+      if (blocked !== null) {
+        return { outcome: 'unavailable', error: `navigation to a disallowed address (${blocked}) was blocked` };
+      }
       return { outcome: 'unavailable', error: `navigation failed: ${errorMessage(err)}` };
+    }
+    const blocked = blockedAddress();
+    if (blocked !== null) {
+      return { outcome: 'unavailable', error: `a request to a disallowed address (${blocked}) was blocked` };
     }
     const observed = await page.evaluate(
       () => (globalThis as { __colossus_xss_marker?: string }).__colossus_xss_marker,
@@ -77,6 +87,83 @@ export async function confirmXss(
   } finally {
     await browser.close();
   }
+}
+
+// Installs the SSRF guard on a page's own requests. The operator-submitted target —
+// the first main-frame navigation — is trusted: it already cleared the passive guard
+// in the scanner before a browser was launched at all. Every request after it (a
+// redirect, a sub-frame, a sub-resource) is resolved and checked against the same
+// disallowed-address table, and any pointing at a private/loopback/link-local/
+// metadata address is aborted, so active scanning can't become an SSRF hole. Returns
+// a getter for the first address blocked, if any.
+async function installNavigationGuard(page: Page): Promise<() => string | null> {
+  let blocked: string | null = null;
+  let trustedFirstNavigationSeen = false;
+  const api = page.context().request;
+
+  // Resolves the request's hostname and records the first disallowed address it hits.
+  const disallowedAddressFor = async (requestUrl: string): Promise<string | null> => {
+    let hostname: string;
+    try {
+      hostname = new URL(requestUrl).hostname;
+    } catch {
+      return null;
+    }
+    const disallowed = await findDisallowedAddress(hostname);
+    if (disallowed !== null && blocked === null) blocked = disallowed;
+    return disallowed;
+  };
+
+  await page.route('**/*', async (route) => {
+    const request = route.request();
+    const isTopLevelNavigation = request.isNavigationRequest() && request.frame() === page.mainFrame();
+
+    // Sub-resources and sub-frames don't auto-follow redirects behind our back the way
+    // a top-level navigation does, so guarding the request URL itself is enough here.
+    if (!isTopLevelNavigation) {
+      if ((await disallowedAddressFor(request.url())) !== null) {
+        await route.abort();
+        return;
+      }
+      await route.continue();
+      return;
+    }
+
+    // The operator-submitted target — the first main-frame navigation — is the one
+    // request we don't guard: it already cleared the passive guard in the scanner.
+    // A later top-level navigation (a client-side location change) is guarded.
+    if (!trustedFirstNavigationSeen) {
+      trustedFirstNavigationSeen = true;
+    } else if ((await disallowedAddressFor(request.url())) !== null) {
+      await route.abort();
+      return;
+    }
+
+    // Follow redirects ourselves, guarding every hop, rather than `route.continue()`:
+    // that would hand redirect-following to the browser's network stack, which would
+    // connect to a disallowed `Location` before this handler ever saw it.
+    try {
+      let currentUrl = request.url();
+      let response = await api.get(currentUrl, { maxRedirects: 0 });
+      for (let hops = 0; hops < 20; hops++) {
+        const status = response.status();
+        const location = response.headers()['location'];
+        if (status < 300 || status >= 400 || location === undefined) break;
+        const nextUrl = new URL(location, currentUrl).toString();
+        if ((await disallowedAddressFor(nextUrl)) !== null) {
+          await route.abort();
+          return;
+        }
+        currentUrl = nextUrl;
+        response = await api.get(currentUrl, { maxRedirects: 0 });
+      }
+      await route.fulfill({ response });
+    } catch {
+      await route.abort();
+    }
+  });
+
+  return () => blocked;
 }
 
 function errorMessage(err: unknown): string {

@@ -1,7 +1,7 @@
 ---
 id: 012
 title: Enforce SSRF guard on every in-browser navigation and redirect
-status: open
+status: done
 type: afk
 blocked-by: [011]
 ---
@@ -49,10 +49,10 @@ does not belong.
 
 ## Definition of done
 
-- [ ] Failing test written first, confirmed red
-- [ ] Implementation makes it green
-- [ ] `test`, `typecheck`, `lint` all pass
-- [ ] Visible at: an active scan against a fixture page that issues a redirect (or makes a sub-request) to a private/loopback/link-local/metadata address never has that request reach the mocked network layer in tests; the attempt is recorded as `unavailable` with an explanatory error.
+- [x] Failing test written first, confirmed red
+- [x] Implementation makes it green
+- [x] `test`, `typecheck`, `lint` all pass
+- [x] Visible at: an active scan against a fixture page that issues a redirect (or makes a sub-request) to a private/loopback/link-local/metadata address never has that request reach the mocked network layer in tests; the attempt is recorded as `unavailable` with an explanatory error.
 
 ## Out of scope
 
