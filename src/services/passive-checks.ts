@@ -1,4 +1,15 @@
+import * as cheerio from 'cheerio';
 import type { FindingConfidence, FindingSeverity } from '../db/schema.js';
+
+// The detector boundary receives an already-parsed document, not a raw string, so the
+// several body-derived consumers (tag/attribute checks, generator-tag banners, later
+// link/form harvesting) don't each re-parse the same up-to-2 MB hostile body. cheerio
+// is parse5 underneath — spec-compliant parsing — without hand-walking the tree.
+export type PassiveDocument = cheerio.CheerioAPI;
+
+export function parsePassiveDocument(html: string): PassiveDocument {
+  return cheerio.load(html);
+}
 
 export type HeaderFinding = {
   category: string;
@@ -223,7 +234,22 @@ function detectDisclosureFindings(headers: Record<string, string>): HeaderFindin
   return result;
 }
 
-export function detectHeaderFindings(headers: Record<string, string>, setCookies: string[] = []): HeaderFinding[] {
+// Body-derived checks live behind the parsed document. Issue 019 only threads the
+// document to this boundary; the detectors that read it arrive in issue 020, so this
+// returns nothing today.
+function detectBodyFindings(document: PassiveDocument | null): HeaderFinding[] {
+  if (document === null) return [];
+  return [];
+}
+
+// `document` is the target's parsed response body, or null when there was no readable
+// HTML body (non-HTML content type, empty body, or a read that failed mid-stream). It
+// is optional so header/TLS analysis stays independent of body availability.
+export function detectHeaderFindings(
+  headers: Record<string, string>,
+  setCookies: string[] = [],
+  document: PassiveDocument | null = null,
+): HeaderFinding[] {
   const result: HeaderFinding[] = MISSING_HEADER_FINDINGS.filter(({ header }) => !(header in headers)).map(
     ({ category, severity }) => ({ category, severity, confidence: 'definitive' }),
   );
@@ -233,6 +259,7 @@ export function detectHeaderFindings(headers: Record<string, string>, setCookies
   result.push(...detectHstsFindings(headers));
   result.push(...detectCorsFindings(headers));
   result.push(...detectDisclosureFindings(headers));
+  result.push(...detectBodyFindings(document));
 
   return result;
 }

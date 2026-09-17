@@ -8,6 +8,7 @@ import {
   ScannerService,
   ScanValidationError,
   isDisallowedAddress,
+  detectHeaderFindings,
   type FetchImpl,
   type TlsCheckImpl,
   type OsvCheckImpl,
@@ -1525,4 +1526,87 @@ describe('ScannerService active-mode XSS confirmation (real browser)', () => {
     expect(target?.findings.some((f) => f.category === 'xss')).toBe(false);
     expect(target?.injectionAttempts?.[0]?.outcome).toBe('not_vulnerable');
   }, 40_000);
+});
+
+describe('ScannerService threads the response body to the passive detector', () => {
+  const HTML_HEADERS = { ...FULLY_HARDENED_HEADERS, 'content-type': 'text/html; charset=utf-8' };
+
+  function waitForCompletion(svc: ScannerService, scanId: number) {
+    return vi.waitFor(async () => {
+      const s = await svc.getScan(scanId);
+      if (!s || s.status !== 'completed') throw new Error('not yet completed');
+      return s;
+    });
+  }
+
+  it('hands the parsed body to the detector boundary', async () => {
+    const fetchImpl: FetchImpl = vi.fn(
+      async () => new Response('<form id="login" action="/login"></form>', { status: 200, headers: HTML_HEADERS }),
+    );
+    const passiveHeaderDetect = vi.fn(detectHeaderFindings);
+    const svc = new ScannerService(createDb(':memory:'), {
+      fetchImpl,
+      tlsCheckImpl: okTlsCheckImpl(),
+      passiveHeaderDetect,
+    });
+
+    const scan = await svc.startScan(['https://example.com/']);
+    await waitForCompletion(svc, scan.id);
+
+    const document = passiveHeaderDetect.mock.calls[0]?.[2];
+    expect(document).not.toBeNull();
+    expect(document?.('form#login[action]').attr('action')).toBe('/login');
+  });
+
+  it('truncates an oversized body before it reaches the detector', async () => {
+    const oversized = `<div id="early"></div>${'x'.repeat(2 * 1024 * 1024)}<div id="late"></div>`;
+    // Only the primary target serves the oversized body; robots.txt and the exposed-file
+    // probes 404, so the 2 MB flows through readHtmlBody/parse alone (the path under test).
+    const fetchImpl: FetchImpl = vi.fn(async (url) =>
+      new URL(String(url)).pathname === '/'
+        ? new Response(oversized, { status: 200, headers: HTML_HEADERS })
+        : new Response('', { status: 404 }),
+    );
+    const passiveHeaderDetect = vi.fn(detectHeaderFindings);
+    const svc = new ScannerService(createDb(':memory:'), {
+      fetchImpl,
+      tlsCheckImpl: okTlsCheckImpl(),
+      passiveHeaderDetect,
+    });
+
+    const scan = await svc.startScan(['https://example.com/']);
+    await waitForCompletion(svc, scan.id);
+
+    const document = passiveHeaderDetect.mock.calls[0]?.[2];
+    expect(document?.('#early').length).toBe(1);
+    expect(document?.('#late').length).toBe(0);
+  });
+
+  it('keeps header findings intact when the body read fails mid-stream', async () => {
+    const fetchImpl: FetchImpl = vi.fn(async (url) => {
+      if (new URL(String(url)).pathname !== '/') return new Response('', { status: 404 });
+      const stream = new ReadableStream({
+        start(controller) {
+          controller.enqueue(new TextEncoder().encode('<div id="partial">'));
+          controller.error(new Error('connection reset'));
+        },
+      });
+      return new Response(stream, { status: 200, headers: { 'content-type': 'text/html' } });
+    });
+    const llmEnrichImpl: LlmEnrichImpl = vi.fn<LlmEnrichImpl>(async (toEnrich) =>
+      toEnrich.map((f) => ({ id: f.id, explanation: 'why', suggestedFix: 'how' })),
+    );
+    const svc = new ScannerService(createDb(':memory:'), {
+      fetchImpl,
+      tlsCheckImpl: okTlsCheckImpl(),
+      llmEnrichImpl,
+    });
+
+    const scan = await svc.startScan(['https://example.com/']);
+    const completed = await waitForCompletion(svc, scan.id);
+
+    const target = completed.targets.find((t) => t.url === 'https://example.com/');
+    expect(target?.status).toBe('ok');
+    expect(target?.findings.map((f) => f.category)).toContain('missing-csp');
+  });
 });

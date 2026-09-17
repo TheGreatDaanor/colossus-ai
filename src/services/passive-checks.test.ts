@@ -1,5 +1,10 @@
 import { describe, expect, it } from 'vitest';
-import { detectHeaderFindings, detectTlsFindings, extractVersionBanner } from './passive-checks.js';
+import {
+  detectHeaderFindings,
+  detectTlsFindings,
+  extractVersionBanner,
+  parsePassiveDocument,
+} from './passive-checks.js';
 
 describe('detectHeaderFindings', () => {
   it('flags a response missing all six security headers', () => {
@@ -330,5 +335,23 @@ describe('detectHeaderFindings weak-header quality checks', () => {
     for (const category of expected) {
       expect(result.filter((c) => c === category)).toHaveLength(1);
     }
+  });
+});
+
+describe('detectHeaderFindings with a parsed document (019 threading)', () => {
+  it('parses HTML into a document whose elements are queryable', () => {
+    const doc = parsePassiveDocument('<form action="/login"></form><meta name="generator" content="WP">');
+
+    expect(doc('form[action]').attr('action')).toBe('/login');
+    expect(doc('meta[name=generator]').attr('content')).toBe('WP');
+  });
+
+  it('accepts an optional parsed document without producing new findings yet', () => {
+    const doc = parsePassiveDocument('<form action="/login"></form>');
+
+    const withDocument = detectHeaderFindings({}, [], doc);
+    const withoutDocument = detectHeaderFindings({}, []);
+
+    expect(withDocument).toEqual(withoutDocument);
   });
 });

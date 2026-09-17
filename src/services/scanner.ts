@@ -8,8 +8,10 @@ import {
   detectHeaderFindings,
   detectTlsFindings,
   extractVersionBanner,
+  parsePassiveDocument,
   NO_TLS_FINDING,
   type HeaderFinding,
+  type PassiveDocument,
   type TlsFinding,
   type TlsInfo,
   type VersionBanner,
@@ -25,9 +27,17 @@ import {
   type InjectionAttempt,
 } from '../db/schema.js';
 
-export { detectHeaderFindings, detectTlsFindings, extractVersionBanner, NO_TLS_FINDING };
+export { detectHeaderFindings, detectTlsFindings, extractVersionBanner, parsePassiveDocument, NO_TLS_FINDING };
 export { isDisallowedAddress };
-export type { HeaderFinding, TlsFinding, TlsInfo, VersionBanner };
+export type { HeaderFinding, PassiveDocument, TlsFinding, TlsInfo, VersionBanner };
+
+// The passive header/body detector, injectable so a test can observe the parsed
+// document that reaches the boundary. Defaults to detectHeaderFindings.
+export type PassiveHeaderDetect = (
+  headers: Record<string, string>,
+  setCookies: string[],
+  document: PassiveDocument | null,
+) => HeaderFinding[];
 
 export class ScanValidationError extends Error {}
 
@@ -374,6 +384,7 @@ export class ScannerService {
   readonly #concurrency: number;
   readonly #defaultUserAgent: string;
   readonly #xssConfirmImpl: XssConfirmImpl;
+  readonly #passiveHeaderDetect: PassiveHeaderDetect;
   // Caps concurrent browser contexts during active scanning, independent of the
   // target batch size — passive work continues at full width. See the Semaphore note.
   readonly #browserSemaphore: Semaphore;
@@ -397,6 +408,7 @@ export class ScannerService {
       xssConfirmImpl?: XssConfirmImpl;
       browserConcurrency?: number;
       allowedHosts?: string[];
+      passiveHeaderDetect?: PassiveHeaderDetect;
     } = {},
   ) {
     this.#db = db;
@@ -408,6 +420,7 @@ export class ScannerService {
     this.#concurrency = options.concurrency ?? 10;
     this.#defaultUserAgent = options.defaultUserAgent ?? 'colossus-scanner/1.0';
     this.#xssConfirmImpl = options.xssConfirmImpl ?? confirmXss;
+    this.#passiveHeaderDetect = options.passiveHeaderDetect ?? detectHeaderFindings;
     this.#browserSemaphore = new Semaphore(options.browserConcurrency ?? 2);
     this.#allowedHosts = new Set(options.allowedHosts ?? []);
     this.#tlsCheckImpl =
@@ -579,6 +592,11 @@ export class ScannerService {
       // the read until then would let a throw from any intervening step (TLS, CVE,
       // enrichment, active-mode injection) silently skip discovery.
       const html = await readHtmlBody(response);
+      // Parse the (bounded) body once here so every body-derived consumer works off a
+      // single parsed document rather than re-parsing the hostile string. An empty
+      // string — non-HTML content type, no body, or a read that failed mid-stream —
+      // yields a null document, and body-derived checks are simply skipped.
+      const document: PassiveDocument | null = html === '' ? null : parsePassiveDocument(html);
 
       this.#db
         .update(scanTargets)
@@ -592,7 +610,7 @@ export class ScannerService {
         .where(eq(scanTargets.id, target.id))
         .run();
 
-      const pendingFindings: PendingFinding[] = [...detectHeaderFindings(responseHeaders, setCookies)];
+      const pendingFindings: PendingFinding[] = [...this.#passiveHeaderDetect(responseHeaders, setCookies, document)];
 
       if (targetUrl.protocol === 'http:') {
         pendingFindings.push(NO_TLS_FINDING);
