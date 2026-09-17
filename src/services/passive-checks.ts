@@ -255,13 +255,13 @@ const MIXED_CONTENT_SOURCES: { selector: string; attr: string }[] = [
 
 // Body checks report once per page, with the count in the explanation: a page with
 // forty insecure scripts has one defect to fix, not forty findings to triage.
-function detectMixedContent(document: PassiveDocument, pageUrl: URL): HeaderFinding[] {
+function detectMixedContent(document: PassiveDocument, pageUrl: URL, baseUrl: URL): HeaderFinding[] {
   if (pageUrl.protocol !== 'https:') return [];
 
   let count = 0;
   for (const { selector, attr } of MIXED_CONTENT_SOURCES) {
     document(selector).each((_, el) => {
-      if (resolveAgainst(document(el).attr(attr), pageUrl)?.protocol === 'http:') count++;
+      if (resolveAgainst(document(el).attr(attr), baseUrl)?.protocol === 'http:') count++;
     });
   }
   if (count === 0) return [];
@@ -278,9 +278,9 @@ function detectMixedContent(document: PassiveDocument, pageUrl: URL): HeaderFind
 
 // A form with no action submits to the page itself, which `no-tls` already covers on
 // an http page, so only an explicit action is judged here.
-function detectInsecureFormAction(document: PassiveDocument, pageUrl: URL): HeaderFinding[] {
+function detectInsecureFormAction(document: PassiveDocument, baseUrl: URL): HeaderFinding[] {
   const count = document('form[action]').filter(
-    (_, el) => resolveAgainst(document(el).attr('action'), pageUrl)?.protocol === 'http:',
+    (_, el) => resolveAgainst(document(el).attr('action'), baseUrl)?.protocol === 'http:',
   ).length;
   if (count === 0) return [];
 
@@ -317,14 +317,27 @@ function detectPasswordAutocomplete(document: PassiveDocument): HeaderFinding[] 
   ];
 }
 
-// Apache and nginx autoindex pages both title themselves `Index of /path` and repeat
-// it in the h1; requiring the path slash keeps prose titles ("Index of recipes") out.
-const DIRECTORY_LISTING_HEADING = /^\s*index of \//i;
+// Each generator titles the page and repeats it in the h1: Apache/nginx/lighttpd
+// `Index of /path`, Python http.server `Directory listing for /path`, and IIS
+// `host - /path`. Requiring the path slash keeps prose titles ("Index of recipes") out;
+// IIS's shape is generic enough ("Acme - /blog/") that it also needs IIS's own
+// `[To Parent Directory]` link.
+const DIRECTORY_LISTING_SHAPES: { heading: RegExp; bodyMarker?: string }[] = [
+  { heading: /^\s*index of \//i },
+  { heading: /^\s*directory listing for \//i },
+  { heading: /^\s*\S+ - \//, bodyMarker: '[To Parent Directory]' },
+];
 
 function detectDirectoryListing(document: PassiveDocument): HeaderFinding[] {
   const title = document('title').first().text();
   const heading = document('h1').first().text();
-  if (!DIRECTORY_LISTING_HEADING.test(title) || !DIRECTORY_LISTING_HEADING.test(heading)) return [];
+  const matches = DIRECTORY_LISTING_SHAPES.some(
+    (shape) =>
+      shape.heading.test(title) &&
+      shape.heading.test(heading) &&
+      (shape.bodyMarker === undefined || document('a').text().includes(shape.bodyMarker)),
+  );
+  if (!matches) return [];
 
   return [
     {
@@ -343,7 +356,13 @@ function detectBodyFindings(document: PassiveDocument | null, pageUrl: URL | nul
 
   const result = [...detectPasswordAutocomplete(document), ...detectDirectoryListing(document)];
   if (pageUrl !== null) {
-    result.push(...detectMixedContent(document, pageUrl), ...detectInsecureFormAction(document, pageUrl));
+    // A browser resolves relative references against the first <base href>, itself
+    // resolved against the page, so an http base silently downgrades every relative link.
+    const baseUrl = resolveAgainst(document('base[href]').first().attr('href'), pageUrl) ?? pageUrl;
+    result.push(
+      ...detectMixedContent(document, pageUrl, baseUrl),
+      ...detectInsecureFormAction(document, baseUrl),
+    );
   }
   return result;
 }
@@ -401,8 +420,9 @@ export type VersionBanner = { software: string; version: string };
 // Neither the PRD nor the issue pins an exact banner source, so this is a judgment
 // call: `name/version` is the de-facto convention for both the Server and
 // X-Powered-By headers (e.g. `nginx/1.18.0`, `PHP/7.4.3`), and some software repeats
-// that same convention in a robots.txt comment. Headers are checked first since
-// they're the more reliable signal; robots.txt is only consulted if neither matches.
+// that same convention in a robots.txt comment. Every source is collected, not just
+// the first: a proxy's `Server: nginx/1.18.0` says nothing about the WordPress behind
+// it, so stopping at the header would hide the application's CVEs.
 const BANNER_HEADER_NAMES = ['server', 'x-powered-by'];
 const BANNER_PATTERN = /([A-Za-z][\w.-]*)\/(\d[\w.-]*)/;
 
@@ -421,32 +441,33 @@ function extractGeneratorBanner(document: PassiveDocument): VersionBanner | null
 }
 
 // The generator tag is not a finding category of its own: a version found there flows
-// into the same OSV correlation as a header banner, so there is one CVE pathway. It
-// ranks between headers and robots.txt — it describes the page actually served, where
-// a robots.txt comment may be a leftover.
-export function extractVersionBanner(
+// into the same OSV correlation as a header banner, so there is one CVE pathway.
+function matchBanner(value: string): VersionBanner | null {
+  const match = BANNER_PATTERN.exec(value);
+  if (match?.[1] === undefined || match[2] === undefined) return null;
+  return { software: match[1], version: match[2] };
+}
+
+// Returns every distinct banner, in source order: headers, generator tag, robots.txt.
+export function extractVersionBanners(
   headers: Record<string, string>,
   robotsBody: string | null,
   document: PassiveDocument | null = null,
-): VersionBanner | null {
-  for (const headerName of BANNER_HEADER_NAMES) {
-    const value = headers[headerName];
-    if (value === undefined) continue;
-    const match = BANNER_PATTERN.exec(value);
-    if (match?.[1] !== undefined && match[2] !== undefined) {
-      return { software: match[1], version: match[2] };
-    }
+): VersionBanner[] {
+  const candidates = [
+    ...BANNER_HEADER_NAMES.map((name) => headers[name]).map((value) => (value === undefined ? null : matchBanner(value))),
+    document === null ? null : extractGeneratorBanner(document),
+    robotsBody === null ? null : matchBanner(robotsBody),
+  ];
+
+  const seen = new Set<string>();
+  const result: VersionBanner[] = [];
+  for (const banner of candidates) {
+    if (banner === null) continue;
+    const key = `${banner.software}/${banner.version}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    result.push(banner);
   }
-
-  const generatorBanner = document === null ? null : extractGeneratorBanner(document);
-  if (generatorBanner !== null) return generatorBanner;
-
-  if (robotsBody !== null) {
-    const match = BANNER_PATTERN.exec(robotsBody);
-    if (match?.[1] !== undefined && match[2] !== undefined) {
-      return { software: match[1], version: match[2] };
-    }
-  }
-
-  return null;
+  return result;
 }

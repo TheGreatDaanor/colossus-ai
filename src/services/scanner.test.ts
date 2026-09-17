@@ -1610,6 +1610,31 @@ describe('ScannerService threads the response body to the passive detector', () 
     expect(target?.findings.map((f) => f.category)).toContain('missing-csp');
   });
 
+  it('still correlates a generator-tag version when the Server header also carries a version', async () => {
+    const fetchImpl: FetchImpl = vi.fn(async (url) =>
+      new URL(String(url)).pathname === '/'
+        ? new Response('<meta name="generator" content="WordPress 6.2.1">', {
+            status: 200,
+            headers: { ...HTML_HEADERS, server: 'nginx/1.18.0' },
+          })
+        : new Response('', { status: 404 }),
+    );
+    // A stand-in OSV feed with a record for each banner; both must reach it.
+    const osvCheckImpl: OsvCheckImpl = async (banner) =>
+      ({ nginx: { cveId: 'CVE-2021-23017' }, WordPress: { cveId: 'CVE-2023-38000' } })[banner.software] ?? null;
+    const svc = new ScannerService(createDb(':memory:'), {
+      fetchImpl,
+      tlsCheckImpl: okTlsCheckImpl(),
+      osvCheckImpl,
+    });
+
+    const scan = await svc.startScan(['https://example.com/']);
+    const completed = await waitForCompletion(svc, scan.id);
+
+    const cveIds = completed.targets[0]?.findings.filter((f) => f.category === 'known-vulnerability').map((f) => f.cveId);
+    expect(cveIds?.sort()).toEqual(['CVE-2021-23017', 'CVE-2023-38000']);
+  });
+
   it('turns each body defect in a fetched HTML page into exactly one finding, and routes the generator version to OSV', async () => {
     const page =
       '<html><head><title>Index of /files/</title>' +

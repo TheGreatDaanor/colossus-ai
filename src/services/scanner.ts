@@ -7,7 +7,7 @@ import { findDisallowedAddress, isDisallowedAddress } from './ssrf-guard.js';
 import {
   detectHeaderFindings,
   detectTlsFindings,
-  extractVersionBanner,
+  extractVersionBanners,
   parsePassiveDocument,
   NO_TLS_FINDING,
   type HeaderFinding,
@@ -27,7 +27,7 @@ import {
   type InjectionAttempt,
 } from '../db/schema.js';
 
-export { detectHeaderFindings, detectTlsFindings, extractVersionBanner, parsePassiveDocument, NO_TLS_FINDING };
+export { detectHeaderFindings, detectTlsFindings, extractVersionBanners, parsePassiveDocument, NO_TLS_FINDING };
 export { isDisallowedAddress };
 export type { HeaderFinding, PassiveDocument, TlsFinding, TlsInfo, VersionBanner };
 
@@ -642,8 +642,7 @@ export class ScannerService {
       const requestBudget = new Budget(this.#maxExtraRequests);
       const robotsBody = await this.#fetchRobotsTxt(targetUrl, userAgent, requestBudget);
       pendingFindings.push(...(await this.#probeExposedFiles(targetUrl, userAgent, requestBudget)));
-      const banner = extractVersionBanner(responseHeaders, robotsBody, document);
-      if (banner !== null) {
+      for (const banner of extractVersionBanners(responseHeaders, robotsBody, document)) {
         const match = await this.#lookupCve(banner, cveCache, target.scanId, target.url);
         if (match !== null) {
           pendingFindings.push({
