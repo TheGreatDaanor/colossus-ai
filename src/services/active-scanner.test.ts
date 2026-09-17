@@ -59,12 +59,15 @@ function redirectingFixture(location: string): Promise<string> {
 }
 
 describe('confirmXss', () => {
-  it('confirms execution when the page reflects the canary payload unescaped', async () => {
+  it('confirms execution and captures a screenshot when the page reflects the canary unescaped', async () => {
     const origin = await fixture((q) => `<html><body>${q}</body></html>`);
     const payload = generateCanaryPayload();
     const url = `${origin}/?q=${encodeURIComponent(payload)}`;
 
-    await expect(confirmXss(url, payload)).resolves.toEqual({ outcome: 'confirmed' });
+    const result = await confirmXss(url, payload);
+
+    expect(result.outcome).toBe('confirmed');
+    expect(result.screenshot?.length).toBeGreaterThan(0);
   }, 30_000);
 
   it('reports not_vulnerable when the page escapes the reflected payload', async () => {

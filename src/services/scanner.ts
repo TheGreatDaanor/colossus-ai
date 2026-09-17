@@ -1,7 +1,7 @@
 import { connect as tlsConnect } from 'node:tls';
 import { eq } from 'drizzle-orm';
 import type { Db } from '../db/client.js';
-import { confirmXss, enumerateInjectionPoints, type XssConfirmImpl } from './active-scanner.js';
+import { confirmXss, enumerateInjectionPoints, saveEvidence, type XssConfirmImpl } from './active-scanner.js';
 import { discoverLinks } from './discovery.js';
 import { findDisallowedAddress, isDisallowedAddress } from './ssrf-guard.js';
 import {
@@ -229,6 +229,33 @@ class Budget {
   }
 }
 
+// Bounds how many wrapped tasks run at once. Used to cap concurrent browser contexts
+// during active scanning independently of the target batch size: passive work on the
+// same scan keeps running at full width while at most `limit` confirmations are live.
+class Semaphore {
+  #available: number;
+  readonly #waiters: (() => void)[] = [];
+
+  constructor(limit: number) {
+    this.#available = limit;
+  }
+
+  async run<T>(task: () => Promise<T>): Promise<T> {
+    if (this.#available > 0) {
+      this.#available -= 1;
+    } else {
+      await new Promise<void>((resolve) => this.#waiters.push(resolve));
+    }
+    try {
+      return await task();
+    } finally {
+      const next = this.#waiters.shift();
+      if (next !== undefined) next();
+      else this.#available += 1;
+    }
+  }
+}
+
 // Probing is bounded by content shape, not just status: a site that answers every
 // unknown path with a 200 SPA shell would otherwise report an exposed .env on every
 // target. Each probe therefore names what the real file looks like. `/server-status`
@@ -347,6 +374,9 @@ export class ScannerService {
   readonly #concurrency: number;
   readonly #defaultUserAgent: string;
   readonly #xssConfirmImpl: XssConfirmImpl;
+  // Caps concurrent browser contexts during active scanning, independent of the
+  // target batch size — passive work continues at full width. See the Semaphore note.
+  readonly #browserSemaphore: Semaphore;
   // Hostnames the SSRF guard is told to permit even though they resolve to a
   // disallowed (e.g. loopback) address. Empty in production and set only by tests
   // that serve a fixture on 127.0.0.1 — deliberately a constructor option, not an
@@ -365,6 +395,7 @@ export class ScannerService {
       concurrency?: number;
       defaultUserAgent?: string;
       xssConfirmImpl?: XssConfirmImpl;
+      browserConcurrency?: number;
       allowedHosts?: string[];
     } = {},
   ) {
@@ -377,6 +408,7 @@ export class ScannerService {
     this.#concurrency = options.concurrency ?? 10;
     this.#defaultUserAgent = options.defaultUserAgent ?? 'colossus-scanner/1.0';
     this.#xssConfirmImpl = options.xssConfirmImpl ?? confirmXss;
+    this.#browserSemaphore = new Semaphore(options.browserConcurrency ?? 2);
     this.#allowedHosts = new Set(options.allowedHosts ?? []);
     this.#tlsCheckImpl =
       options.tlsCheckImpl ?? ((hostname, port) => defaultTlsCheck(hostname, port, this.#timeoutMs));
@@ -720,11 +752,11 @@ export class ScannerService {
         console.warn(`[scan ${target.scanId}] ${point.url} injection fetch failed: ${message}`);
       }
 
-      const result = await this.#xssConfirmImpl(point.url, point.payload);
+      const result = await this.#browserSemaphore.run(() => this.#xssConfirmImpl(point.url, point.payload));
       attempts.push({ injectionPoint: point.injectionPoint, payload: point.payload, ...result });
 
       if (result.outcome === 'confirmed') {
-        this.#db
+        const [inserted] = this.#db
           .insert(findings)
           .values({
             scanTargetId: target.id,
@@ -734,7 +766,15 @@ export class ScannerService {
             injectionPoint: point.injectionPoint,
             payload: point.payload,
           })
-          .run();
+          .returning({ id: findings.id })
+          .all();
+
+        // The evidence filename is the finding id, known only after the insert, so the
+        // screenshot is written and linked here rather than at capture time.
+        if (inserted !== undefined && result.screenshot !== undefined) {
+          const evidencePath = await saveEvidence(target.scanId, inserted.id, result.screenshot);
+          this.#db.update(findings).set({ evidencePath }).where(eq(findings.id, inserted.id)).run();
+        }
       }
     }
 

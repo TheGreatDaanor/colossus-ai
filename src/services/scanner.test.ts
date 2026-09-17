@@ -1,5 +1,6 @@
 import { createServer, type Server } from 'node:http';
 import type { AddressInfo } from 'node:net';
+import { readFile, rm } from 'node:fs/promises';
 import { afterAll, describe, expect, it, vi } from 'vitest';
 import { createDb } from '../db/client.js';
 import { findings } from '../db/schema.js';
@@ -1386,6 +1387,72 @@ describe('ScannerService active-mode XSS confirmation', () => {
     expect(target?.findings.some((f) => f.category === 'xss')).toBe(false);
     expect(target?.injectionAttempts?.map((a) => a.outcome)).toEqual(['not_vulnerable']);
   });
+
+  it('saves the confirmation screenshot to disk and exposes evidencePath on the finding', async () => {
+    const fetchImpl: FetchImpl = vi.fn(async () => okResponse(FULLY_HARDENED_HEADERS));
+    const screenshot = Buffer.from('fake-png-bytes-for-evidence');
+    const xssConfirmImpl = vi.fn(async () => ({ outcome: 'confirmed' as const, screenshot }));
+    const svc = new ScannerService(createDb(':memory:'), {
+      fetchImpl,
+      tlsCheckImpl: okTlsCheckImpl(),
+      xssConfirmImpl,
+    });
+    const scan = await svc.startScan(['https://example.com/search?q=test'], {
+      mode: 'active',
+      confirmAuthorized: true,
+    });
+
+    await vi.waitFor(async () => {
+      const s = await svc.getScan(scan.id);
+      if (!s || s.status !== 'completed') throw new Error('not yet completed');
+    });
+
+    const xss = (await svc.getScan(scan.id))?.targets[0]?.findings.find((f) => f.category === 'xss');
+    expect(xss?.evidencePath).toBe(`data/evidence/${scan.id}/${xss?.id}.png`);
+    evidenceDirs.push(`data/evidence/${scan.id}`);
+    const written = await readFile(xss!.evidencePath!);
+    expect(written.equals(screenshot)).toBe(true);
+  });
+
+  it('never runs more browser confirmations at once than the browser-concurrency cap', async () => {
+    const fetchImpl: FetchImpl = vi.fn(async () => okResponse(FULLY_HARDENED_HEADERS));
+    let inFlight = 0;
+    let peak = 0;
+    const xssConfirmImpl = vi.fn(async () => {
+      inFlight += 1;
+      peak = Math.max(peak, inFlight);
+      await new Promise((r) => setTimeout(r, 20));
+      inFlight -= 1;
+      return { outcome: 'not_vulnerable' as const };
+    });
+    const svc = new ScannerService(createDb(':memory:'), {
+      fetchImpl,
+      tlsCheckImpl: okTlsCheckImpl(),
+      xssConfirmImpl,
+      browserConcurrency: 2,
+    });
+    const urls = Array.from({ length: 6 }, (_, i) => `https://example.com/p${i}?q=test`);
+    const scan = await svc.startScan(urls, { mode: 'active', confirmAuthorized: true });
+
+    await vi.waitFor(
+      async () => {
+        const s = await svc.getScan(scan.id);
+        if (!s || s.status !== 'completed') throw new Error('not yet completed');
+      },
+      { timeout: 5000 },
+    );
+
+    expect(xssConfirmImpl).toHaveBeenCalledTimes(6);
+    expect(peak).toBeLessThanOrEqual(2);
+    expect(peak).toBeGreaterThan(1); // the cap is actually exercised, not accidentally serial
+  });
+});
+
+// Confirmed findings write a PNG under data/evidence/<scan>/; clean up what the
+// evidence tests leave behind.
+const evidenceDirs: string[] = [];
+afterAll(async () => {
+  await Promise.all(evidenceDirs.map((dir) => rm(dir, { recursive: true, force: true })));
 });
 
 // End-to-end through the real Playwright browser (default confirmXss, no mock) against
@@ -1431,6 +1498,8 @@ describe('ScannerService active-mode XSS confirmation (real browser)', () => {
     const target = (await svc.getScan(scan.id))?.targets[0];
     const xss = target?.findings.find((f) => f.category === 'xss');
     expect(xss?.confidence).toBe('definitive');
+    expect(xss?.evidencePath).toBe(`data/evidence/${scan.id}/${xss?.id}.png`);
+    evidenceDirs.push(`data/evidence/${scan.id}`);
     expect(target?.injectionAttempts?.[0]?.outcome).toBe('confirmed');
   }, 40_000);
 

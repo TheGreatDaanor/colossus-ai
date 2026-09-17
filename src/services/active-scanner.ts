@@ -1,7 +1,13 @@
 import { chromium, type Browser, type Page } from 'playwright';
 import { randomUUID } from 'node:crypto';
+import { mkdir, writeFile } from 'node:fs/promises';
+import { join } from 'node:path';
 import type { InjectionAttempt } from '../db/schema.js';
 import { findDisallowedAddress } from './ssrf-guard.js';
+
+// Confirmed-finding evidence lives here, one directory per scan. `data/` is
+// gitignored in full, so nothing extra is needed to keep screenshots out of git.
+const EVIDENCE_ROOT = 'data/evidence';
 
 // A single query-parameter injection point: which parameter was targeted, the
 // unique canary payload put in its place, and the resulting URL to fetch.
@@ -33,7 +39,21 @@ export function enumerateInjectionPoints(targetUrl: URL): InjectionPoint[] {
 // loaded and it did not; `unavailable` means we could not tell. Collapsing the last
 // two would destroy the PRD's "not vulnerable vs. couldn't test it" distinction.
 export type XssOutcome = 'confirmed' | 'not_vulnerable' | 'unavailable';
-export type XssAttemptResult = { outcome: XssOutcome; error?: string };
+// `screenshot` is captured only on a `confirmed` outcome — proof the marker executed
+// in a real browser. The scanner writes it to disk under the confirmed finding's id.
+export type XssAttemptResult = { outcome: XssOutcome; error?: string; screenshot?: Buffer };
+
+// Writes a confirmation screenshot to data/evidence/<scanId>/<findingId>.png and
+// returns that relative path. The file is named after the finding id (a value this
+// codebase controls), never the payload marker. Written once and never deleted:
+// evidence you auto-delete is evidence you don't have when you need it.
+export async function saveEvidence(scanId: number, findingId: number, screenshot: Buffer): Promise<string> {
+  const dir = join(EVIDENCE_ROOT, String(scanId));
+  await mkdir(dir, { recursive: true });
+  const path = join(dir, `${findingId}.png`);
+  await writeFile(path, screenshot);
+  return path;
+}
 
 // The payload sets `window.__colossus_xss_marker` to a UUID; execution is detected
 // by reading that property back and matching the UUID out of the payload we sent.
@@ -83,7 +103,8 @@ export async function confirmXss(
     const observed = await page.evaluate(
       () => (globalThis as { __colossus_xss_marker?: string }).__colossus_xss_marker,
     );
-    return { outcome: observed === marker ? 'confirmed' : 'not_vulnerable' };
+    if (observed !== marker) return { outcome: 'not_vulnerable' };
+    return { outcome: 'confirmed', screenshot: await page.screenshot() };
   } finally {
     await browser.close();
   }

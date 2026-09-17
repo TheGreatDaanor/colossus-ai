@@ -65,4 +65,7 @@ export const findings = sqliteTable('findings', {
   // parameter was injected and the canary payload that executed.
   injectionPoint: text('injection_point'),
   payload: text('payload'),
+  // Set only on browser-confirmed findings: relative path to the evidence screenshot
+  // under data/evidence/<scan_id>/<finding_id>.png. Written once, never deleted.
+  evidencePath: text('evidence_path'),
 });

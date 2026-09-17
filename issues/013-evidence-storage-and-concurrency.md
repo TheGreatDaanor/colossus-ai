@@ -1,7 +1,7 @@
 ---
 id: 013
 title: Capture evidence screenshot and cap active-scan concurrency
-status: open
+status: done
 type: afk
 blocked-by: [012]
 ---
@@ -68,10 +68,10 @@ issue; [[022]] defines its own.
 
 ## Definition of done
 
-- [ ] Failing test written first, confirmed red
-- [ ] Implementation makes it green
-- [ ] `test`, `typecheck`, `lint` all pass
-- [ ] Visible at: a confirmed-XSS finding in `GET /scans/:id` includes `evidencePath`, and the file exists on disk at that path; a test asserts active-mode batching never exceeds the configured concurrency cap even when submitting more targets than the cap.
+- [x] Failing test written first, confirmed red
+- [x] Implementation makes it green
+- [x] `test`, `typecheck`, `lint` all pass
+- [x] Visible at: a confirmed-XSS finding in `GET /scans/:id` includes `evidencePath`, and the file exists on disk at that path; a test asserts active-mode batching never exceeds the configured concurrency cap even when submitting more targets than the cap.
 
 ## Out of scope
 
