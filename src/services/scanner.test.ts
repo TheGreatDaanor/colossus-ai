@@ -1568,6 +1568,39 @@ describe('ScannerService response-body threading', () => {
     expect(input?.document?.('meta[name=generator]').attr('content')).toBe('WordPress 6.1');
   });
 
+  it('turns a defective fixture page into body findings and correlates its generator tag', async () => {
+    const html = `<html><head>
+      <meta name="generator" content="WordPress 6.1">
+      <script src="http://cdn.example.net/lib.js"></script>
+    </head><body>
+      <form action="http://example.com/login"><input type="password"></form>
+    </body></html>`;
+    const fetchImpl: FetchImpl = vi.fn(async (url) =>
+      String(url) === 'https://example.com/'
+        ? new Response(html, { status: 200, headers: HTML_HEADERS })
+        : new Response(null, { status: 404 }),
+    );
+    const osvCheckImpl: OsvCheckImpl = vi.fn(async () => ({ cveId: 'CVE-2023-0001' }));
+    const svc = new ScannerService(createDb(':memory:'), {
+      fetchImpl,
+      tlsCheckImpl: okTlsCheckImpl(),
+      llmEnrichImpl: vi.fn(async () => []),
+      osvCheckImpl,
+    });
+    const scan = await svc.startScan(['https://example.com/']);
+    const completed = await vi.waitFor(async () => {
+      const s = await svc.getScan(scan.id);
+      if (!s || s.status !== 'completed') throw new Error('not yet completed');
+      return s;
+    });
+
+    const categories = completed.targets[0]?.findings.map((f) => f.category) ?? [];
+    for (const category of ['mixed-content', 'insecure-form-action', 'password-field-autocomplete', 'known-vulnerability']) {
+      expect(categories.filter((c) => c === category)).toHaveLength(1);
+    }
+    expect(osvCheckImpl).toHaveBeenCalledWith(expect.objectContaining({ software: 'WordPress', version: '6.1' }));
+  });
+
   it('truncates a body larger than 2 MB before parsing it', async () => {
     const big = `<p id="head">start</p>${'a'.repeat(3 * 1024 * 1024)}<p id="tail">end</p>`;
     const { input } = await runWithSpy(() => new Response(big, { status: 200, headers: HTML_HEADERS }));

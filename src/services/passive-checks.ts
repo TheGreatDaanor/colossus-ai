@@ -242,14 +242,107 @@ export function detectHeaderFindings(headers: Record<string, string>, setCookies
 // later link/form harvesting (014) can query it without re-parsing up to 2 MB of
 // hostile HTML. `document` is absent when there is no usable body — non-HTML
 // content, or a read that failed mid-stream — and body checks are then skipped.
+// `url` is the page the body came from: HTTPS-ness and relative `action` resolution
+// both depend on it.
 export type PassiveInput = {
+  url: URL;
   headers: Record<string, string>;
   setCookies: string[];
   document?: CheerioAPI;
 };
 
 export function detectPassiveFindings(input: PassiveInput): HeaderFinding[] {
-  return detectHeaderFindings(input.headers, input.setCookies);
+  const result = detectHeaderFindings(input.headers, input.setCookies);
+  if (input.document !== undefined) result.push(...detectBodyFindings(input.url, input.document));
+  return result;
+}
+
+// Only subresources that execute or render active content count: browsers upgrade or
+// block passive http images silently, and plain links are navigations, not loads.
+const ACTIVE_SUBRESOURCE_SELECTORS: { selector: string; attr: string }[] = [
+  { selector: 'script[src]', attr: 'src' },
+  { selector: 'link[rel~="stylesheet" i][href]', attr: 'href' },
+  { selector: 'iframe[src]', attr: 'src' },
+];
+
+const PASSWORD_AUTOCOMPLETE_TOKENS = new Set(['new-password', 'current-password']);
+const DIRECTORY_LISTING_PATTERN = /^\s*(index of|directory listing for)\s+\//i;
+
+// Unparseable URLs are ignored rather than guessed at: a browser wouldn't load them either.
+function resolveUrl(value: string, base: URL): URL | null {
+  try {
+    return new URL(value, base);
+  } catch {
+    return null;
+  }
+}
+
+function detectBodyFindings(pageUrl: URL, $: CheerioAPI): HeaderFinding[] {
+  const result: HeaderFinding[] = [];
+
+  if (pageUrl.protocol === 'https:') {
+    for (const { selector, attr } of ACTIVE_SUBRESOURCE_SELECTORS) {
+      $(selector).each((_, el) => {
+        const value = $(el).attr(attr) ?? '';
+        if (resolveUrl(value, pageUrl)?.protocol !== 'http:') return;
+        result.push({
+          category: 'mixed-content',
+          severity: 'medium',
+          confidence: 'definitive',
+          explanation: `The HTTPS page loads "${value}" over plaintext HTTP.`,
+        });
+      });
+    }
+  }
+
+  // A form without an action submits to the page itself, so only an explicit one can
+  // differ from the page's own scheme — but an http page's own-URL form is still flagged.
+  $('form').each((_, el) => {
+    const action = $(el).attr('action')?.trim() || pageUrl.href;
+    const resolved = resolveUrl(action, pageUrl);
+    if (resolved?.protocol !== 'http:') return;
+    result.push({
+      category: 'insecure-form-action',
+      severity: 'high',
+      confidence: 'definitive',
+      explanation: `A form submits to "${resolved.href}" over plaintext HTTP.`,
+    });
+  });
+
+  $('input').each((_, el) => {
+    const input = $(el);
+    if (input.attr('type')?.toLowerCase() !== 'password') return;
+    const tokens = (input.attr('autocomplete') ?? '').toLowerCase().split(/\s+/);
+    if (tokens.some((token) => PASSWORD_AUTOCOMPLETE_TOKENS.has(token))) return;
+    result.push({
+      category: 'password-field-autocomplete',
+      severity: 'low',
+      confidence: 'possible',
+      explanation: `Password field "${input.attr('name') ?? 'unnamed'}" does not declare autocomplete="new-password" or "current-password".`,
+    });
+  });
+
+  if (DIRECTORY_LISTING_PATTERN.test($('title').first().text())) {
+    result.push({
+      category: 'directory-listing',
+      severity: 'medium',
+      confidence: 'possible',
+      explanation: `The page looks like an auto-generated directory listing ("${$('title').first().text().trim()}").`,
+    });
+  }
+
+  return result;
+}
+
+// `WordPress 6.1`, `Joomla! 4.2.8`: the generator convention is name-space-version,
+// unlike the name/version header banner. A generator with no version is not a banner.
+const GENERATOR_PATTERN = /^\s*(.+?)\s+v?(\d[\w.-]*)/;
+
+export function extractGeneratorBanner($: CheerioAPI): VersionBanner | null {
+  const content = $('meta[name="generator" i]').first().attr('content');
+  const match = content === undefined ? null : GENERATOR_PATTERN.exec(content);
+  if (match?.[1] === undefined || match[2] === undefined) return null;
+  return { software: match[1], version: match[2] };
 }
 
 export type TlsInfo = { version: string; certExpiresAt: Date };
@@ -289,6 +382,7 @@ const BANNER_PATTERN = /([A-Za-z][\w.-]*)\/(\d[\w.-]*)/;
 export function extractVersionBanner(
   headers: Record<string, string>,
   robotsBody: string | null,
+  generator: VersionBanner | null = null,
 ): VersionBanner | null {
   for (const headerName of BANNER_HEADER_NAMES) {
     const value = headers[headerName];
@@ -298,6 +392,10 @@ export function extractVersionBanner(
       return { software: match[1], version: match[2] };
     }
   }
+
+  // The page's own generator tag names the application actually serving it, so it
+  // outranks a robots.txt comment.
+  if (generator !== null) return generator;
 
   if (robotsBody !== null) {
     const match = BANNER_PATTERN.exec(robotsBody);

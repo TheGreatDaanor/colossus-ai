@@ -9,6 +9,7 @@ import {
   detectHeaderFindings,
   detectPassiveFindings,
   detectTlsFindings,
+  extractGeneratorBanner,
   extractVersionBanner,
   NO_TLS_FINDING,
   type HeaderFinding,
@@ -606,6 +607,7 @@ export class ScannerService {
 
       const pendingFindings: PendingFinding[] = [
         ...this.#passiveChecksImpl({
+          url: targetUrl,
           headers: responseHeaders,
           setCookies,
           ...(document === undefined ? {} : { document }),
@@ -639,7 +641,8 @@ export class ScannerService {
       const requestBudget = new Budget(this.#maxExtraRequests);
       const robotsBody = await this.#fetchRobotsTxt(targetUrl, userAgent, requestBudget);
       pendingFindings.push(...(await this.#probeExposedFiles(targetUrl, userAgent, requestBudget)));
-      const banner = extractVersionBanner(responseHeaders, robotsBody);
+      const generator = document === undefined ? null : extractGeneratorBanner(document);
+      const banner = extractVersionBanner(responseHeaders, robotsBody, generator);
       if (banner !== null) {
         const match = await this.#lookupCve(banner, cveCache, target.scanId, target.url);
         if (match !== null) {
