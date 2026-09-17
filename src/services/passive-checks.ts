@@ -234,21 +234,129 @@ function detectDisclosureFindings(headers: Record<string, string>): HeaderFindin
   return result;
 }
 
-// Body-derived checks live behind the parsed document. Issue 019 only threads the
-// document to this boundary; the detectors that read it arrive in issue 020, so this
-// returns nothing today.
-function detectBodyFindings(document: PassiveDocument | null): HeaderFinding[] {
+// Resolves a markup-supplied URL against the page; an unparseable value is ignored
+// rather than guessed at.
+function resolveAgainst(value: string | undefined, pageUrl: URL): URL | null {
+  if (value === undefined || value.trim() === '') return null;
+  try {
+    return new URL(value, pageUrl);
+  } catch {
+    return null;
+  }
+}
+
+// Only subresources a browser would block or that can rewrite the page are counted;
+// passive content (images, media) is out of scope for this check.
+const MIXED_CONTENT_SOURCES: { selector: string; attr: string }[] = [
+  { selector: 'script[src]', attr: 'src' },
+  { selector: 'link[rel~="stylesheet" i][href]', attr: 'href' },
+  { selector: 'iframe[src]', attr: 'src' },
+];
+
+// Body checks report once per page, with the count in the explanation: a page with
+// forty insecure scripts has one defect to fix, not forty findings to triage.
+function detectMixedContent(document: PassiveDocument, pageUrl: URL): HeaderFinding[] {
+  if (pageUrl.protocol !== 'https:') return [];
+
+  let count = 0;
+  for (const { selector, attr } of MIXED_CONTENT_SOURCES) {
+    document(selector).each((_, el) => {
+      if (resolveAgainst(document(el).attr(attr), pageUrl)?.protocol === 'http:') count++;
+    });
+  }
+  if (count === 0) return [];
+
+  return [
+    {
+      category: 'mixed-content',
+      severity: 'medium',
+      confidence: 'definitive',
+      explanation: `This HTTPS page loads ${count} script, stylesheet, or iframe resource(s) over plain http.`,
+    },
+  ];
+}
+
+// A form with no action submits to the page itself, which `no-tls` already covers on
+// an http page, so only an explicit action is judged here.
+function detectInsecureFormAction(document: PassiveDocument, pageUrl: URL): HeaderFinding[] {
+  const count = document('form[action]').filter(
+    (_, el) => resolveAgainst(document(el).attr('action'), pageUrl)?.protocol === 'http:',
+  ).length;
+  if (count === 0) return [];
+
+  return [
+    {
+      category: 'insecure-form-action',
+      severity: 'high',
+      confidence: 'definitive',
+      explanation: `${count} form(s) on this page submit to a plain http URL, exposing whatever is entered.`,
+    },
+  ];
+}
+
+const PASSWORD_AUTOCOMPLETE_HINTS = new Set(['new-password', 'current-password']);
+
+// Without an explicit hint, password managers guess at the field's role (and `off` is
+// widely ignored), so this is a usability-to-security nudge rather than a hard defect.
+function detectPasswordAutocomplete(document: PassiveDocument): HeaderFinding[] {
+  const count = document('input')
+    .filter((_, el) => document(el).attr('type')?.trim().toLowerCase() === 'password')
+    .filter((_, el) => {
+      const tokens = (document(el).attr('autocomplete') ?? '').toLowerCase().split(/\s+/);
+      return !tokens.some((token) => PASSWORD_AUTOCOMPLETE_HINTS.has(token));
+    }).length;
+  if (count === 0) return [];
+
+  return [
+    {
+      category: 'password-field-autocomplete',
+      severity: 'low',
+      confidence: 'possible',
+      explanation: `${count} password field(s) lack an autocomplete="new-password" or "current-password" hint.`,
+    },
+  ];
+}
+
+// Apache and nginx autoindex pages both title themselves `Index of /path` and repeat
+// it in the h1; requiring the path slash keeps prose titles ("Index of recipes") out.
+const DIRECTORY_LISTING_HEADING = /^\s*index of \//i;
+
+function detectDirectoryListing(document: PassiveDocument): HeaderFinding[] {
+  const title = document('title').first().text();
+  const heading = document('h1').first().text();
+  if (!DIRECTORY_LISTING_HEADING.test(title) || !DIRECTORY_LISTING_HEADING.test(heading)) return [];
+
+  return [
+    {
+      category: 'directory-listing',
+      severity: 'medium',
+      confidence: 'possible',
+      explanation: 'The response looks like an auto-generated directory index, which exposes every file in the directory.',
+    },
+  ];
+}
+
+// `pageUrl` anchors relative references; without it, body checks that depend on the
+// page's scheme or on resolving a link cannot be decided, so they are skipped.
+function detectBodyFindings(document: PassiveDocument | null, pageUrl: URL | null): HeaderFinding[] {
   if (document === null) return [];
-  return [];
+
+  const result = [...detectPasswordAutocomplete(document), ...detectDirectoryListing(document)];
+  if (pageUrl !== null) {
+    result.push(...detectMixedContent(document, pageUrl), ...detectInsecureFormAction(document, pageUrl));
+  }
+  return result;
 }
 
 // `document` is the target's parsed response body, or null when there was no readable
 // HTML body (non-HTML content type, empty body, or a read that failed mid-stream). It
 // is optional so header/TLS analysis stays independent of body availability.
+// `pageUrl` is the URL the document was served from.
 export function detectHeaderFindings(
   headers: Record<string, string>,
   setCookies: string[] = [],
   document: PassiveDocument | null = null,
+  pageUrl: URL | null = null,
 ): HeaderFinding[] {
   const result: HeaderFinding[] = MISSING_HEADER_FINDINGS.filter(({ header }) => !(header in headers)).map(
     ({ category, severity }) => ({ category, severity, confidence: 'definitive' }),
@@ -259,7 +367,7 @@ export function detectHeaderFindings(
   result.push(...detectHstsFindings(headers));
   result.push(...detectCorsFindings(headers));
   result.push(...detectDisclosureFindings(headers));
-  result.push(...detectBodyFindings(document));
+  result.push(...detectBodyFindings(document, pageUrl));
 
   return result;
 }
@@ -298,9 +406,28 @@ export type VersionBanner = { software: string; version: string };
 const BANNER_HEADER_NAMES = ['server', 'x-powered-by'];
 const BANNER_PATTERN = /([A-Za-z][\w.-]*)\/(\d[\w.-]*)/;
 
+// Generator tags conventionally space-separate the version (`WordPress 6.2.1`,
+// `Drupal 9 (https://www.drupal.org)`), and a tag naming only the software yields
+// nothing, same as a versionless Server header.
+const GENERATOR_BANNER_PATTERN = /^\s*([A-Za-z][\w.-]*(?:\s+[A-Za-z][\w.-]*)*)\s+v?(\d[\w.-]*)/;
+
+function extractGeneratorBanner(document: PassiveDocument): VersionBanner | null {
+  const content = document('meta[name="generator" i]').first().attr('content');
+  if (content === undefined) return null;
+
+  const match = BANNER_PATTERN.exec(content) ?? GENERATOR_BANNER_PATTERN.exec(content);
+  if (match?.[1] === undefined || match[2] === undefined) return null;
+  return { software: match[1], version: match[2] };
+}
+
+// The generator tag is not a finding category of its own: a version found there flows
+// into the same OSV correlation as a header banner, so there is one CVE pathway. It
+// ranks between headers and robots.txt — it describes the page actually served, where
+// a robots.txt comment may be a leftover.
 export function extractVersionBanner(
   headers: Record<string, string>,
   robotsBody: string | null,
+  document: PassiveDocument | null = null,
 ): VersionBanner | null {
   for (const headerName of BANNER_HEADER_NAMES) {
     const value = headers[headerName];
@@ -310,6 +437,9 @@ export function extractVersionBanner(
       return { software: match[1], version: match[2] };
     }
   }
+
+  const generatorBanner = document === null ? null : extractGeneratorBanner(document);
+  if (generatorBanner !== null) return generatorBanner;
 
   if (robotsBody !== null) {
     const match = BANNER_PATTERN.exec(robotsBody);

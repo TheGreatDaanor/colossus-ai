@@ -37,6 +37,7 @@ export type PassiveHeaderDetect = (
   headers: Record<string, string>,
   setCookies: string[],
   document: PassiveDocument | null,
+  pageUrl: URL,
 ) => HeaderFinding[];
 
 export class ScanValidationError extends Error {}
@@ -610,7 +611,9 @@ export class ScannerService {
         .where(eq(scanTargets.id, target.id))
         .run();
 
-      const pendingFindings: PendingFinding[] = [...this.#passiveHeaderDetect(responseHeaders, setCookies, document)];
+      const pendingFindings: PendingFinding[] = [
+        ...this.#passiveHeaderDetect(responseHeaders, setCookies, document, targetUrl),
+      ];
 
       if (targetUrl.protocol === 'http:') {
         pendingFindings.push(NO_TLS_FINDING);
@@ -639,7 +642,7 @@ export class ScannerService {
       const requestBudget = new Budget(this.#maxExtraRequests);
       const robotsBody = await this.#fetchRobotsTxt(targetUrl, userAgent, requestBudget);
       pendingFindings.push(...(await this.#probeExposedFiles(targetUrl, userAgent, requestBudget)));
-      const banner = extractVersionBanner(responseHeaders, robotsBody);
+      const banner = extractVersionBanner(responseHeaders, robotsBody, document);
       if (banner !== null) {
         const match = await this.#lookupCve(banner, cveCache, target.scanId, target.url);
         if (match !== null) {

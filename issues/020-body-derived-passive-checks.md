@@ -1,7 +1,7 @@
 ---
 id: 020
 title: Add body-derived passive checks (mixed content, form action, generator, listing)
-status: open
+status: done
 type: afk
 blocked-by: [019]
 ---
@@ -43,10 +43,10 @@ dependency — flag it in review rather than hand-rolling a tag matcher.
 
 ## Definition of done
 
-- [ ] Failing test written first, confirmed red
-- [ ] Implementation makes it green
-- [ ] `test`, `typecheck`, `lint` all pass
-- [ ] Visible at: a stubbed fetch returning a fixture HTML page with each
+- [x] Failing test written first, confirmed red
+- [x] Implementation makes it green
+- [x] `test`, `typecheck`, `lint` all pass
+- [x] Visible at: a stubbed fetch returning a fixture HTML page with each
       defect produces each expected category exactly once, and a generator
       meta tag reaches OSV correlation.
 

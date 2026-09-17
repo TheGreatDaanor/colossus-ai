@@ -1609,4 +1609,41 @@ describe('ScannerService threads the response body to the passive detector', () 
     expect(target?.status).toBe('ok');
     expect(target?.findings.map((f) => f.category)).toContain('missing-csp');
   });
+
+  it('turns each body defect in a fetched HTML page into exactly one finding, and routes the generator version to OSV', async () => {
+    const page =
+      '<html><head><title>Index of /files/</title>' +
+      '<meta name="generator" content="WordPress 6.2.1">' +
+      '<script src="http://cdn.example.com/a.js"></script>' +
+      '<link rel="stylesheet" href="http://cdn.example.com/a.css"></head>' +
+      '<body><h1>Index of /files/</h1>' +
+      '<form action="http://example.com/login"><input type="password" name="pw"></form>' +
+      '<form action="http://example.com/signup"><input type="password" name="pw2"></form>' +
+      '</body></html>';
+    const fetchImpl: FetchImpl = vi.fn(async (url) =>
+      new URL(String(url)).pathname === '/'
+        ? new Response(page, { status: 200, headers: HTML_HEADERS })
+        : new Response('', { status: 404 }),
+    );
+    // A stand-in OSV feed that only knows the generator-tag banner, so a CVE finding
+    // can only appear if that banner is what reached the lookup.
+    const osvCheckImpl: OsvCheckImpl = async (banner) =>
+      banner.software === 'WordPress' && banner.version === '6.2.1' ? { cveId: 'CVE-2023-38000' } : null;
+    const svc = new ScannerService(createDb(':memory:'), {
+      fetchImpl,
+      tlsCheckImpl: okTlsCheckImpl(),
+      osvCheckImpl,
+    });
+
+    const scan = await svc.startScan(['https://example.com/']);
+    const completed = await waitForCompletion(svc, scan.id);
+
+    const categories = completed.targets[0]?.findings.map((f) => f.category) ?? [];
+    for (const category of ['mixed-content', 'insecure-form-action', 'password-field-autocomplete', 'directory-listing']) {
+      expect(categories.filter((c) => c === category), category).toHaveLength(1);
+    }
+    expect(completed.targets[0]?.findings.find((f) => f.category === 'known-vulnerability')).toMatchObject({
+      cveId: 'CVE-2023-38000',
+    });
+  });
 });
