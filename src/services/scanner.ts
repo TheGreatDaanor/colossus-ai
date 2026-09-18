@@ -312,10 +312,12 @@ const MAX_DISCOVERED_PER_ROOT = 25;
 // instead of silently turning discovery off.
 const MAX_HTML_BYTES = 2 * 1024 * 1024;
 
-async function readHtmlBody(response: Response): Promise<string> {
-  const contentType = response.headers.get('content-type') ?? '';
-  if (!/^\s*(text\/html|application\/xhtml\+xml)\b/i.test(contentType)) return '';
+// robots.txt is parsed for Disallow prefixes and scanned for a version banner, and
+// both of those are linear in its length — so an attacker-controlled robots.txt is
+// worker time an attacker controls. 64 KiB is far more than any real one needs.
+const MAX_ROBOTS_BYTES = 64 * 1024;
 
+async function readBoundedText(response: Response, maxBytes: number): Promise<string> {
   const body = response.body;
   if (body === null) return '';
 
@@ -331,8 +333,8 @@ async function readHtmlBody(response: Response): Promise<string> {
       if (value === undefined) continue;
 
       bytes += value.byteLength;
-      if (bytes > MAX_HTML_BYTES) {
-        html += decoder.decode(value.subarray(0, value.byteLength - (bytes - MAX_HTML_BYTES)));
+      if (bytes > maxBytes) {
+        html += decoder.decode(value.subarray(0, value.byteLength - (bytes - maxBytes)));
         break;
       }
       html += decoder.decode(value, { stream: true });
@@ -345,6 +347,13 @@ async function readHtmlBody(response: Response): Promise<string> {
   }
 
   return html;
+}
+
+async function readHtmlBody(response: Response): Promise<string> {
+  const contentType = response.headers.get('content-type') ?? '';
+  if (!/^\s*(text\/html|application\/xhtml\+xml)\b/i.test(contentType)) return '';
+
+  return readBoundedText(response, MAX_HTML_BYTES);
 }
 
 // Scoped to a single #runScan call, not the instance: discovery bookkeeping (depth,
@@ -793,7 +802,7 @@ export class ScannerService {
     try {
       const robotsUrl = new URL('/robots.txt', targetUrl).toString();
       const response = await this.#fetchImpl(robotsUrl, { redirect: 'manual', headers: { 'user-agent': userAgent } });
-      return await response.text();
+      return await readBoundedText(response, MAX_ROBOTS_BYTES);
     } catch {
       // robots.txt is an extra probe surface, not a required one — a missing or
       // broken robots.txt just means banner extraction relies on headers alone.

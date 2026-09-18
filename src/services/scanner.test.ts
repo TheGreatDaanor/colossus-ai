@@ -1606,3 +1606,53 @@ describe('ScannerService body-derived passive checks', () => {
     expect(target?.findings.map((f) => f.category)).toEqual(['insecure-form-action']);
   });
 });
+
+describe('ScannerService robots.txt bounds', () => {
+  // A robots.txt is an unauthenticated, attacker-controlled body on a target the
+  // operator only attested they may scan — it must not be able to stall a worker.
+  // No Server/X-Powered-By banner on the page response, so banner extraction falls
+  // through to the robots.txt body — the path that actually scans it.
+  it('completes a scan whose target serves a hostile multi-megabyte robots.txt', async () => {
+    const hostile = 'x'.repeat(3_000_000);
+    const fetchImpl: FetchImpl = vi.fn(async (url) =>
+      String(url).endsWith('/robots.txt')
+        ? new Response(hostile, { status: 200, headers: { 'content-type': 'text/plain' } })
+        : okResponse(FULLY_HARDENED_HEADERS),
+    );
+    const svc = new ScannerService(createDb(':memory:'), { fetchImpl, tlsCheckImpl: okTlsCheckImpl() });
+    const scan = await svc.startScan(['https://example.com/']);
+
+    const completed = await vi.waitFor(
+      async () => {
+        const s = await svc.getScan(scan.id);
+        if (!s || s.status !== 'completed') throw new Error('not yet completed');
+        return s;
+      },
+      { timeout: 5000 },
+    );
+
+    expect(completed.targets[0]?.status).toBe('ok');
+  });
+
+  it('still honours Disallow rules that appear within the read bound', async () => {
+    const robots = `User-agent: *\nDisallow: /admin\n${'#'.repeat(200)}`;
+    const fetchImpl: FetchImpl = vi.fn(async (url) => {
+      const href = String(url);
+      if (href.endsWith('/robots.txt')) return new Response(robots, { status: 200 });
+      const headers = { ...FULLY_HARDENED_HEADERS, 'content-type': 'text/html' };
+      if (href === 'https://example.com/')
+        return new Response('<a href="/admin/x">a</a><a href="/ok">b</a>', { status: 200, headers });
+      return new Response('', { status: 200, headers });
+    });
+    const svc = new ScannerService(createDb(':memory:'), { fetchImpl, tlsCheckImpl: okTlsCheckImpl() });
+    const scan = await svc.startScan(['https://example.com/']);
+
+    const completed = await vi.waitFor(async () => {
+      const s = await svc.getScan(scan.id);
+      if (!s || s.status !== 'completed') throw new Error('not yet completed');
+      return s;
+    });
+
+    expect(completed.targets.map((t) => t.url).sort()).toEqual(['https://example.com/', 'https://example.com/ok']);
+  });
+});

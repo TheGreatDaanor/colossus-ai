@@ -370,7 +370,10 @@ export type VersionBanner = { software: string; version: string };
 // that same convention in a robots.txt comment. Headers are checked first since
 // they're the more reliable signal; robots.txt is only consulted if neither matches.
 const BANNER_HEADER_NAMES = ['server', 'x-powered-by'];
-const BANNER_PATTERN = /([A-Za-z][\w.-]*)\/(\d[\w.-]*)/;
+// The quantifiers are bounded, not open-ended: `[\w.-]*` before a required `/` makes
+// this quadratic on a long run of non-matching characters, and this pattern is run
+// over an attacker-controlled robots.txt. No real banner approaches 64 characters.
+const BANNER_PATTERN = /([A-Za-z][\w.-]{0,63})\/(\d[\w.-]{0,63})/;
 
 // A generator tag writes its version with a space, not a slash ("WordPress 6.4.1"),
 // so BANNER_PATTERN alone would miss it. It deliberately produces a banner rather
