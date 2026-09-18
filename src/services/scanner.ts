@@ -1,7 +1,12 @@
 import { connect as tlsConnect } from 'node:tls';
 import { eq } from 'drizzle-orm';
 import type { Db } from '../db/client.js';
-import { confirmXss, enumerateInjectionPoints, saveEvidence, type XssConfirmImpl } from './active-scanner.js';
+import {
+  makeXssInjectionClass,
+  saveEvidence,
+  type InjectionClass,
+  type XssConfirmImpl,
+} from './active-scanner.js';
 import { discoverLinks } from './discovery.js';
 import { findDisallowedAddress, isDisallowedAddress } from './ssrf-guard.js';
 import {
@@ -383,7 +388,9 @@ export class ScannerService {
   readonly #maxExtraRequests: number;
   readonly #concurrency: number;
   readonly #defaultUserAgent: string;
-  readonly #xssConfirmImpl: XssConfirmImpl;
+  // The XSS strategy, reached through the InjectionClass interface. Built from the
+  // injected confirmer so tests keep mocking confirmation at the same boundary.
+  readonly #xssClass: InjectionClass;
   // Caps concurrent browser contexts during active scanning, independent of the
   // target batch size — passive work continues at full width. See the Semaphore note.
   readonly #browserSemaphore: Semaphore;
@@ -417,7 +424,7 @@ export class ScannerService {
     this.#maxExtraRequests = options.maxExtraRequests ?? 6;
     this.#concurrency = options.concurrency ?? 10;
     this.#defaultUserAgent = options.defaultUserAgent ?? 'colossus-scanner/1.0';
-    this.#xssConfirmImpl = options.xssConfirmImpl ?? confirmXss;
+    this.#xssClass = makeXssInjectionClass(options.xssConfirmImpl);
     this.#browserSemaphore = new Semaphore(options.browserConcurrency ?? 2);
     this.#allowedHosts = new Set(options.allowedHosts ?? []);
     this.#tlsCheckImpl =
@@ -756,7 +763,7 @@ export class ScannerService {
   // URLs share the target's host, which the SSRF guard already cleared;
   // per-navigation redirect guarding is 012.
   async #injectQueryParams(target: ScanTarget, targetUrl: URL, userAgent: string): Promise<void> {
-    const points = enumerateInjectionPoints(targetUrl);
+    const points = this.#xssClass.enumerate(targetUrl);
     if (points.length === 0) return;
 
     const attempts: InjectionAttempt[] = [];
@@ -768,7 +775,7 @@ export class ScannerService {
         console.warn(`[scan ${target.scanId}] ${point.url} injection fetch failed: ${message}`);
       }
 
-      const result = await this.#browserSemaphore.run(() => this.#xssConfirmImpl(point.url, point.payload));
+      const result = await this.#browserSemaphore.run(() => this.#xssClass.confirm(point));
       attempts.push({ injectionPoint: point.injectionPoint, payload: point.payload, ...result });
 
       if (result.outcome === 'confirmed') {
@@ -776,7 +783,7 @@ export class ScannerService {
           .insert(findings)
           .values({
             scanTargetId: target.id,
-            category: 'xss',
+            category: this.#xssClass.category,
             severity: 'high',
             confidence: 'definitive',
             injectionPoint: point.injectionPoint,

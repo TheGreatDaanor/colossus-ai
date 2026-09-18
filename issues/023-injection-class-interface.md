@@ -1,7 +1,7 @@
 ---
 id: 023
 title: Extract an InjectionClass interface with XSS as its first implementation
-status: open
+status: done
 type: afk
 blocked-by: []
 ---

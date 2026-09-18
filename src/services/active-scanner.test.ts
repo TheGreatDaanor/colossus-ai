@@ -1,7 +1,7 @@
 import { createServer, type Server } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { afterAll, describe, expect, it } from 'vitest';
-import { confirmXss, generateCanaryPayload } from './active-scanner.js';
+import { confirmXss, generateCanaryPayload, xssInjectionClass } from './active-scanner.js';
 
 // A real loopback server, not `page.route()` — 012 uses that hook as production
 // behaviour, and a test that owns it too would fight the code under test.
@@ -99,5 +99,28 @@ describe('confirmXss', () => {
     expect(result.outcome).toBe('unavailable');
     expect(result.error).toContain('169.254.169.254');
     expect(result.error).toMatch(/disallowed|blocked/i);
+  }, 30_000);
+});
+
+describe('xssInjectionClass', () => {
+  it('reports the xss finding category', () => {
+    expect(xssInjectionClass.category).toBe('xss');
+  });
+
+  it('enumerates one injection point per query parameter behind the interface', () => {
+    const points = xssInjectionClass.enumerate(new URL('https://example.com/search?q=1&page=2'));
+
+    expect(points.map((p) => p.injectionPoint).sort()).toEqual(['page', 'q']);
+    expect(points[0]?.payload).not.toEqual(points[1]?.payload);
+  });
+
+  it('confirms execution through the browser and captures a screenshot for a reflected canary', async () => {
+    const origin = await fixture((q) => `<html><body>${q}</body></html>`);
+    const [point] = xssInjectionClass.enumerate(new URL(`${origin}/?q=test`));
+
+    const result = await xssInjectionClass.confirm(point!);
+
+    expect(result.outcome).toBe('confirmed');
+    expect(result.screenshot?.length).toBeGreaterThan(0);
   }, 30_000);
 });

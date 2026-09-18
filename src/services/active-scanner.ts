@@ -194,3 +194,26 @@ function errorMessage(err: unknown): string {
 // The scanner injects this at its boundary so every test but the real-browser
 // fixture can drive confirmation outcomes without launching Chromium.
 export type XssConfirmImpl = (url: string, payload: string) => Promise<XssAttemptResult>;
+
+// The strategy seam every injection class plugs into: it names its finding
+// category, enumerates a target's injection points, and confirms one point.
+// XSS is its first implementation; SSTI/SQLi/LFI follow behind the same shape.
+export interface InjectionClass {
+  readonly category: string;
+  enumerate(target: URL): InjectionPoint[];
+  confirm(point: InjectionPoint): Promise<XssAttemptResult>;
+}
+
+// Reflected-XSS as an InjectionClass: enumeration and browser confirmation are
+// the existing functions, unchanged, reached through the interface. `confirm`
+// accepts an injected confirmer so the scanner can still mock it at its boundary.
+export function makeXssInjectionClass(confirmImpl: XssConfirmImpl = confirmXss): InjectionClass {
+  return {
+    category: 'xss',
+    enumerate: enumerateInjectionPoints,
+    confirm: (point) => confirmImpl(point.url, point.payload),
+  };
+}
+
+// The default XSS class, backed by the real browser confirmer.
+export const xssInjectionClass: InjectionClass = makeXssInjectionClass();
