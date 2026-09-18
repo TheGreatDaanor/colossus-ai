@@ -1,7 +1,7 @@
 ---
 id: 028
 title: Run all four injection classes per active target under split concurrency
-status: open
+status: done
 type: afk
 blocked-by: [023, 025, 026, 027]
 ---
