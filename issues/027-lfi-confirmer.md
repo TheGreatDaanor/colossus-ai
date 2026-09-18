@@ -1,7 +1,7 @@
 ---
 id: 027
 title: Confirm local file inclusion via an /etc/passwd signature oracle
-status: open
+status: done
 type: afk
 blocked-by: [023, 024]
 ---

@@ -4,6 +4,7 @@ import { afterAll, describe, expect, it } from 'vitest';
 import {
   confirmXss,
   generateCanaryPayload,
+  makeLfiInjectionClass,
   makeSqliInjectionClass,
   makeSstiInjectionClass,
   xssInjectionClass,
@@ -232,6 +233,62 @@ describe('sqliInjectionClass', () => {
     const [point] = sqli.enumerate(new URL(`${origin}/?q=seed`));
 
     const result = await sqli.confirm(point!);
+
+    expect(result.outcome).toBe('not_vulnerable');
+  });
+});
+
+describe('lfiInjectionClass', () => {
+  const fetchText = async (url: string): Promise<string> => (await fetch(url)).text();
+  const PASSWD = 'root:x:0:0:root:/root:/bin/bash\ndaemon:x:1:1:daemon:/usr/sbin:/usr/sbin/nologin';
+
+  it('reports the lfi finding category', () => {
+    expect(makeLfiInjectionClass(fetchText).category).toBe('lfi');
+  });
+
+  it('enumerates one injection point per query parameter', () => {
+    const points = makeLfiInjectionClass(fetchText).enumerate(
+      new URL('https://example.com/p?a=1&b=2'),
+    );
+
+    expect(points.map((p) => p.injectionPoint).sort()).toEqual(['a', 'b']);
+  });
+
+  it('confirms and captures the passwd line when the traversal payload returns /etc/passwd', async () => {
+    // A vulnerable file-inclusion endpoint: the traversal payload resolves to the
+    // real file and its contents are served; a neutral value returns a clean page.
+    const origin = await fixture((q) =>
+      q.includes('etc/passwd')
+        ? PASSWD
+        : `<html><body>results for ${q}</body></html>`,
+    );
+    const lfi = makeLfiInjectionClass(fetchText);
+    const [point] = lfi.enumerate(new URL(`${origin}/?q=seed`));
+
+    const result = await lfi.confirm(point!);
+
+    expect(result.outcome).toBe('confirmed');
+    expect(result.evidenceSnippet).toContain('root:x:0:0:');
+  });
+
+  it('reports not_vulnerable when the passwd signature is already in the baseline', async () => {
+    // The signature is present regardless of the payload, so the differential fails.
+    const origin = await fixture(() => PASSWD);
+    const lfi = makeLfiInjectionClass(fetchText);
+    const [point] = lfi.enumerate(new URL(`${origin}/?q=seed`));
+
+    const result = await lfi.confirm(point!);
+
+    expect(result.outcome).toBe('not_vulnerable');
+    expect(result.evidenceSnippet).toBeUndefined();
+  });
+
+  it('reports not_vulnerable when the payload is echoed without file contents', async () => {
+    const origin = await fixture((q) => `<html><body>results for ${q}</body></html>`);
+    const lfi = makeLfiInjectionClass(fetchText);
+    const [point] = lfi.enumerate(new URL(`${origin}/?q=seed`));
+
+    const result = await lfi.confirm(point!);
 
     expect(result.outcome).toBe('not_vulnerable');
   });

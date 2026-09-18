@@ -405,3 +405,72 @@ export function makeSqliInjectionClass(fetchImpl: BodyFetchImpl = guardedFetchTe
 
 // The default SQLi class, backed by the SSRF-guarded content fetcher.
 export const sqliInjectionClass: InjectionClass = makeSqliInjectionClass();
+
+// A path-traversal payload aimed at a file whose contents are stable across Unix
+// systems. Enough `../` to climb out of any plausible include directory; the depth
+// is harmless when it overshoots, since a leading-slash-normalised path still lands
+// on the filesystem root.
+const LFI_PAYLOAD = '../../../../etc/passwd';
+
+// The `/etc/passwd` signature: the root account's entry, uid and gid zero. A line
+// this shaped doesn't appear on a page by accident, and its presence proves the
+// traversal resolved to the real file rather than being echoed as a string.
+const PASSWD_SIGNATURE = /root:.*:0:0:/;
+
+// The first line of the body carrying the passwd signature, so the finding's evidence
+// quotes the line that proved the inclusion rather than the whole file.
+function matchedPasswdLine(body: string): string | null {
+  for (const line of body.split(/\r?\n/)) {
+    if (PASSWD_SIGNATURE.test(line)) return line.trim();
+  }
+  return null;
+}
+
+// A baseline URL for the same point with a neutral, non-traversing value, so passwd-like
+// content the page emits regardless of our payload (already present in the baseline)
+// doesn't read as a confirmation.
+function lfiBaselineUrlFor(point: InjectionPoint): string {
+  const url = new URL(point.url);
+  url.searchParams.set(point.injectionPoint, 'colossus_lfi_baseline');
+  return url.toString();
+}
+
+// Local file inclusion as an InjectionClass: enumeration mutates each query param with a
+// path-traversal payload toward `/etc/passwd`; confirmation fetches the injected and a
+// baseline response and confirms iff the passwd signature appears in the injected body
+// and was absent from the baseline. A page that echoes the payload or 404s (no signature)
+// is `not_vulnerable`; a page that shows the signature unconditionally is `not_vulnerable`;
+// a fetch that fails is `unavailable`.
+export function makeLfiInjectionClass(fetchImpl: BodyFetchImpl = guardedFetchText): InjectionClass {
+  return {
+    category: 'lfi',
+    enumerate: (target) => enumerateInjectionPoints(target, () => LFI_PAYLOAD),
+    confirm: async (point) => {
+      let injectedBody: string;
+      try {
+        injectedBody = await fetchImpl(point.url);
+      } catch (err) {
+        return { outcome: 'unavailable', error: `injection fetch failed: ${errorMessage(err)}` };
+      }
+
+      const passwdLine = matchedPasswdLine(injectedBody);
+      if (passwdLine === null) return { outcome: 'not_vulnerable' };
+
+      // The signature is present, but only the traversal proves it: if the baseline shows
+      // it too, the page emits it unconditionally. A baseline we can't fetch can't clear
+      // that doubt, so we can't confirm.
+      let baselineBody: string;
+      try {
+        baselineBody = await fetchImpl(lfiBaselineUrlFor(point));
+      } catch (err) {
+        return { outcome: 'unavailable', error: `baseline fetch failed: ${errorMessage(err)}` };
+      }
+      if (matchedPasswdLine(baselineBody) !== null) return { outcome: 'not_vulnerable' };
+
+      return { outcome: 'confirmed', evidenceSnippet: passwdLine };
+    },
+  };
+}
+
+// The default LFI class, backed by the SSRF-guarded content fetcher.
+export const lfiInjectionClass: InjectionClass = makeLfiInjectionClass();
