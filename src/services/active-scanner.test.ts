@@ -1,7 +1,12 @@
 import { createServer, type Server } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { afterAll, describe, expect, it } from 'vitest';
-import { confirmXss, generateCanaryPayload, xssInjectionClass } from './active-scanner.js';
+import {
+  confirmXss,
+  generateCanaryPayload,
+  makeSstiInjectionClass,
+  xssInjectionClass,
+} from './active-scanner.js';
 
 // A real loopback server, not `page.route()` — 012 uses that hook as production
 // behaviour, and a test that owns it too would fight the code under test.
@@ -123,4 +128,53 @@ describe('xssInjectionClass', () => {
     expect(result.outcome).toBe('confirmed');
     expect(result.screenshot?.length).toBeGreaterThan(0);
   }, 30_000);
+});
+
+describe('sstiInjectionClass', () => {
+  // A plain (unguarded) fetch: the SSTI class fetches through an injected fetch so
+  // loopback fixtures aren't rejected by the SSRF guard the real default enforces.
+  const fetchText = async (url: string): Promise<string> => (await fetch(url)).text();
+
+  it('reports the ssti finding category', () => {
+    expect(makeSstiInjectionClass(fetchText).category).toBe('ssti');
+  });
+
+  it('enumerates one injection point per query parameter with distinct payloads', () => {
+    const points = makeSstiInjectionClass(fetchText).enumerate(
+      new URL('https://example.com/p?a=1&b=2'),
+    );
+
+    expect(points.map((p) => p.injectionPoint).sort()).toEqual(['a', 'b']);
+    expect(points[0]?.payload).not.toEqual(points[1]?.payload);
+  });
+
+  it('confirms and captures the product as evidence when the engine evaluates the expression', async () => {
+    // A vulnerable engine: it evaluates any `<int>*<int>` in the param and reflects
+    // the product instead of the literal expression.
+    const origin = await fixture((q) => {
+      const m = /(\d+)\*(\d+)/.exec(q);
+      const body = m ? String(Number(m[1]) * Number(m[2])) : q;
+      return `<html><body>result: ${body}</body></html>`;
+    });
+    const ssti = makeSstiInjectionClass(fetchText);
+    const [point] = ssti.enumerate(new URL(`${origin}/?q=seed`));
+
+    const result = await ssti.confirm(point!);
+
+    const m = /(\d+)\*(\d+)/.exec(point!.payload)!;
+    const product = String(Number(m[1]) * Number(m[2]));
+    expect(result.outcome).toBe('confirmed');
+    expect(result.evidenceSnippet).toContain(product);
+  });
+
+  it('reports not_vulnerable when the target echoes the literal expression unchanged', async () => {
+    const origin = await fixture((q) => `<html><body>result: ${q}</body></html>`);
+    const ssti = makeSstiInjectionClass(fetchText);
+    const [point] = ssti.enumerate(new URL(`${origin}/?q=seed`));
+
+    const result = await ssti.confirm(point!);
+
+    expect(result.outcome).toBe('not_vulnerable');
+    expect(result.evidenceSnippet).toBeUndefined();
+  });
 });

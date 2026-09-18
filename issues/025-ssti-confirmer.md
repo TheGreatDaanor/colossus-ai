@@ -1,7 +1,7 @@
 ---
 id: 025
 title: Confirm server-side template injection via an arithmetic oracle
-status: open
+status: done
 type: afk
 blocked-by: [023, 024]
 ---

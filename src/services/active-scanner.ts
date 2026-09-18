@@ -24,10 +24,13 @@ export function generateCanaryPayload(): string {
 // with that parameter's value replaced by a fresh canary payload. A URL with no
 // query parameters yields no injection points (not an error). Order follows the
 // query string so attempts are stable and inspectable.
-export function enumerateInjectionPoints(targetUrl: URL): InjectionPoint[] {
+export function enumerateInjectionPoints(
+  targetUrl: URL,
+  makePayload: () => string = generateCanaryPayload,
+): InjectionPoint[] {
   const points: InjectionPoint[] = [];
   for (const injectionPoint of new Set(targetUrl.searchParams.keys())) {
-    const payload = generateCanaryPayload();
+    const payload = makePayload();
     const mutated = new URL(targetUrl);
     mutated.searchParams.set(injectionPoint, payload);
     points.push({ injectionPoint, payload, url: mutated.toString() });
@@ -41,7 +44,14 @@ export function enumerateInjectionPoints(targetUrl: URL): InjectionPoint[] {
 export type XssOutcome = 'confirmed' | 'not_vulnerable' | 'unavailable';
 // `screenshot` is captured only on a `confirmed` outcome — proof the marker executed
 // in a real browser. The scanner writes it to disk under the confirmed finding's id.
-export type XssAttemptResult = { outcome: XssOutcome; error?: string; screenshot?: Buffer };
+export type XssAttemptResult = {
+  outcome: XssOutcome;
+  error?: string;
+  screenshot?: Buffer;
+  // Oracle-confirmed non-XSS classes prove themselves with a response substring
+  // rather than a screenshot; this carries it to the finding's `evidence_snippet`.
+  evidenceSnippet?: string;
+};
 
 // Writes a confirmation screenshot to data/evidence/<scanId>/<findingId>.png and
 // returns that relative path. The file is named after the finding id (a value this
@@ -217,3 +227,103 @@ export function makeXssInjectionClass(confirmImpl: XssConfirmImpl = confirmXss):
 
 // The default XSS class, backed by the real browser confirmer.
 export const xssInjectionClass: InjectionClass = makeXssInjectionClass();
+
+// Fetches a URL's body text. The SSTI class confirms by content, not by browser,
+// so it fetches through this seam — the scanner injects its SSRF-guarded fetch, and
+// `guardedFetchText` is the default for standalone use.
+export type BodyFetchImpl = (url: string) => Promise<string>;
+
+// Produces a fresh arithmetic-oracle payload: two random factors wrapped in the two
+// most common template delimiters (`${...}` for JSP/EL/Freemarker, `{{...}}` for
+// Jinja/Twig/Handlebars), so one attempt reaches several engines. Factors are 4-digit
+// so their product is 7-8 digits — long enough not to appear on a page by accident,
+// which the baseline fetch double-checks. The literal `a*b` expression is recoverable
+// from the payload, so confirmation needs nothing stored alongside it.
+export function generateSstiPayload(): string {
+  const factor = (): number => 1000 + Math.floor(Math.random() * 9000);
+  const a = factor();
+  const b = factor();
+  return `\${${a}*${b}}{{${a}*${b}}}`;
+}
+
+// Recovers the two factors from a payload generated above, or null if the string
+// carries no `<int>*<int>` expression (so a hand-built or malformed point is
+// `unavailable`, never silently confirmed).
+function factorsOf(payload: string): { literal: string; product: string } | null {
+  const match = /(\d+)\*(\d+)/.exec(payload);
+  if (match === null) return null;
+  return { literal: `${match[1]}*${match[2]}`, product: String(Number(match[1]) * Number(match[2])) };
+}
+
+// The confirmed product plus a little surrounding context, so the finding's evidence
+// shows where in the response the evaluated value landed rather than a bare number.
+function snippetAround(body: string, needle: string, context = 40): string {
+  const at = body.indexOf(needle);
+  if (at === -1) return needle;
+  return body.slice(Math.max(0, at - context), at + needle.length + context);
+}
+
+// A baseline URL for the same point with the parameter set to a neutral, non-arithmetic
+// value: fetching it tells us whether the product already appears on the page for
+// reasons unrelated to our injection, which would otherwise be a false positive.
+function baselineUrlFor(point: InjectionPoint): string {
+  const url = new URL(point.url);
+  url.searchParams.set(point.injectionPoint, 'colossus_ssti_baseline');
+  return url.toString();
+}
+
+// Resolves the host and refuses a disallowed (private/loopback/link-local/metadata)
+// address before fetching, so the SSTI confirmer can't be pointed at internal
+// infrastructure. The scanner injects its own already-guarded fetch instead; this is
+// the default for standalone use.
+async function guardedFetchText(url: string): Promise<string> {
+  const disallowed = await findDisallowedAddress(new URL(url).hostname);
+  if (disallowed !== null) throw new Error(`fetch to a disallowed address (${disallowed}) was blocked`);
+  const response = await fetch(url, { redirect: 'manual' });
+  return await response.text();
+}
+
+// Server-side template injection as an InjectionClass: enumeration mutates each query
+// param with a fresh arithmetic payload; confirmation fetches the injected and a
+// baseline response and confirms iff the engine *evaluated* the expression — the
+// product appears in the injected body, the literal `a*b` does not, and the product
+// was not already present in the baseline. A page that echoes the literal expression
+// unchanged is `not_vulnerable`; a fetch that fails is `unavailable`.
+export function makeSstiInjectionClass(fetchImpl: BodyFetchImpl = guardedFetchText): InjectionClass {
+  return {
+    category: 'ssti',
+    enumerate: (target) => enumerateInjectionPoints(target, generateSstiPayload),
+    confirm: async (point) => {
+      const factors = factorsOf(point.payload);
+      if (factors === null) return { outcome: 'unavailable', error: 'payload carries no arithmetic expression' };
+
+      let injectedBody: string;
+      try {
+        injectedBody = await fetchImpl(point.url);
+      } catch (err) {
+        return { outcome: 'unavailable', error: `injection fetch failed: ${errorMessage(err)}` };
+      }
+
+      // The engine echoed our expression verbatim, or never produced the product:
+      // reflected but not evaluated.
+      if (injectedBody.includes(factors.literal)) return { outcome: 'not_vulnerable' };
+      if (!injectedBody.includes(factors.product)) return { outcome: 'not_vulnerable' };
+
+      // The product is in the injected body and the expression isn't — evaluated, unless
+      // the number was already on the page for unrelated reasons. A baseline we can't
+      // fetch can't clear that doubt, so we can't confirm.
+      let baselineBody: string;
+      try {
+        baselineBody = await fetchImpl(baselineUrlFor(point));
+      } catch (err) {
+        return { outcome: 'unavailable', error: `baseline fetch failed: ${errorMessage(err)}` };
+      }
+      if (baselineBody.includes(factors.product)) return { outcome: 'not_vulnerable' };
+
+      return { outcome: 'confirmed', evidenceSnippet: snippetAround(injectedBody, factors.product) };
+    },
+  };
+}
+
+// The default SSTI class, backed by the SSRF-guarded content fetcher.
+export const sstiInjectionClass: InjectionClass = makeSstiInjectionClass();
