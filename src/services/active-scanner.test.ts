@@ -4,6 +4,7 @@ import { afterAll, describe, expect, it } from 'vitest';
 import {
   confirmXss,
   generateCanaryPayload,
+  makeSqliInjectionClass,
   makeSstiInjectionClass,
   xssInjectionClass,
 } from './active-scanner.js';
@@ -176,5 +177,62 @@ describe('sstiInjectionClass', () => {
 
     expect(result.outcome).toBe('not_vulnerable');
     expect(result.evidenceSnippet).toBeUndefined();
+  });
+});
+
+describe('sqliInjectionClass', () => {
+  const fetchText = async (url: string): Promise<string> => (await fetch(url)).text();
+
+  it('reports the sqli finding category', () => {
+    expect(makeSqliInjectionClass(fetchText).category).toBe('sqli');
+  });
+
+  it('enumerates one injection point per query parameter', () => {
+    const points = makeSqliInjectionClass(fetchText).enumerate(
+      new URL('https://example.com/p?a=1&b=2'),
+    );
+
+    expect(points.map((p) => p.injectionPoint).sort()).toEqual(['a', 'b']);
+  });
+
+  it('confirms and captures the error line when the injected token provokes a DB error', async () => {
+    // A vulnerable backend: the syntax-breaking quote reaches the DB and the raw
+    // error is reflected on the page; a neutral value returns a clean page.
+    const origin = await fixture((q) =>
+      q.includes("'")
+        ? `<html><body>You have an error in your SQL syntax near "'"</body></html>`
+        : `<html><body>results for ${q}</body></html>`,
+    );
+    const sqli = makeSqliInjectionClass(fetchText);
+    const [point] = sqli.enumerate(new URL(`${origin}/?q=seed`));
+
+    const result = await sqli.confirm(point!);
+
+    expect(result.outcome).toBe('confirmed');
+    expect(result.evidenceSnippet).toContain('SQL syntax');
+  });
+
+  it('reports not_vulnerable when the DB error signature is already in the baseline', async () => {
+    // The signature is present regardless of the token, so the differential fails.
+    const origin = await fixture(
+      () => `<html><body>You have an error in your SQL syntax near "x"</body></html>`,
+    );
+    const sqli = makeSqliInjectionClass(fetchText);
+    const [point] = sqli.enumerate(new URL(`${origin}/?q=seed`));
+
+    const result = await sqli.confirm(point!);
+
+    expect(result.outcome).toBe('not_vulnerable');
+    expect(result.evidenceSnippet).toBeUndefined();
+  });
+
+  it('reports not_vulnerable when no DB error signature appears', async () => {
+    const origin = await fixture((q) => `<html><body>results for ${q}</body></html>`);
+    const sqli = makeSqliInjectionClass(fetchText);
+    const [point] = sqli.enumerate(new URL(`${origin}/?q=seed`));
+
+    const result = await sqli.confirm(point!);
+
+    expect(result.outcome).toBe('not_vulnerable');
   });
 });

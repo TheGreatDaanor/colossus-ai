@@ -1,7 +1,7 @@
 ---
 id: 026
 title: Confirm error-based SQL injection via a DB-error-signature oracle
-status: open
+status: done
 type: afk
 blocked-by: [023, 024]
 ---

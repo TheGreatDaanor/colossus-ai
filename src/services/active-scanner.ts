@@ -327,3 +327,81 @@ export function makeSstiInjectionClass(fetchImpl: BodyFetchImpl = guardedFetchTe
 
 // The default SSTI class, backed by the SSRF-guarded content fetcher.
 export const sstiInjectionClass: InjectionClass = makeSstiInjectionClass();
+
+// A single unbalanced quote: the smallest token that breaks the syntax of a naively
+// concatenated SQL string, provoking the backend's own error page when the value
+// reaches the database unescaped.
+const SQLI_TOKEN = "'";
+
+// Known database error signatures, one per common engine. A match proves the token
+// reached the SQL parser rather than being escaped or rejected upstream; the
+// differential against the baseline rules out signatures a page shows unconditionally.
+const SQL_ERROR_SIGNATURES: RegExp[] = [
+  /You have an error in your SQL syntax/i, // MySQL / MariaDB
+  /SQL syntax.*MySQL/i,
+  /ORA-\d{5}/, // Oracle
+  /PG::\w*Error/, // PostgreSQL (Rails/pg)
+  /PostgreSQL.*ERROR/i,
+  /SQLITE_ERROR/, // SQLite
+  /unrecognized token/i, // SQLite parser
+  /SqlException/, // .NET / SQL Server
+  /Unclosed quotation mark after the character string/i, // SQL Server
+  /Microsoft OLE DB Provider for (?:ODBC|SQL Server)/i,
+];
+
+// The first line of the injected body that carries a DB error signature, so the finding's
+// evidence quotes the message that proved the injection rather than the whole page.
+function matchedErrorLine(body: string): string | null {
+  for (const line of body.split(/\r?\n/)) {
+    if (SQL_ERROR_SIGNATURES.some((sig) => sig.test(line))) return line.trim();
+  }
+  return null;
+}
+
+// A baseline URL for the same point with a neutral, non-breaking value, so a DB error
+// the page emits regardless of our token (already present in the baseline) doesn't read
+// as a confirmation.
+function sqliBaselineUrlFor(point: InjectionPoint): string {
+  const url = new URL(point.url);
+  url.searchParams.set(point.injectionPoint, 'colossus_sqli_baseline');
+  return url.toString();
+}
+
+// Error-based SQL injection as an InjectionClass: enumeration puts a single unbalanced
+// quote in each query param; confirmation fetches the injected and a baseline response
+// and confirms iff a known DB error signature appears in the injected body and was absent
+// from the baseline. A page with no signature — or one that shows it unconditionally — is
+// `not_vulnerable`; a fetch that fails is `unavailable`.
+export function makeSqliInjectionClass(fetchImpl: BodyFetchImpl = guardedFetchText): InjectionClass {
+  return {
+    category: 'sqli',
+    enumerate: (target) => enumerateInjectionPoints(target, () => SQLI_TOKEN),
+    confirm: async (point) => {
+      let injectedBody: string;
+      try {
+        injectedBody = await fetchImpl(point.url);
+      } catch (err) {
+        return { outcome: 'unavailable', error: `injection fetch failed: ${errorMessage(err)}` };
+      }
+
+      const errorLine = matchedErrorLine(injectedBody);
+      if (errorLine === null) return { outcome: 'not_vulnerable' };
+
+      // A signature is present, but only an injection proves it: if the baseline shows
+      // one too, the page emits it unconditionally. A baseline we can't fetch can't
+      // clear that doubt, so we can't confirm.
+      let baselineBody: string;
+      try {
+        baselineBody = await fetchImpl(sqliBaselineUrlFor(point));
+      } catch (err) {
+        return { outcome: 'unavailable', error: `baseline fetch failed: ${errorMessage(err)}` };
+      }
+      if (matchedErrorLine(baselineBody) !== null) return { outcome: 'not_vulnerable' };
+
+      return { outcome: 'confirmed', evidenceSnippet: errorLine };
+    },
+  };
+}
+
+// The default SQLi class, backed by the SSRF-guarded content fetcher.
+export const sqliInjectionClass: InjectionClass = makeSqliInjectionClass();
