@@ -43,6 +43,13 @@
       "when": 1789656029365,
       "tag": "0005_wealthy_echo",
       "breakpoints": true
+    },
+    {
+      "idx": 6,
+      "version": "6",
+      "when": 1789739902626,
+      "tag": "0006_same_earthquake",
+      "breakpoints": true
     }
   ]
 }

@@ -1,7 +1,7 @@
 ---
 id: 024
 title: Add SSTI/SQLi/LFI finding categories and an evidence_snippet column
-status: open
+status: done
 type: afk
 blocked-by: []
 ---

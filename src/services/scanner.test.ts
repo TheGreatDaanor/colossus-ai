@@ -3,7 +3,7 @@ import type { AddressInfo } from 'node:net';
 import { readFile, rm } from 'node:fs/promises';
 import { afterAll, describe, expect, it, vi } from 'vitest';
 import { createDb } from '../db/client.js';
-import { findings } from '../db/schema.js';
+import { findings, scans, scanTargets } from '../db/schema.js';
 import {
   ScannerService,
   ScanValidationError,
@@ -1654,5 +1654,36 @@ describe('ScannerService robots.txt bounds', () => {
     });
 
     expect(completed.targets.map((t) => t.url).sort()).toEqual(['https://example.com/', 'https://example.com/ok']);
+  });
+});
+
+describe('ScannerService oracle-confirmed finding storage', () => {
+  it('round-trips an ssti finding with a non-null evidence_snippet through getScan', async () => {
+    const db = createDb(':memory:');
+    const svc = new ScannerService(db);
+
+    const scan = db
+      .insert(scans)
+      .values({ name: 'x', status: 'completed', urls: ['https://example.com'], createdAt: new Date() })
+      .returning({ id: scans.id })
+      .get();
+    const target = db
+      .insert(scanTargets)
+      .values({ scanId: scan.id, url: 'https://example.com/?q=1', status: 'ok' })
+      .returning({ id: scanTargets.id })
+      .get();
+    db.insert(findings)
+      .values({
+        scanTargetId: target.id,
+        category: 'ssti',
+        severity: 'high',
+        confidence: 'definitive',
+        evidenceSnippet: '49',
+      })
+      .run();
+
+    const finding = (await svc.getScan(scan.id))?.targets[0]?.findings.find((f) => f.category === 'ssti');
+    expect(finding).toBeDefined();
+    expect(finding?.evidenceSnippet).toBe('49');
   });
 });
