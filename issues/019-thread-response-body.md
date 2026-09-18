@@ -1,7 +1,7 @@
 ---
 id: 019
 title: Thread the response body through the passive pipeline, in memory only
-status: open
+status: done
 type: afk
 blocked-by: [017]
 ---
@@ -58,10 +58,10 @@ The parser dependency therefore lands here, in [[019]], rather than in
 
 ## Definition of done
 
-- [ ] Failing test written first, confirmed red
-- [ ] Implementation makes it green
-- [ ] `test`, `typecheck`, `lint` all pass
-- [ ] Visible at: a test asserts the body reaches the detector boundary, that
+- [x] Failing test written first, confirmed red
+- [x] Implementation makes it green
+- [x] `test`, `typecheck`, `lint` all pass
+- [x] Visible at: a test asserts the body reaches the detector boundary, that
       an oversized body is truncated, and that a mid-stream failure leaves
       header findings intact.
 

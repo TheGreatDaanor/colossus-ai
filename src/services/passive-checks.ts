@@ -1,4 +1,16 @@
+import { load, type CheerioAPI } from 'cheerio';
 import type { FindingConfidence, FindingSeverity } from '../db/schema.js';
+
+// The detector boundary carries a parsed document rather than a raw string: three
+// consumers (body-derived checks, the generator-tag banner path, link discovery)
+// each want selectors over the same up-to-2 MB, hostile body, and re-parsing it
+// per consumer is pure waste. `url` travels with it because resolving a relative
+// `action`/`src` needs the page it came from.
+export type PageDocument = { $: CheerioAPI; url: URL };
+
+export function parsePageDocument(html: string, url: URL): PageDocument {
+  return { $: load(html), url };
+}
 
 export type HeaderFinding = {
   category: string;
@@ -223,7 +235,95 @@ function detectDisclosureFindings(headers: Record<string, string>): HeaderFindin
   return result;
 }
 
-export function detectHeaderFindings(headers: Record<string, string>, setCookies: string[] = []): HeaderFinding[] {
+// Body-derived checks read the markup only: nothing here follows or fetches a
+// referenced subresource, and no JavaScript is executed, so a defect inserted at
+// runtime is invisible to them by design.
+function detectBodyFindings(doc: PageDocument): HeaderFinding[] {
+  const result: HeaderFinding[] = [];
+  const { $, url } = doc;
+
+  // Only meaningful on an https page: an http page referencing http is not "mixed".
+  if (url.protocol === 'https:') {
+    const insecure = $('script[src], link[href], iframe[src]')
+      .toArray()
+      .map((el) => $(el).attr('src') ?? $(el).attr('href') ?? '')
+      .filter((ref) => /^http:\/\//i.test(ref));
+
+    if (insecure.length > 0) {
+      result.push({
+        category: 'mixed-content',
+        severity: 'medium',
+        confidence: 'definitive',
+        explanation: `The page is served over HTTPS but references ${insecure.length} subresource(s) over plaintext HTTP, e.g. "${insecure[0]}".`,
+      });
+    }
+  }
+
+  // A form's action is resolved against the page URL first: a relative action on an
+  // http page submits over plaintext just as surely as an absolute http:// one, and
+  // a form with no action at all submits back to the page itself.
+  const insecureActions = $('form')
+    .toArray()
+    .map((el) => {
+      const action = $(el).attr('action');
+      try {
+        return new URL(action === undefined || action === '' ? url.href : action, url);
+      } catch {
+        return null;
+      }
+    })
+    .filter((resolved): resolved is URL => resolved !== null && resolved.protocol === 'http:');
+
+  if (insecureActions.length > 0) {
+    result.push({
+      category: 'insecure-form-action',
+      severity: 'high',
+      confidence: 'definitive',
+      explanation: `A form submits to "${insecureActions[0]?.href}" over plaintext HTTP, exposing whatever is typed into it.`,
+    });
+  }
+
+  // `possible`, not `definitive`: the field is definitely unannotated, but whether
+  // that matters depends on the form — hence the low severity too. Only the two
+  // password-manager-aware values count; `off` is not a substitute, browsers
+  // increasingly ignore it.
+  const unannotatedPasswords = $('input')
+    .toArray()
+    .filter((el) => ($(el).attr('type') ?? '').trim().toLowerCase() === 'password')
+    .filter((el) => !['current-password', 'new-password'].includes(($(el).attr('autocomplete') ?? '').trim().toLowerCase()));
+
+  if (unannotatedPasswords.length > 0) {
+    result.push({
+      category: 'password-field-autocomplete',
+      severity: 'low',
+      confidence: 'possible',
+      explanation: `${unannotatedPasswords.length} password field(s) set no autocomplete="current-password"/"new-password", leaving the browser to guess how to handle them.`,
+    });
+  }
+
+  // The autoindex pages of Apache, nginx, IIS and lighttpd all announce themselves
+  // in the title or the first heading ("Index of /path", "Directory listing for /").
+  // Matching that, rather than the link shapes in the body, is what keeps an
+  // ordinary page that happens to link to a directory out of the results — hence
+  // `possible`: a hand-written page is free to carry the same title.
+  const listingText = [$('title').first().text(), $('h1').first().text()].join(' ');
+  if (/\b(index of|directory listing (for|of))\s*\//i.test(listingText)) {
+    result.push({
+      category: 'directory-listing',
+      severity: 'medium',
+      confidence: 'possible',
+      explanation: 'The response looks like an automatically generated directory listing, which exposes file names the server was not asked to publish.',
+    });
+  }
+
+  return result;
+}
+
+export function detectHeaderFindings(
+  headers: Record<string, string>,
+  setCookies: string[] = [],
+  doc: PageDocument | null = null,
+): HeaderFinding[] {
   const result: HeaderFinding[] = MISSING_HEADER_FINDINGS.filter(({ header }) => !(header in headers)).map(
     ({ category, severity }) => ({ category, severity, confidence: 'definitive' }),
   );
@@ -233,6 +333,7 @@ export function detectHeaderFindings(headers: Record<string, string>, setCookies
   result.push(...detectHstsFindings(headers));
   result.push(...detectCorsFindings(headers));
   result.push(...detectDisclosureFindings(headers));
+  if (doc !== null) result.push(...detectBodyFindings(doc));
 
   return result;
 }
@@ -271,9 +372,26 @@ export type VersionBanner = { software: string; version: string };
 const BANNER_HEADER_NAMES = ['server', 'x-powered-by'];
 const BANNER_PATTERN = /([A-Za-z][\w.-]*)\/(\d[\w.-]*)/;
 
+// A generator tag writes its version with a space, not a slash ("WordPress 6.4.1"),
+// so BANNER_PATTERN alone would miss it. It deliberately produces a banner rather
+// than a finding of its own: the version then flows through the one existing OSV
+// correlation path and surfaces as `known-vulnerability`, instead of opening a
+// second, parallel CVE pathway.
+const GENERATOR_PATTERN = /^([A-Za-z][\w.-]*(?:\s[A-Za-z][\w.-]*)*?)[\s/]v?(\d[\w.-]*)/;
+
+function generatorBanner(doc: PageDocument): VersionBanner | null {
+  const content = doc.$('meta[name="generator"]').first().attr('content')?.trim();
+  if (content === undefined) return null;
+
+  const match = GENERATOR_PATTERN.exec(content);
+  if (match?.[1] === undefined || match[2] === undefined) return null;
+  return { software: match[1], version: match[2] };
+}
+
 export function extractVersionBanner(
   headers: Record<string, string>,
   robotsBody: string | null,
+  doc: PageDocument | null = null,
 ): VersionBanner | null {
   for (const headerName of BANNER_HEADER_NAMES) {
     const value = headers[headerName];
@@ -282,6 +400,13 @@ export function extractVersionBanner(
     if (match?.[1] !== undefined && match[2] !== undefined) {
       return { software: match[1], version: match[2] };
     }
+  }
+
+  // The page's own generator tag outranks a robots.txt comment: it is emitted by
+  // the software itself, where a robots.txt banner is often a stale copied template.
+  if (doc !== null) {
+    const banner = generatorBanner(doc);
+    if (banner !== null) return banner;
   }
 
   if (robotsBody !== null) {

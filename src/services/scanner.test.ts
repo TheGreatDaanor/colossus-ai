@@ -1526,3 +1526,83 @@ describe('ScannerService active-mode XSS confirmation (real browser)', () => {
     expect(target?.injectionAttempts?.[0]?.outcome).toBe('not_vulnerable');
   }, 40_000);
 });
+
+describe('ScannerService body-derived passive checks', () => {
+  const HTML_HEADERS = { ...FULLY_HARDENED_HEADERS, 'content-type': 'text/html; charset=utf-8' };
+
+  function htmlResponse(html: string, headers: Record<string, string> = HTML_HEADERS): Response {
+    return new Response(html, { status: 200, headers });
+  }
+
+  async function scanOne(
+    fetchImpl: FetchImpl,
+    options: Partial<{ osvCheckImpl: OsvCheckImpl }> = {},
+    timeout = 5000,
+  ) {
+    const svc = new ScannerService(createDb(':memory:'), {
+      fetchImpl,
+      tlsCheckImpl: okTlsCheckImpl(),
+      ...options,
+    });
+    const scan = await svc.startScan(['https://example.com/']);
+
+    const completed = await vi.waitFor(async () => {
+      const s = await svc.getScan(scan.id);
+      if (!s || s.status !== 'completed') throw new Error('not yet completed');
+      return s;
+    }, { timeout });
+    return completed.targets.find((t) => t.url === 'https://example.com/');
+  }
+
+  it('turns each defect in a fetched HTML page into exactly one finding', async () => {
+    const page = `<html><head><title>Index of /files</title></head><body>
+      <script src="http://cdn.example.com/a.js"></script>
+      <form action="http://example.com/login"><input type="password" name="pw"></form>
+      </body></html>`;
+    const target = await scanOne(vi.fn(async () => htmlResponse(page)));
+
+    expect(target?.findings.map((f) => f.category).sort()).toEqual([
+      'directory-listing',
+      'insecure-form-action',
+      'mixed-content',
+      'password-field-autocomplete',
+    ]);
+  });
+
+  it('routes a generator-tag version into the existing OSV correlation', async () => {
+    const osvCheckImpl: OsvCheckImpl = vi.fn(async () => ({ cveId: 'CVE-2024-31210' }));
+    const target = await scanOne(
+      vi.fn(async () => htmlResponse('<meta name="generator" content="WordPress 6.4.1">')),
+      { osvCheckImpl },
+    );
+
+    expect(osvCheckImpl).toHaveBeenCalledWith({ software: 'WordPress', version: '6.4.1' });
+    expect(target?.findings.find((f) => f.category === 'known-vulnerability')?.cveId).toBe('CVE-2024-31210');
+  });
+
+  it('leaves header findings intact when the body cannot be read', async () => {
+    const stream = new ReadableStream({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode('<html><form action="http://example.com/x">'));
+        controller.error(new Error('socket hang up'));
+      },
+    });
+    const target = await scanOne(vi.fn(async () => new Response(stream, { status: 200, headers: { 'content-type': 'text/html' } })));
+
+    expect(target?.status).toBe('ok');
+    expect(target?.findings.map((f) => f.category)).toContain('missing-csp');
+  });
+
+  it('runs body checks on the first 2 MB of an oversized body and ignores the rest', async () => {
+    // Padding is one long text node, not many elements: the point is to exceed the
+    // 2 MB read bound, and a cheap-to-parse body keeps this test off the event loop
+    // long enough for the timing-sensitive concurrency test to stay honest.
+    const padding = `<div>${'x'.repeat(2_500_000)}</div>`;
+    const page = `<form action="http://example.com/login"></form>${padding}<input type="password">`;
+    const target = await scanOne(
+      vi.fn(async (url) => (String(url).endsWith('/robots.txt') ? new Response('', { status: 404 }) : htmlResponse(page))),
+    );
+
+    expect(target?.findings.map((f) => f.category)).toEqual(['insecure-form-action']);
+  });
+});

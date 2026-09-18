@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { detectHeaderFindings, detectTlsFindings, extractVersionBanner } from './passive-checks.js';
+import { detectHeaderFindings, detectTlsFindings, extractVersionBanner, parsePageDocument } from './passive-checks.js';
 
 describe('detectHeaderFindings', () => {
   it('flags a response missing all six security headers', () => {
@@ -330,5 +330,85 @@ describe('detectHeaderFindings weak-header quality checks', () => {
     for (const category of expected) {
       expect(result.filter((c) => c === category)).toHaveLength(1);
     }
+  });
+});
+
+describe('parsePageDocument', () => {
+  it('parses a body once into a document the detectors can query by selector', () => {
+    const doc = parsePageDocument('<html><body><form action="/login"></form></body></html>', new URL('https://example.com/a'));
+
+    expect(doc.$('form').attr('action')).toBe('/login');
+    expect(doc.url.toString()).toBe('https://example.com/a');
+  });
+});
+
+describe('detectHeaderFindings with a page document', () => {
+  const HARDENED: Record<string, string> = {
+    'content-security-policy': "default-src 'self'; frame-ancestors 'none'",
+    'x-frame-options': 'DENY',
+    'x-content-type-options': 'nosniff',
+    'strict-transport-security': 'max-age=63072000; includeSubDomains',
+    'referrer-policy': 'no-referrer',
+    'permissions-policy': 'geolocation=()',
+  };
+
+  function categoriesFor(html: string, url = 'https://example.com/'): string[] {
+    return detectHeaderFindings(HARDENED, [], parsePageDocument(html, new URL(url))).map((f) => f.category);
+  }
+
+  it('flags an https page that pulls a script over plaintext http', () => {
+    expect(categoriesFor('<script src="http://cdn.example.com/a.js"></script>')).toEqual(['mixed-content']);
+  });
+
+  it('flags a form whose action posts over plaintext http, including a relative action on an http page', () => {
+    expect(categoriesFor('<form action="http://example.com/login"></form>')).toEqual(['insecure-form-action']);
+    expect(categoriesFor('<form action="/login"></form>', 'http://example.com/')).toEqual(['insecure-form-action']);
+  });
+
+  it('does not flag a form posting to an https action', () => {
+    expect(categoriesFor('<form action="/login"></form>')).toEqual([]);
+  });
+
+  it('flags a password field that sets no explicit autocomplete mode', () => {
+    expect(categoriesFor('<input type="password" name="pw">')).toEqual(['password-field-autocomplete']);
+  });
+
+  it('does not flag a password field marked current-password or new-password', () => {
+    expect(categoriesFor('<input type="password" autocomplete="current-password">')).toEqual([]);
+    expect(categoriesFor('<input type="PASSWORD" autocomplete="New-Password">')).toEqual([]);
+  });
+
+  it('flags an autoindex page whose title announces it as a directory listing', () => {
+    const listing = '<html><head><title>Index of /backup</title></head><body><h1>Index of /backup</h1><pre><a href="../">../</a></pre></body></html>';
+    expect(categoriesFor(listing)).toEqual(['directory-listing']);
+  });
+
+  it('emits no category of its own for a generator meta tag', () => {
+    expect(categoriesFor('<meta name="generator" content="WordPress 6.4.1">')).toEqual([]);
+  });
+
+  it('does not flag an ordinary page that merely links to a directory', () => {
+    expect(categoriesFor('<html><head><title>Backups</title></head><body><a href="/backup/">Backups</a></body></html>')).toEqual([]);
+  });
+});
+
+describe('extractVersionBanner from a generator meta tag', () => {
+  const doc = (html: string) => parsePageDocument(html, new URL('https://example.com/'));
+
+  it('extracts a space-separated software and version from a generator meta tag', () => {
+    expect(extractVersionBanner({}, null, doc('<meta name="generator" content="WordPress 6.4.1">'))).toEqual({
+      software: 'WordPress',
+      version: '6.4.1',
+    });
+  });
+
+  it('prefers a header banner over a generator meta tag', () => {
+    expect(
+      extractVersionBanner({ server: 'nginx/1.18.0' }, null, doc('<meta name="generator" content="WordPress 6.4.1">')),
+    ).toEqual({ software: 'nginx', version: '1.18.0' });
+  });
+
+  it('ignores a generator tag that names software without a version', () => {
+    expect(extractVersionBanner({}, null, doc('<meta name="generator" content="Hugo">'))).toBeNull();
   });
 });

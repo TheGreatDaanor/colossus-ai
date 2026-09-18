@@ -8,6 +8,7 @@ import {
   detectHeaderFindings,
   detectTlsFindings,
   extractVersionBanner,
+  parsePageDocument,
   NO_TLS_FINDING,
   type HeaderFinding,
   type TlsFinding,
@@ -25,7 +26,7 @@ import {
   type InjectionAttempt,
 } from '../db/schema.js';
 
-export { detectHeaderFindings, detectTlsFindings, extractVersionBanner, NO_TLS_FINDING };
+export { detectHeaderFindings, detectTlsFindings, extractVersionBanner, parsePageDocument, NO_TLS_FINDING };
 export { isDisallowedAddress };
 export type { HeaderFinding, TlsFinding, TlsInfo, VersionBanner };
 
@@ -592,7 +593,13 @@ export class ScannerService {
         .where(eq(scanTargets.id, target.id))
         .run();
 
-      const pendingFindings: PendingFinding[] = [...detectHeaderFindings(responseHeaders, setCookies)];
+      // Parsed once, here, and shared by every consumer below (body checks, the
+      // generator-tag banner, discovery). An empty `html` means the body was not
+      // HTML, was empty, or failed mid-stream — body-derived checks are simply
+      // skipped, exactly as the TLS-check failure path degrades.
+      const doc = html === '' ? null : parsePageDocument(html, targetUrl);
+
+      const pendingFindings: PendingFinding[] = [...detectHeaderFindings(responseHeaders, setCookies, doc)];
 
       if (targetUrl.protocol === 'http:') {
         pendingFindings.push(NO_TLS_FINDING);
@@ -621,7 +628,7 @@ export class ScannerService {
       const requestBudget = new Budget(this.#maxExtraRequests);
       const robotsBody = await this.#fetchRobotsTxt(targetUrl, userAgent, requestBudget);
       pendingFindings.push(...(await this.#probeExposedFiles(targetUrl, userAgent, requestBudget)));
-      const banner = extractVersionBanner(responseHeaders, robotsBody);
+      const banner = extractVersionBanner(responseHeaders, robotsBody, doc);
       if (banner !== null) {
         const match = await this.#lookupCve(banner, cveCache, target.scanId, target.url);
         if (match !== null) {
