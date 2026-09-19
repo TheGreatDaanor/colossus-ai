@@ -1,9 +1,29 @@
-import { lookup } from 'node:dns/promises';
-import { isIP } from 'node:net';
 import { connect as tlsConnect } from 'node:tls';
-import Anthropic from '@anthropic-ai/sdk';
 import { eq } from 'drizzle-orm';
 import type { Db } from '../db/client.js';
+import {
+  makeXssInjectionClass,
+  makeSstiInjectionClass,
+  makeSqliInjectionClass,
+  makeLfiInjectionClass,
+  saveEvidence,
+  type InjectionClass,
+  type XssConfirmImpl,
+  type BodyFetchImpl,
+} from './active-scanner.js';
+import { discoverLinks } from './discovery.js';
+import { findDisallowedAddress, isDisallowedAddress } from './ssrf-guard.js';
+import {
+  detectHeaderFindings,
+  detectTlsFindings,
+  extractVersionBanner,
+  parsePageDocument,
+  NO_TLS_FINDING,
+  type HeaderFinding,
+  type TlsFinding,
+  type TlsInfo,
+  type VersionBanner,
+} from './passive-checks.js';
 import {
   scans,
   scanTargets,
@@ -12,8 +32,12 @@ import {
   type FindingSeverity,
   type FindingConfidence,
   type ScanMode,
+  type InjectionAttempt,
 } from '../db/schema.js';
-import { enumerateInjectionAttempts } from './active-scanner.js';
+
+export { detectHeaderFindings, detectTlsFindings, extractVersionBanner, parsePageDocument, NO_TLS_FINDING };
+export { isDisallowedAddress };
+export type { HeaderFinding, TlsFinding, TlsInfo, VersionBanner };
 
 export class ScanValidationError extends Error {}
 
@@ -22,12 +46,15 @@ const MAX_URLS = 100;
 export type Scan = typeof scans.$inferSelect;
 export type ScanTarget = typeof scanTargets.$inferSelect;
 export type Finding = typeof findings.$inferSelect;
-export type ScanWithTargets = Scan & { targets: (ScanTarget & { findings: Finding[] })[] };
+export type ScanWithTargets = Scan & {
+  targets: (ScanTarget & { findings: Finding[] })[];
+  findingsBySeverity: Record<FindingSeverity, number>;
+};
 
 export type StartScanOptions = {
   name?: string;
   userAgent?: string;
-  mode?: ScanMode;
+  mode?: 'passive' | 'active';
   confirmAuthorized?: boolean;
   authorizationNote?: string;
 };
@@ -50,101 +77,6 @@ function dedupe(urls: string[]): string[] {
   return Array.from(new Set(urls));
 }
 
-function ipv4ToInt(ip: string): number | null {
-  const parts = ip.split('.');
-  if (parts.length !== 4) return null;
-  let result = 0;
-  for (const part of parts) {
-    if (!/^\d{1,3}$/.test(part)) return null;
-    const n = Number(part);
-    if (n > 255) return null;
-    result = (result << 8) | n;
-  }
-  return result >>> 0;
-}
-
-const DISALLOWED_IPV4_RANGES: [string, number][] = [
-  ['127.0.0.0', 8], // loopback
-  ['10.0.0.0', 8], // private
-  ['172.16.0.0', 12], // private
-  ['192.168.0.0', 16], // private
-  ['169.254.0.0', 16], // link-local, includes the 169.254.169.254 cloud metadata address
-];
-
-function isDisallowedIPv4(ip: string): boolean {
-  const int = ipv4ToInt(ip);
-  if (int === null) return false;
-
-  return DISALLOWED_IPV4_RANGES.some(([base, prefixLength]) => {
-    const baseInt = ipv4ToInt(base);
-    if (baseInt === null) return false;
-    const mask = prefixLength === 0 ? 0 : (~0 << (32 - prefixLength)) >>> 0;
-    return (int & mask) === (baseInt & mask);
-  });
-}
-
-function ipv6ToBigInt(ip: string): bigint | null {
-  const doubleColonParts = ip.split('::');
-  if (doubleColonParts.length > 2) return null;
-
-  const head = doubleColonParts[0] ? doubleColonParts[0].split(':') : [];
-  const tail = doubleColonParts.length === 2 && doubleColonParts[1] ? doubleColonParts[1].split(':') : [];
-
-  let groups: string[];
-  if (doubleColonParts.length === 2) {
-    const missing = 8 - head.length - tail.length;
-    if (missing < 0) return null;
-    groups = [...head, ...Array<string>(missing).fill('0'), ...tail];
-  } else {
-    groups = head;
-  }
-  if (groups.length !== 8) return null;
-
-  let result = 0n;
-  for (const group of groups) {
-    if (!/^[0-9a-fA-F]{1,4}$/.test(group)) return null;
-    result = (result << 16n) | BigInt(parseInt(group, 16));
-  }
-  return result;
-}
-
-const DISALLOWED_IPV6_PREFIXES: [bigint, number][] = [
-  [1n, 128], // ::1 loopback
-  [ipv6ToBigInt('fe80::')!, 10], // link-local
-  [ipv6ToBigInt('fc00::')!, 7], // unique-local (private)
-];
-
-function isDisallowedIPv6(ip: string): boolean {
-  const mappedIPv4 = /^::ffff:(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})$/i.exec(ip);
-  if (mappedIPv4?.[1] !== undefined) return isDisallowedIPv4(mappedIPv4[1]);
-
-  const value = ipv6ToBigInt(ip);
-  if (value === null) return false;
-
-  return DISALLOWED_IPV6_PREFIXES.some(([base, prefixLength]) => {
-    const shift = BigInt(128 - prefixLength);
-    return value >> shift === base >> shift;
-  });
-}
-
-export function isDisallowedAddress(ip: string): boolean {
-  return ip.includes(':') ? isDisallowedIPv6(ip) : isDisallowedIPv4(ip);
-}
-
-async function findDisallowedAddress(hostname: string): Promise<string | null> {
-  if (isIP(hostname) !== 0) {
-    return isDisallowedAddress(hostname) ? hostname : null;
-  }
-
-  try {
-    const records = await lookup(hostname, { all: true });
-    return records.find((record) => isDisallowedAddress(record.address))?.address ?? null;
-  } catch {
-    // A lookup failure isn't an SSRF signal — let the fetch attempt proceed and fail on its own terms.
-    return null;
-  }
-}
-
 function lowercaseHeaders(headers: Headers): Record<string, string> {
   const out: Record<string, string> = {};
   headers.forEach((value, key) => {
@@ -153,101 +85,17 @@ function lowercaseHeaders(headers: Headers): Record<string, string> {
   return out;
 }
 
-export type HeaderFinding = {
-  category: string;
-  severity: FindingSeverity;
-  confidence: FindingConfidence;
-};
-
-// Severity is not pinned by the PRD beyond the five-value scale, so this is a
-// judgment call: missing HSTS/CSP allow the broadest attacks (no encryption
-// enforcement / arbitrary script injection) so they skew high; framing and
-// MIME-sniffing protections are narrower in impact, so they sit lower.
-const MISSING_HEADER_FINDINGS: { header: string; category: string; severity: FindingSeverity }[] = [
-  { header: 'content-security-policy', category: 'missing-csp', severity: 'high' },
-  { header: 'strict-transport-security', category: 'missing-hsts', severity: 'high' },
-  { header: 'x-frame-options', category: 'missing-x-frame-options', severity: 'medium' },
-  { header: 'x-content-type-options', category: 'missing-x-content-type-options', severity: 'low' },
-  { header: 'referrer-policy', category: 'missing-referrer-policy', severity: 'low' },
-  { header: 'permissions-policy', category: 'missing-permissions-policy', severity: 'low' },
-];
-
-function isCookieSecure(setCookie: string): boolean {
-  const attributes = setCookie.split(';').map((part) => part.trim().toLowerCase());
-  const hasSecure = attributes.includes('secure');
-  const hasHttpOnly = attributes.includes('httponly');
-  const hasSameSite = attributes.some((attr) => attr.startsWith('samesite='));
-  return hasSecure && hasHttpOnly && hasSameSite;
-}
-
-export function detectHeaderFindings(headers: Record<string, string>): HeaderFinding[] {
-  const result: HeaderFinding[] = MISSING_HEADER_FINDINGS.filter(({ header }) => !(header in headers)).map(
-    ({ category, severity }) => ({ category, severity, confidence: 'definitive' }),
-  );
-
-  const setCookie = headers['set-cookie'];
-  if (setCookie !== undefined && !isCookieSecure(setCookie)) {
-    result.push({ category: 'insecure-cookie', severity: 'medium', confidence: 'definitive' });
+// Module-private: the only caller is `getScan`, and it is covered through that
+// public seam rather than directly.
+function summarizeFindingsBySeverity(rows: { severity: FindingSeverity }[]): Record<FindingSeverity, number> {
+  const summary: Record<FindingSeverity, number> = { critical: 0, high: 0, medium: 0, low: 0, info: 0 };
+  for (const row of rows) {
+    // `severity` is a compile-time cast over a plain text column, so a row can carry
+    // a value outside the union. `hasOwn`, not `in`: `in` walks the prototype chain,
+    // so a severity of `constructor` or `toString` would slip past and corrupt the block.
+    if (Object.hasOwn(summary, row.severity)) summary[row.severity] += 1;
   }
-
-  return result;
-}
-
-export type TlsInfo = { version: string; certExpiresAt: Date };
-export type TlsFinding = { category: string; severity: FindingSeverity; confidence: FindingConfidence };
-
-const OUTDATED_TLS_VERSIONS = new Set(['TLSv1', 'TLSv1.1']);
-const CERT_EXPIRY_WARNING_DAYS = 30;
-const MS_PER_DAY = 1000 * 60 * 60 * 24;
-
-export const NO_TLS_FINDING: TlsFinding = { category: 'no-tls', severity: 'high', confidence: 'definitive' };
-
-export function detectTlsFindings(info: TlsInfo, now: Date = new Date()): TlsFinding[] {
-  const result: TlsFinding[] = [];
-
-  if (OUTDATED_TLS_VERSIONS.has(info.version)) {
-    result.push({ category: 'outdated-tls', severity: 'high', confidence: 'definitive' });
-  }
-
-  const daysUntilExpiry = (info.certExpiresAt.getTime() - now.getTime()) / MS_PER_DAY;
-  if (daysUntilExpiry <= CERT_EXPIRY_WARNING_DAYS) {
-    result.push({ category: 'cert-expiring-soon', severity: 'medium', confidence: 'definitive' });
-  }
-
-  return result;
-}
-
-export type VersionBanner = { software: string; version: string };
-
-// Neither the PRD nor the issue pins an exact banner source, so this is a judgment
-// call: `name/version` is the de-facto convention for both the Server and
-// X-Powered-By headers (e.g. `nginx/1.18.0`, `PHP/7.4.3`), and some software repeats
-// that same convention in a robots.txt comment. Headers are checked first since
-// they're the more reliable signal; robots.txt is only consulted if neither matches.
-const BANNER_HEADER_NAMES = ['server', 'x-powered-by'];
-const BANNER_PATTERN = /([A-Za-z][\w.-]*)\/(\d[\w.-]*)/;
-
-export function extractVersionBanner(
-  headers: Record<string, string>,
-  robotsBody: string | null,
-): VersionBanner | null {
-  for (const headerName of BANNER_HEADER_NAMES) {
-    const value = headers[headerName];
-    if (value === undefined) continue;
-    const match = BANNER_PATTERN.exec(value);
-    if (match?.[1] !== undefined && match[2] !== undefined) {
-      return { software: match[1], version: match[2] };
-    }
-  }
-
-  if (robotsBody !== null) {
-    const match = BANNER_PATTERN.exec(robotsBody);
-    if (match?.[1] !== undefined && match[2] !== undefined) {
-      return { software: match[1], version: match[2] };
-    }
-  }
-
-  return null;
+  return summary;
 }
 
 export type TlsCheckImpl = (hostname: string, port: number) => Promise<TlsInfo>;
@@ -274,90 +122,18 @@ function defaultTlsCheck(hostname: string, port: number, timeoutMs: number): Pro
   });
 }
 
-export type EnrichedFinding = { category: string; explanation: string; suggestedFix: string };
-export type EnrichImpl = (findings: Finding[]) => Promise<EnrichedFinding[]>;
-
-const ENRICH_MODEL = 'claude-opus-5';
-
-const ENRICH_TOOL = {
-  name: 'report_finding_explanations',
-  description: 'Report a plain-English explanation and suggested fix for each security finding.',
-  input_schema: {
-    type: 'object' as const,
-    properties: {
-      findings: {
-        type: 'array',
-        items: {
-          type: 'object',
-          properties: {
-            category: { type: 'string', description: 'The finding category being explained.' },
-            explanation: { type: 'string', description: 'Why this finding matters, in plain English.' },
-            suggested_fix: { type: 'string', description: 'A concrete, actionable remediation step.' },
-          },
-          required: ['category', 'explanation', 'suggested_fix'],
-          additionalProperties: false,
-        },
-      },
-    },
-    required: ['findings'],
-    additionalProperties: false,
-  },
-  strict: true,
-};
-
-// Scanned sites control some of the text that reaches this prompt (banners, cookie names).
-// Prompt-injection hardening is explicitly out of scope per the PRD — raw findings are always
-// rendered regardless of what comes back here, so a hijacked explanation cannot hide a finding.
-async function defaultEnrich(findingRows: Finding[]): Promise<EnrichedFinding[]> {
-  const { default: Anthropic } = await import('@anthropic-ai/sdk');
-  const client = new Anthropic();
-
-  const response = await client.messages.create({
-    model: ENRICH_MODEL,
-    max_tokens: 16000,
-    thinking: { type: 'adaptive' },
-    tools: [ENRICH_TOOL],
-    tool_choice: { type: 'tool', name: ENRICH_TOOL.name },
-    messages: [
-      {
-        role: 'user',
-        content:
-          'Explain each of these web security scan findings for the site owner, and suggest a fix. ' +
-          'Return exactly one entry per input category, reusing the category string verbatim.\n\n' +
-          JSON.stringify(
-            findingRows.map((f) => ({
-              category: f.category,
-              severity: f.severity,
-              confidence: f.confidence,
-              cve_id: f.cveId,
-            })),
-          ),
-      },
-    ],
-  });
-
-  const toolUse = response.content.find((block) => block.type === 'tool_use');
-  if (toolUse === undefined) throw new Error('enrichment response contained no tool_use block');
-
-  const { findings: entries } = toolUse.input as {
-    findings: { category: string; explanation: string; suggested_fix: string }[];
-  };
-  return entries.map((e) => ({
-    category: e.category,
-    explanation: e.explanation,
-    suggestedFix: e.suggested_fix,
-  }));
-}
-
 export type FetchImpl = (url: string, init: RequestInit) => Promise<Response>;
 
 export type OsvMatch = { cveId: string };
 export type OsvCheckImpl = (banner: VersionBanner) => Promise<OsvMatch | null>;
 
-async function defaultOsvCheck(banner: VersionBanner): Promise<OsvMatch | null> {
+export async function defaultOsvCheck(banner: VersionBanner): Promise<OsvMatch | null> {
   const response = await fetch('https://api.osv.dev/v1/query', {
     method: 'POST',
-    body: JSON.stringify({ version: banner.version, package: { name: banner.software, ecosystem: 'Generic' } }),
+    // OSV.dev has no "Generic" ecosystem — sending one 400s the whole query. A
+    // version + package name with the ecosystem omitted is a valid query for
+    // software OSV can't place in a package ecosystem (e.g. a server banner).
+    body: JSON.stringify({ version: banner.version, package: { name: banner.software } }),
   });
   if (!response.ok) throw new Error(`OSV.dev query failed with status ${response.status}`);
 
@@ -366,77 +142,248 @@ async function defaultOsvCheck(banner: VersionBanner): Promise<OsvMatch | null> 
   return first !== undefined ? { cveId: first.id } : null;
 }
 
+export type PendingFinding = {
+  category: string;
+  severity: FindingSeverity;
+  confidence: FindingConfidence;
+  cveId?: string;
+  explanation?: string;
+};
+
+export type LlmEnrichment = { explanation: string; suggestedFix: string };
+// The id is a synthetic per-call discriminator (f0, f1, ...), not stored anywhere —
+// it exists so a short, reordered, or truncated LLM response can still be matched
+// back to the finding it belongs to instead of relying on array position.
+export type EnrichmentRequest = PendingFinding & { id: string };
+export type LlmEnrichmentResult = LlmEnrichment & { id: string };
+export type LlmEnrichImpl = (findingsToEnrich: EnrichmentRequest[]) => Promise<LlmEnrichmentResult[]>;
+
+// Mirrors defaultOsvCheck's approach: a raw call against the provider's HTTP API
+// rather than pulling in `@anthropic-ai/sdk` as a dependency, keeping runtime deps
+// minimal per the coding-standards skill. Structured tool-use asks the model to
+// return one { id, explanation, suggestedFix } tuple per finding it can address;
+// a short or reordered response is matched back to findings by id, not position.
+async function defaultLlmEnrich(findingsToEnrich: EnrichmentRequest[]): Promise<LlmEnrichmentResult[]> {
+  const response = await fetch('https://api.anthropic.com/v1/messages', {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      'x-api-key': process.env.ANTHROPIC_API_KEY ?? '',
+      'anthropic-version': '2023-06-01',
+    },
+    body: JSON.stringify({
+      model: 'claude-sonnet-5',
+      max_tokens: 1024,
+      tools: [
+        {
+          name: 'submit_finding_enrichment',
+          description:
+            'Submit a plain-English explanation and suggested fix for each finding, echoing back the id given for each one.',
+          input_schema: {
+            type: 'object',
+            properties: {
+              enrichments: {
+                type: 'array',
+                items: {
+                  type: 'object',
+                  properties: {
+                    id: { type: 'string' },
+                    explanation: { type: 'string' },
+                    suggestedFix: { type: 'string' },
+                  },
+                  required: ['id', 'explanation', 'suggestedFix'],
+                },
+              },
+            },
+            required: ['enrichments'],
+          },
+        },
+      ],
+      tool_choice: { type: 'tool', name: 'submit_finding_enrichment' },
+      messages: [
+        {
+          role: 'user',
+          content: `Explain each of these security scan findings in plain English and suggest a fix. Echo back each finding's "id" in your response. Findings: ${JSON.stringify(findingsToEnrich)}`,
+        },
+      ],
+    }),
+  });
+  if (!response.ok) throw new Error(`Anthropic API call failed with status ${response.status}`);
+
+  const data = (await response.json()) as {
+    content?: { type: string; input?: { enrichments?: LlmEnrichmentResult[] } }[];
+  };
+  const toolUse = data.content?.find((block) => block.type === 'tool_use');
+  const enrichments = toolUse?.input?.enrichments;
+  if (enrichments === undefined) throw new Error('Anthropic API did not return structured enrichment output');
+
+  return enrichments;
+}
+
+// Same-origin discovery bounds, per the roadmap: depth-2, 25 discovered pages per
+// operator-submitted root, regardless of how much depth remains.
+// One bounding mechanism, two uses: a per-target allowance for extra HTTP requests
+// (robots.txt and the exposed-file probes) and the per-root cap on discovered pages.
+// They bound different resources and so hold different limits, but issue 022 asked
+// for a single helper rather than a second hand-rolled counter, and 014's inline
+// counter is retrofitted onto it here.
+class Budget {
+  #remaining: number;
+
+  constructor(limit: number) {
+    this.#remaining = limit;
+  }
+
+  // Returns false once exhausted; callers skip the work rather than throwing.
+  tryConsume(): boolean {
+    if (this.#remaining <= 0) return false;
+    this.#remaining -= 1;
+    return true;
+  }
+}
+
+// Bounds how many wrapped tasks run at once. Used to cap concurrent browser contexts
+// during active scanning independently of the target batch size: passive work on the
+// same scan keeps running at full width while at most `limit` confirmations are live.
+class Semaphore {
+  #available: number;
+  readonly #waiters: (() => void)[] = [];
+
+  constructor(limit: number) {
+    this.#available = limit;
+  }
+
+  async run<T>(task: () => Promise<T>): Promise<T> {
+    if (this.#available > 0) {
+      this.#available -= 1;
+    } else {
+      await new Promise<void>((resolve) => this.#waiters.push(resolve));
+    }
+    try {
+      return await task();
+    } finally {
+      const next = this.#waiters.shift();
+      if (next !== undefined) next();
+      else this.#available += 1;
+    }
+  }
+}
+
+// Probing is bounded by content shape, not just status: a site that answers every
+// unknown path with a 200 SPA shell would otherwise report an exposed .env on every
+// target. Each probe therefore names what the real file looks like. `/server-status`
+// and `security.txt` carry shape tests too, which the issue's table did not require,
+// because that same SPA shell would otherwise trip them.
+const EXPOSED_FILE_PROBES: {
+  path: string;
+  category: string;
+  severity: FindingSeverity;
+  matches: (body: string) => boolean;
+  explanation: string;
+}[] = [
+  {
+    path: '/.git/HEAD',
+    category: 'exposed-git-directory',
+    severity: 'critical',
+    matches: (body) => /^ref:\s/.test(body.trimStart()),
+    explanation: 'A .git directory is served, exposing the repository and its history.',
+  },
+  {
+    path: '/.env',
+    category: 'exposed-env-file',
+    severity: 'critical',
+    matches: (body) => /^[A-Z_][A-Z0-9_]*=/m.test(body),
+    explanation: 'A .env file is served, typically exposing credentials and secrets.',
+  },
+  {
+    path: '/server-status',
+    category: 'exposed-server-status',
+    severity: 'medium',
+    matches: (body) => /server status/i.test(body),
+    explanation: 'The Apache server-status page is publicly reachable, revealing live request data.',
+  },
+  {
+    path: '/.well-known/security.txt',
+    category: 'security-txt-present',
+    severity: 'info',
+    // Contact is the one mandatory field in RFC 9116.
+    matches: (body) => /^contact:/im.test(body),
+    explanation: 'A security.txt is published, giving researchers a documented disclosure route.',
+  },
+];
+
+const MAX_DISCOVERY_DEPTH = 2;
+const MAX_DISCOVERED_PER_ROOT = 25;
+
+// Discovery only parses HTML, and #concurrency of these bodies sit in memory at
+// once, so a body is read only when the server says it is HTML, and only up to
+// MAX_HTML_BYTES — a 500 MB octet-stream target is never buffered. A read that
+// fails mid-stream (socket dropped) degrades to "no links found"; that catch is
+// deliberately around the stream read alone, so a programming error elsewhere —
+// e.g. reading a body something upstream already consumed — still surfaces
+// instead of silently turning discovery off.
+const MAX_HTML_BYTES = 2 * 1024 * 1024;
+
+// robots.txt is parsed for Disallow prefixes and scanned for a version banner, and
+// both of those are linear in its length — so an attacker-controlled robots.txt is
+// worker time an attacker controls. 64 KiB is far more than any real one needs.
+const MAX_ROBOTS_BYTES = 64 * 1024;
+
+async function readBoundedText(response: Response, maxBytes: number): Promise<string> {
+  const body = response.body;
+  if (body === null) return '';
+
+  const reader = body.getReader();
+  const decoder = new TextDecoder();
+  let html = '';
+  let bytes = 0;
+
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (value === undefined) continue;
+
+      bytes += value.byteLength;
+      if (bytes > maxBytes) {
+        html += decoder.decode(value.subarray(0, value.byteLength - (bytes - maxBytes)));
+        break;
+      }
+      html += decoder.decode(value, { stream: true });
+    }
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    console.warn(`body read failed: ${message}`);
+  } finally {
+    void reader.cancel().catch(() => {});
+  }
+
+  return html;
+}
+
+async function readHtmlBody(response: Response): Promise<string> {
+  const contentType = response.headers.get('content-type') ?? '';
+  if (!/^\s*(text\/html|application\/xhtml\+xml)\b/i.test(contentType)) return '';
+
+  return readBoundedText(response, MAX_HTML_BYTES);
+}
+
+// Scoped to a single #runScan call, not the instance: discovery bookkeeping (depth,
+// root, per-root count, and which URLs are already a target) only makes sense for the
+// scan currently running, mirroring how cveCache/llmCache are scan-scoped.
+type DiscoveryContext = {
+  seenUrls: Set<string>;
+  depthOf: Map<number, number>;
+  rootOf: Map<number, number>;
+  discoveredCount: Map<number, Budget>;
+};
+
 const CVE_FINDING_CATEGORY = 'known-vulnerability';
 // A version-string match doesn't prove a fix wasn't backported, so CVE findings stay
 // `possible` confidence (per the PRD) rather than `definitive`. Severity isn't reported
 // by a bare OSV.dev match in this v1 integration, so every match is treated as `high` —
 // a known, matched CVE is a serious signal even without a parsed CVSS score.
 const CVE_FINDING_SEVERITY: FindingSeverity = 'high';
-
-export type LlmEnrichInput = {
-  category: string;
-  severity: FindingSeverity;
-  confidence: FindingConfidence;
-  cveId: string | null;
-};
-export type LlmEnrichment = { explanation: string; suggestedFix: string };
-export type EnrichedFinding = { explanation: string | null; suggestedFix: string | null };
-export type LlmEnrichImpl = (findings: LlmEnrichInput[]) => Promise<LlmEnrichment[]>;
-
-const ENRICHMENT_TOOL_NAME = 'report_finding_explanations';
-const LLM_RETRY_DELAY_MS = 1000;
-
-async function defaultLlmEnrich(findings: LlmEnrichInput[]): Promise<LlmEnrichment[]> {
-  const client = new Anthropic();
-  const response = await client.messages.create({
-    model: 'claude-sonnet-5',
-    max_tokens: 4096,
-    tool_choice: { type: 'tool', name: ENRICHMENT_TOOL_NAME },
-    tools: [
-      {
-        name: ENRICHMENT_TOOL_NAME,
-        description:
-          'Report a plain-English explanation and a suggested fix for each security finding, one entry per finding, in the same order as the input list.',
-        input_schema: {
-          type: 'object',
-          properties: {
-            findings: {
-              type: 'array',
-              items: {
-                type: 'object',
-                properties: {
-                  explanation: { type: 'string', description: 'Plain-English explanation of the risk.' },
-                  suggestedFix: { type: 'string', description: 'A concrete suggested fix.' },
-                },
-                required: ['explanation', 'suggestedFix'],
-              },
-            },
-          },
-          required: ['findings'],
-        },
-      },
-    ],
-    messages: [
-      {
-        role: 'user',
-        content: `For each of these security findings, give a short plain-English explanation and a suggested fix. Findings:\n${JSON.stringify(findings)}`,
-      },
-    ],
-  });
-
-  const toolUse = response.content.find((block) => block.type === 'tool_use');
-  if (toolUse === undefined || toolUse.type !== 'tool_use') {
-    throw new Error('LLM enrichment response did not include a tool_use block');
-  }
-
-  const input = toolUse.input as { findings?: unknown };
-  if (!Array.isArray(input.findings)) throw new Error('LLM enrichment response is missing a findings array');
-  return input.findings as LlmEnrichment[];
-}
-
-function findingFingerprint(finding: LlmEnrichInput): string {
-  return `${finding.category}|${finding.severity}|${finding.confidence}|${finding.cveId ?? ''}`;
-}
 
 export class ScannerService {
   readonly #db: Db;
@@ -445,7 +392,29 @@ export class ScannerService {
   readonly #osvCheckImpl: OsvCheckImpl;
   readonly #llmEnrichImpl: LlmEnrichImpl;
   readonly #timeoutMs: number;
+  readonly #maxExtraRequests: number;
   readonly #concurrency: number;
+  readonly #defaultUserAgent: string;
+  // The XSS strategy, reached through the InjectionClass interface. Built from the
+  // injected confirmer so tests keep mocking confirmation at the same boundary.
+  readonly #xssClass: InjectionClass;
+  // The fetch-based injection classes (SSTI, SQLi, LFI): each confirms by comparing an
+  // injected response body against a baseline, so they share one content fetcher rather
+  // than the browser. Kept separate from #xssClass because they run under a different
+  // concurrency budget — the wider passive fetch budget, not the browser cap.
+  readonly #oracleClasses: InjectionClass[];
+  // Caps concurrent browser contexts during active scanning, independent of the
+  // target batch size — passive work continues at full width. See the Semaphore note.
+  readonly #browserSemaphore: Semaphore;
+  // The passive fetch budget the oracle (ssti/sqli/lfi) confirmations share: sized to
+  // the target concurrency, deliberately wider than the browser cap so payload-body
+  // fetches aren't serialized behind the two headless-browser slots XSS reserves.
+  readonly #fetchSemaphore: Semaphore;
+  // Hostnames the SSRF guard is told to permit even though they resolve to a
+  // disallowed (e.g. loopback) address. Empty in production and set only by tests
+  // that serve a fixture on 127.0.0.1 — deliberately a constructor option, not an
+  // env var, so nothing in production can accidentally disable the guard.
+  readonly #allowedHosts: Set<string>;
 
   constructor(
     db: Db,
@@ -455,13 +424,32 @@ export class ScannerService {
       osvCheckImpl?: OsvCheckImpl;
       llmEnrichImpl?: LlmEnrichImpl;
       timeoutMs?: number;
+      maxExtraRequests?: number;
       concurrency?: number;
+      defaultUserAgent?: string;
+      xssConfirmImpl?: XssConfirmImpl;
+      bodyFetchImpl?: BodyFetchImpl;
+      browserConcurrency?: number;
+      allowedHosts?: string[];
     } = {},
   ) {
     this.#db = db;
     this.#fetchImpl = options.fetchImpl ?? fetch;
     this.#timeoutMs = options.timeoutMs ?? 10_000;
+    // Every request beyond a target's primary fetch draws on this: robots.txt plus
+    // the four probes fit in the default with one to spare.
+    this.#maxExtraRequests = options.maxExtraRequests ?? 6;
     this.#concurrency = options.concurrency ?? 10;
+    this.#defaultUserAgent = options.defaultUserAgent ?? 'colossus-scanner/1.0';
+    this.#xssClass = makeXssInjectionClass(options.xssConfirmImpl);
+    this.#oracleClasses = [
+      makeSstiInjectionClass(options.bodyFetchImpl),
+      makeSqliInjectionClass(options.bodyFetchImpl),
+      makeLfiInjectionClass(options.bodyFetchImpl),
+    ];
+    this.#browserSemaphore = new Semaphore(options.browserConcurrency ?? 2);
+    this.#fetchSemaphore = new Semaphore(this.#concurrency);
+    this.#allowedHosts = new Set(options.allowedHosts ?? []);
     this.#tlsCheckImpl =
       options.tlsCheckImpl ?? ((hostname, port) => defaultTlsCheck(hostname, port, this.#timeoutMs));
     this.#osvCheckImpl = options.osvCheckImpl ?? defaultOsvCheck;
@@ -472,7 +460,10 @@ export class ScannerService {
     if (urls.length === 0) throw new ScanValidationError('urls must not be empty');
     if (urls.length > MAX_URLS) throw new ScanValidationError(`urls must not exceed ${MAX_URLS}`);
     if (options.mode === 'active' && options.confirmAuthorized !== true) {
-      throw new ScanValidationError('mode "active" requires confirmAuthorized: true');
+      throw new ScanValidationError('mode: "active" requires confirmAuthorized: true');
+    }
+    if (options.userAgent !== undefined && options.userAgent.trim() === '') {
+      throw new ScanValidationError('userAgent must not be blank');
     }
 
     const deduped = dedupe(urls);
@@ -488,10 +479,10 @@ export class ScannerService {
         name: options.name ?? defaultScanName(now),
         status: hasValid ? 'pending' : 'failed',
         urls: deduped,
+        userAgent: options.userAgent ?? null,
         mode: options.mode ?? 'passive',
         confirmAuthorized: options.confirmAuthorized ?? null,
         authorizationNote: options.authorizationNote ?? null,
-        userAgent: options.userAgent ?? null,
         error: hasValid ? null : 'no valid URLs to scan',
         createdAt: now,
         completedAt: hasValid ? null : now,
@@ -519,7 +510,7 @@ export class ScannerService {
         .get(),
     );
 
-    void this.#runScan(scan.id, scan.mode, targetRows);
+    void this.#runScan(scan.id, targetRows, scan.userAgent ?? this.#defaultUserAgent, scan.mode);
 
     return scan;
   }
@@ -534,32 +525,43 @@ export class ScannerService {
       findings: this.#db.select().from(findings).where(eq(findings.scanTargetId, target.id)).all(),
     }));
 
-    return { ...scan, targets };
+    const allFindings = targets.flatMap((target) => target.findings);
+
+    return { ...scan, targets, findingsBySeverity: summarizeFindingsBySeverity(allFindings) };
   }
 
   async listScans(): Promise<Scan[]> {
     return this.#db.select().from(scans).orderBy(scans.createdAt).all().reverse();
   }
 
-  async #runScan(scanId: number, mode: ScanMode, targetRows: ScanTarget[]): Promise<void> {
+  async #runScan(scanId: number, targetRows: ScanTarget[], userAgent: string, mode: ScanMode): Promise<void> {
     this.#db.update(scans).set({ status: 'running' }).where(eq(scans.id, scanId)).run();
 
     // Cached per scan run, not on the instance: the PRD requires CVE lookups to be
     // cached per unique version string *within a scan* and never reused across scans.
     const cveCache = new Map<string, OsvMatch | null>();
-    // Same rationale, for LLM enrichment: identical finding-sets within one scan
-    // reuse a single call, keyed by a fingerprint of the sorted finding-set.
-    const llmCache = new Map<string, Promise<EnrichedFinding[]>>();
+    // Cached per scan run too: identical finding-sets within one scan share a single
+    // LLM call, but explanations are never reused across scans (findings differ by
+    // target and time even when the category/severity shape repeats).
+    const llmCache = new Map<string, (LlmEnrichment | null)[]>();
 
-    // Same per-scan (never cross-scan) rule as cveCache: keyed on the finding *set*, since
-    // that set is the entire input to the LLM call — two targets with the same findings get
-    // the same explanations, so the second one costs nothing. Holds the in-flight promise so
-    // targets running concurrently in the same batch share one call rather than racing.
-    const enrichCache = new Map<string, Promise<EnrichedFinding[] | null>>();
+    // Roots are the operator-submitted targets: depth 0, and their own discovery
+    // budget. Discovery can add new rows to the queue mid-run, so this loop drains a
+    // growing queue rather than iterating the fixed initial batch.
+    const discovery: DiscoveryContext = {
+      seenUrls: new Set(targetRows.map((t) => t.url)),
+      depthOf: new Map(targetRows.map((t) => [t.id, 0])),
+      rootOf: new Map(targetRows.map((t) => [t.id, t.id])),
+      discoveredCount: new Map(targetRows.map((t) => [t.id, new Budget(MAX_DISCOVERED_PER_ROOT)])),
+    };
 
-    for (let i = 0; i < targetRows.length; i += this.#concurrency) {
-      const batch = targetRows.slice(i, i + this.#concurrency);
-      await Promise.all(batch.map((target) => this.#processTarget(target, cveCache, llmCache)));
+    const queue = [...targetRows];
+    while (queue.length > 0) {
+      const batch = queue.splice(0, this.#concurrency);
+      const discoveredBatches = await Promise.all(
+        batch.map((target) => this.#processTarget(target, cveCache, llmCache, userAgent, mode, discovery)),
+      );
+      for (const discovered of discoveredBatches) queue.push(...discovered);
     }
 
     this.#db
@@ -572,13 +574,16 @@ export class ScannerService {
   async #processTarget(
     target: ScanTarget,
     cveCache: Map<string, OsvMatch | null>,
-    llmCache: Map<string, Promise<EnrichedFinding[]>>,
-  ): Promise<void> {
+    llmCache: Map<string, (LlmEnrichment | null)[]>,
+    userAgent: string,
+    mode: ScanMode,
+    discovery: DiscoveryContext,
+  ): Promise<ScanTarget[]> {
     console.warn(`[scan ${target.scanId}] ${target.url} started`);
 
     const targetUrl = new URL(target.url);
     const hostname = targetUrl.hostname;
-    const disallowedAddress = await findDisallowedAddress(hostname);
+    const disallowedAddress = this.#allowedHosts.has(hostname) ? null : await findDisallowedAddress(hostname);
     if (disallowedAddress !== null) {
       this.#db
         .update(scanTargets)
@@ -590,7 +595,7 @@ export class ScannerService {
         .run();
 
       console.warn(`[scan ${target.scanId}] ${target.url} rejected (disallowed address)`);
-      return;
+      return [];
     }
 
     const controller = new AbortController();
@@ -601,12 +606,19 @@ export class ScannerService {
       const response = await this.#fetchImpl(target.url, {
         redirect: 'manual',
         signal: controller.signal,
+        headers: { 'user-agent': userAgent },
       });
       const elapsed = Math.round(performance.now() - start);
       const status: ScanTargetStatus = 'ok';
       const redirectLocation = response.headers.get('location');
       const responseHeaders = lowercaseHeaders(response.headers);
-      const injectionAttempts = mode === 'active' ? enumerateInjectionAttempts(target.url) : undefined;
+      const setCookies = response.headers.getSetCookie();
+
+      // Read the body here, immediately after the fetch and while the abort timer
+      // still bounds it. Discovery is the last step of the pipeline, so deferring
+      // the read until then would let a throw from any intervening step (TLS, CVE,
+      // enrichment, active-mode injection) silently skip discovery.
+      const html = await readHtmlBody(response);
 
       this.#db
         .update(scanTargets)
@@ -616,22 +628,20 @@ export class ScannerService {
           responseHeaders,
           responseTimeMs: elapsed,
           redirectLocation: redirectLocation ?? null,
-          ...(injectionAttempts !== undefined ? { injectionAttempts } : {}),
         })
         .where(eq(scanTargets.id, target.id))
         .run();
 
-      // Findings are collected here rather than inserted immediately so that
-      // #enrichFindings sees the target's whole finding-set at once — the LLM
-      // dedup cache is keyed on the full set, not per-individual-finding.
-      const targetFindings: LlmEnrichInput[] = [];
+      // Parsed once, here, and shared by every consumer below (body checks, the
+      // generator-tag banner, discovery). An empty `html` means the body was not
+      // HTML, was empty, or failed mid-stream — body-derived checks are simply
+      // skipped, exactly as the TLS-check failure path degrades.
+      const doc = html === '' ? null : parsePageDocument(html, targetUrl);
 
-      for (const finding of detectHeaderFindings(responseHeaders)) {
-        targetFindings.push({ ...finding, cveId: null });
-      }
+      const pendingFindings: PendingFinding[] = [...detectHeaderFindings(responseHeaders, setCookies, doc)];
 
       if (targetUrl.protocol === 'http:') {
-        targetFindings.push({ ...NO_TLS_FINDING, cveId: null });
+        pendingFindings.push(NO_TLS_FINDING);
       } else {
         // TLS-check failures degrade gracefully (target stays `ok`, TLS columns/findings
         // are just skipped) rather than failing the target — mirrors the CVE-lookup
@@ -647,21 +657,21 @@ export class ScannerService {
             .where(eq(scanTargets.id, target.id))
             .run();
 
-          for (const finding of detectTlsFindings(tlsInfo)) {
-            targetFindings.push({ ...finding, cveId: null });
-          }
+          pendingFindings.push(...detectTlsFindings(tlsInfo));
         } catch (tlsErr) {
           const message = tlsErr instanceof Error ? tlsErr.message : String(tlsErr);
           console.warn(`[scan ${target.scanId}] ${target.url} TLS check failed: ${message}`);
         }
       }
 
-      const robotsBody = await this.#fetchRobotsTxt(targetUrl);
-      const banner = extractVersionBanner(responseHeaders, robotsBody);
+      const requestBudget = new Budget(this.#maxExtraRequests);
+      const robotsBody = await this.#fetchRobotsTxt(targetUrl, userAgent, requestBudget);
+      pendingFindings.push(...(await this.#probeExposedFiles(targetUrl, userAgent, requestBudget)));
+      const banner = extractVersionBanner(responseHeaders, robotsBody, doc);
       if (banner !== null) {
         const match = await this.#lookupCve(banner, cveCache, target.scanId, target.url);
         if (match !== null) {
-          targetFindings.push({
+          pendingFindings.push({
             category: CVE_FINDING_CATEGORY,
             severity: CVE_FINDING_SEVERITY,
             confidence: 'possible',
@@ -670,16 +680,37 @@ export class ScannerService {
         }
       }
 
-      const enrichments = await this.#enrichFindings(targetFindings, llmCache, target.scanId, target.url);
-      targetFindings.forEach((finding, index) => {
-        const enrichment = enrichments[index] ?? { explanation: null, suggestedFix: null };
+      const enrichments =
+        pendingFindings.length > 0
+          ? await this.#enrichFindings(pendingFindings, llmCache, target.scanId, target.url)
+          : [];
+
+      for (let i = 0; i < pendingFindings.length; i++) {
+        const finding = pendingFindings[i];
+        if (finding === undefined) continue;
+        const enrichment = enrichments[i] ?? null;
         this.#db
           .insert(findings)
-          .values({ scanTargetId: target.id, ...finding, ...enrichment })
+          .values({
+            scanTargetId: target.id,
+            ...finding,
+            explanation: finding.explanation ?? enrichment?.explanation ?? null,
+            suggestedFix: enrichment?.suggestedFix ?? null,
+          })
           .run();
-      });
+      }
+
+      if (mode === 'active') {
+        await this.#injectQueryParams(target, targetUrl, userAgent);
+        await this.#runOracleClasses(target, targetUrl);
+      }
+
+      // Discovery runs regardless of mode — it's non-intrusive HTML parsing, not a
+      // payload-sending check, so it isn't gated behind the active-mode attestation.
+      const discovered = this.#discoverTargets(target, targetUrl, html, robotsBody, discovery);
 
       console.warn(`[scan ${target.scanId}] ${target.url} succeeded`);
+      return discovered;
     } catch (err) {
       const timedOut = err instanceof Error && err.name === 'AbortError';
       const status: ScanTargetStatus = timedOut ? 'timeout' : 'unreachable';
@@ -695,21 +726,189 @@ export class ScannerService {
         .run();
 
       console.warn(`[scan ${target.scanId}] ${target.url} ${timedOut ? 'timed-out' : 'failed'}`);
+      return [];
     } finally {
       clearTimeout(timer);
     }
   }
 
-  async #fetchRobotsTxt(targetUrl: URL): Promise<string | null> {
+  // A discovered link becomes a real `scan_targets` row, run through the identical
+  // pipeline as a submitted URL, bounded to depth-2 and 25 discovered pages per
+  // operator-submitted root (walking `discoveredFrom` back to the root would also
+  // work but requires a DB round-trip per target; the in-memory maps are scoped to
+  // one #runScan call and cost nothing extra).
+  #discoverTargets(
+    target: ScanTarget,
+    targetUrl: URL,
+    html: string,
+    robotsTxt: string | null,
+    discovery: DiscoveryContext,
+  ): ScanTarget[] {
+    const depth = discovery.depthOf.get(target.id) ?? 0;
+    if (depth >= MAX_DISCOVERY_DEPTH) return [];
+
+    const rootId = discovery.rootOf.get(target.id) ?? target.id;
+    const links = discoverLinks({ url: targetUrl, html }, robotsTxt);
+    const rows: (typeof scanTargets.$inferInsert)[] = [];
+
+    for (const url of links) {
+      if (discovery.seenUrls.has(url)) continue;
+
+      // Breaking here leaves the rest of this page's links out of `seenUrls`, so a
+      // sibling page under another root can still reach them — intended: the cap is
+      // per root, not a global "never visit this URL again".
+      if (discovery.discoveredCount.get(rootId)?.tryConsume() !== true) break;
+
+      discovery.seenUrls.add(url);
+      rows.push({ scanId: target.scanId, url, status: 'pending', discoveredFrom: target.id });
+    }
+
+    if (rows.length === 0) return [];
+
+    // One insert for the whole page rather than one per link: up to 25 round-trips
+    // per page otherwise, and #concurrency pages are in flight at once.
+    const created = this.#db.insert(scanTargets).values(rows).returning().all();
+    if (created.length !== rows.length) throw new Error('failed to insert discovered scan targets');
+
+    for (const row of created) {
+      discovery.depthOf.set(row.id, depth + 1);
+      discovery.rootOf.set(row.id, rootId);
+    }
+
+    return created;
+  }
+
+  // Active-mode only: for each query parameter, substitute a unique canary payload,
+  // fetch the mutated URL, then load it in a headless browser to see whether the
+  // marker executes. Each attempt records its confirmation outcome so a
+  // `not_vulnerable` (page escaped it) is visibly distinct from an `unavailable`
+  // (we couldn't test it); a `confirmed` outcome also writes a definitive `xss`
+  // finding. A target with no query parameters produces zero attempts. The mutated
+  // URLs share the target's host, which the SSRF guard already cleared;
+  // per-navigation redirect guarding is 012.
+  async #injectQueryParams(target: ScanTarget, targetUrl: URL, userAgent: string): Promise<void> {
+    const points = this.#xssClass.enumerate(targetUrl);
+    if (points.length === 0) return;
+
+    const attempts: InjectionAttempt[] = [];
+    for (const point of points) {
+      try {
+        await this.#fetchImpl(point.url, { redirect: 'manual', headers: { 'user-agent': userAgent } });
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        console.warn(`[scan ${target.scanId}] ${point.url} injection fetch failed: ${message}`);
+      }
+
+      const result = await this.#browserSemaphore.run(() => this.#xssClass.confirm(point));
+      attempts.push({ injectionPoint: point.injectionPoint, payload: point.payload, ...result });
+
+      if (result.outcome === 'confirmed') {
+        const [inserted] = this.#db
+          .insert(findings)
+          .values({
+            scanTargetId: target.id,
+            category: this.#xssClass.category,
+            severity: 'high',
+            confidence: 'definitive',
+            injectionPoint: point.injectionPoint,
+            payload: point.payload,
+          })
+          .returning({ id: findings.id })
+          .all();
+
+        // The evidence filename is the finding id, known only after the insert, so the
+        // screenshot is written and linked here rather than at capture time.
+        if (inserted !== undefined && result.screenshot !== undefined) {
+          const evidencePath = await saveEvidence(target.scanId, inserted.id, result.screenshot);
+          this.#db.update(findings).set({ evidencePath }).where(eq(findings.id, inserted.id)).run();
+        }
+      }
+    }
+
+    this.#db.update(scanTargets).set({ injectionAttempts: attempts }).where(eq(scanTargets.id, target.id)).run();
+  }
+
+  // Active-mode only: run every fetch-based injection class (SSTI, SQLi, LFI) against
+  // the target's query parameters. Each class enumerates a payload per param and confirms
+  // by fetching the mutated body — those fetches share the wider passive fetch budget
+  // (#fetchSemaphore), not the browser cap XSS reserves, so adding classes doesn't
+  // serialize their network work behind the two headless-browser slots. A confirmed
+  // outcome writes a definitive finding for that class; other outcomes write nothing
+  // (the per-attempt record is XSS-specific — see #injectQueryParams). Points and classes
+  // run concurrently under the semaphore; the synchronous better-sqlite3 inserts don't race.
+  async #runOracleClasses(target: ScanTarget, targetUrl: URL): Promise<void> {
+    await Promise.all(
+      this.#oracleClasses.flatMap((injectionClass) =>
+        injectionClass.enumerate(targetUrl).map(async (point) => {
+          const result = await this.#fetchSemaphore.run(() => injectionClass.confirm(point));
+          if (result.outcome !== 'confirmed') return;
+
+          this.#db
+            .insert(findings)
+            .values({
+              scanTargetId: target.id,
+              category: injectionClass.category,
+              severity: 'high',
+              confidence: 'definitive',
+              injectionPoint: point.injectionPoint,
+              payload: point.payload,
+              evidenceSnippet: result.evidenceSnippet ?? null,
+            })
+            .run();
+        }),
+      ),
+    );
+  }
+
+  async #fetchRobotsTxt(targetUrl: URL, userAgent: string, budget: Budget): Promise<string | null> {
+    if (!budget.tryConsume()) return null;
     try {
       const robotsUrl = new URL('/robots.txt', targetUrl).toString();
-      const response = await this.#fetchImpl(robotsUrl, { redirect: 'manual' });
-      return await response.text();
+      const response = await this.#fetchImpl(robotsUrl, { redirect: 'manual', headers: { 'user-agent': userAgent } });
+      return await readBoundedText(response, MAX_ROBOTS_BYTES);
     } catch {
       // robots.txt is an extra probe surface, not a required one — a missing or
       // broken robots.txt just means banner extraction relies on headers alone.
       return null;
     }
+  }
+
+  // Same-origin GETs for ordinary paths: no payload, so this runs in passive mode and
+  // needs no attestation. The host has already cleared the SSRF guard in #processTarget
+  // and every probe URL is built against it, so no probe can reach a different host.
+  async #probeExposedFiles(targetUrl: URL, userAgent: string, budget: Budget): Promise<PendingFinding[]> {
+    const result: PendingFinding[] = [];
+
+    for (const probe of EXPOSED_FILE_PROBES) {
+      if (!budget.tryConsume()) break;
+
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), this.#timeoutMs);
+      try {
+        const url = new URL(probe.path, targetUrl).toString();
+        const response = await this.#fetchImpl(url, {
+          redirect: 'manual',
+          signal: controller.signal,
+          headers: { 'user-agent': userAgent },
+        });
+        if (response.status !== 200) continue;
+        if (!probe.matches(await response.text())) continue;
+
+        result.push({
+          category: probe.category,
+          severity: probe.severity,
+          confidence: 'definitive',
+          explanation: probe.explanation,
+        });
+      } catch {
+        // A probe is best-effort: an unreachable or slow path says nothing about the
+        // target's primary status, so it must not fail the target.
+      } finally {
+        clearTimeout(timer);
+      }
+    }
+
+    return result;
   }
 
   async #lookupCve(
@@ -739,54 +938,50 @@ export class ScannerService {
   }
 
   async #enrichFindings(
-    targetFindings: LlmEnrichInput[],
-    cache: Map<string, Promise<EnrichedFinding[]>>,
+    findingsToEnrich: PendingFinding[],
+    cache: Map<string, (LlmEnrichment | null)[]>,
     scanId: number,
     url: string,
-  ): Promise<EnrichedFinding[]> {
-    if (targetFindings.length === 0) return [];
-
-    // Sorted by fingerprint so two targets with the same findings in a different
-    // insertion order still hit the cache under the same key.
-    const withIndex = targetFindings.map((finding, index) => ({ finding, index }));
-    const sorted = [...withIndex].sort((a, b) =>
-      findingFingerprint(a.finding).localeCompare(findingFingerprint(b.finding)),
+  ): Promise<(LlmEnrichment | null)[]> {
+    const key = JSON.stringify(
+      findingsToEnrich.map((f) => ({
+        category: f.category,
+        severity: f.severity,
+        confidence: f.confidence,
+        cveId: f.cveId ?? null,
+      })),
     );
-    const key = sorted.map(({ finding }) => findingFingerprint(finding)).join('|');
+    const cached = cache.get(key);
+    if (cached !== undefined) return cached;
 
-    // The promise itself (not its resolved value) is cached synchronously,
-    // before any await — so a second target reaching this key while the first
-    // call is still in flight awaits the same promise instead of firing its
-    // own concurrent LLM call.
-    let inFlight = cache.get(key);
-    if (!inFlight) {
-      inFlight = (async () => {
-        for (let attempt = 1; attempt <= 2; attempt++) {
-          try {
-            const result = await this.#llmEnrichImpl(sorted.map(({ finding }) => finding));
-            if (result.length !== sorted.length) throw new Error('LLM enrichment returned a mismatched result count');
-            return result;
-          } catch (err) {
-            if (attempt === 2) {
-              const message = err instanceof Error ? err.message : String(err);
-              console.warn(`[scan ${scanId}] ${url} LLM enrichment failed after retry: ${message}`);
-            } else {
-              await new Promise((resolve) => setTimeout(resolve, LLM_RETRY_DELAY_MS));
-            }
-          }
+    const requests: EnrichmentRequest[] = findingsToEnrich.map((finding, i) => ({
+      ...finding,
+      id: `f${i}`,
+    }));
+
+    let byId = new Map<string, LlmEnrichmentResult>();
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      try {
+        const enrichments = await this.#llmEnrichImpl(requests);
+        byId = new Map(enrichments.map((e) => [e.id, e]));
+        break;
+      } catch (err) {
+        if (attempt === 2) {
+          const message = err instanceof Error ? err.message : String(err);
+          console.warn(`[scan ${scanId}] ${url} LLM enrichment failed after retry: ${message}`);
         }
-        return sorted.map(() => ({ explanation: null, suggestedFix: null }));
-      })();
-      cache.set(key, inFlight);
+      }
     }
 
-    const sortedResult = await inFlight;
-
-    const result: EnrichedFinding[] = targetFindings.map(() => ({ explanation: null, suggestedFix: null }));
-    sorted.forEach(({ index }, position) => {
-      const enriched = sortedResult[position];
-      if (enriched) result[index] = enriched;
+    // Matched by synthetic id, not array position: a short, reordered, or truncated
+    // response leaves the unmatched findings null instead of misattributing another
+    // finding's explanation/suggestedFix to them.
+    const result: (LlmEnrichment | null)[] = requests.map((request) => {
+      const match = byId.get(request.id);
+      return match !== undefined ? { explanation: match.explanation, suggestedFix: match.suggestedFix } : null;
     });
+
+    cache.set(key, result);
     return result;
   }
 }

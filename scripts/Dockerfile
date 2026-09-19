@@ -26,6 +26,10 @@ RUN npm install -g @anthropic-ai/claude-code
 # ---- project toolchain: add anything your test/typecheck/lint commands need ----
 # RUN corepack enable && corepack prepare pnpm@latest --activate
 # RUN apt-get update && apt-get install -y postgresql-client
+# Active-scan XSS confirmation drives a headless Chromium via Playwright. Install it
+# from the pinned npm dependency (not a Playwright base image) so the uid/gid and
+# /home/agent handling below stay as worked out.
+RUN npx playwright install --with-deps chromium
 # -------------------------------------------------------------------------------
 
 # Non-root, with a uid that maps cleanly onto a Linux host bind mount, so files

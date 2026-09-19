@@ -1,8 +1,8 @@
 {
   "version": "6",
   "dialect": "sqlite",
-  "id": "bd801d2f-b88b-4b5b-abd0-68319d2125e1",
-  "prevId": "e2cc26cf-b017-4f8e-aba4-323ab9978f62",
+  "id": "c6dfa0e8-7aa3-458d-a701-10aa5fec68e7",
+  "prevId": "6fc40793-62fd-4b87-90de-a0606a3472aa",
   "tables": {
     "findings": {
       "name": "findings",
@@ -157,15 +157,15 @@
           "notNull": false,
           "autoincrement": false
         },
-        "error": {
-          "name": "error",
+        "injection_attempts": {
+          "name": "injection_attempts",
           "type": "text",
           "primaryKey": false,
           "notNull": false,
           "autoincrement": false
         },
-        "injection_attempts": {
-          "name": "injection_attempts",
+        "error": {
+          "name": "error",
           "type": "text",
           "primaryKey": false,
           "notNull": false,
@@ -223,6 +223,13 @@
           "notNull": true,
           "autoincrement": false
         },
+        "user_agent": {
+          "name": "user_agent",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
         "mode": {
           "name": "mode",
           "type": "text",
@@ -240,13 +247,6 @@
         },
         "authorization_note": {
           "name": "authorization_note",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": false,
-          "autoincrement": false
-        },
-        "user_agent": {
-          "name": "user_agent",
           "type": "text",
           "primaryKey": false,
           "notNull": false,

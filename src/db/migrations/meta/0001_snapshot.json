@@ -1,7 +1,7 @@
 {
   "version": "6",
   "dialect": "sqlite",
-  "id": "e2cc26cf-b017-4f8e-aba4-323ab9978f62",
+  "id": "6fc40793-62fd-4b87-90de-a0606a3472aa",
   "prevId": "ebe47297-2978-4c44-9dc6-44320ae7ff10",
   "tables": {
     "findings": {
@@ -216,6 +216,13 @@
           "notNull": true,
           "autoincrement": false
         },
+        "user_agent": {
+          "name": "user_agent",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
         "mode": {
           "name": "mode",
           "type": "text",
@@ -233,13 +240,6 @@
         },
         "authorization_note": {
           "name": "authorization_note",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": false,
-          "autoincrement": false
-        },
-        "user_agent": {
-          "name": "user_agent",
           "type": "text",
           "primaryKey": false,
           "notNull": false,
