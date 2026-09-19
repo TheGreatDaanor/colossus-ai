@@ -120,6 +120,14 @@ the out-of-scope list, the enumerated hosts found under them, and the scans
 run against it. Hosts accumulate across scans, so the inventory can be
 diffed over time.
 
+A program is **one engagement, not one domain** — it models an authorization
+boundary, and authorization is granted over an estate rather than per DNS
+name. Its in-scope list therefore holds however many apexes that engagement
+covers, and its exclusions are written once for all of them. A program
+covering a single domain is just an engagement with one entry; the reverse —
+expressing "these domains share one authorization" — is not available if
+programs are per-domain.
+
 **Scope** stays reserved for the rule set *inside* a program — the two lists
 — never for the program itself.
 

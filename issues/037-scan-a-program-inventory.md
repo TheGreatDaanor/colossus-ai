@@ -23,8 +23,12 @@ enumeration finally feeds the pipeline.
 - Schema: `scans.program_id` (nullable — legacy URL-only scans are unchanged),
   `scan_targets.enumerated_host_id`.
 - Service: `src/services/programs.ts` — `selectHostsToScan(programId, limit)`,
-  ordering hosts never scanned since first seen ahead of least-recently-scanned,
-  capped at 50. `src/services/scanner.ts` — resolves targets from the
+  ordering hosts never scanned since first seen ahead of least-recently-scanned.
+  The limit is chosen by mode — 250 passive, 50 active — because active
+  checks additionally launch a browser and inject payloads per target, and a
+  single flat cap would either throttle passive pointlessly or let active run
+  wild. Both are overridable per program via `passive_host_cap` /
+  `active_host_cap`. `src/services/scanner.ts` — resolves targets from the
   inventory in addition to submitted URLs, and stamps `last_scanned_at`.
 - Route / UI: scan results show which targets came from the inventory.
 
@@ -33,9 +37,10 @@ enumeration finally feeds the pipeline.
 - [ ] Failing test written first, confirmed red
 - [ ] Implementation makes it green
 - [ ] `test`, `typecheck`, `lint` all pass
-- [ ] Visible at: starting a scan on a program with 60 in-scope hosts produces
-      50 targets, new hosts first; a legacy scan with no `program_id` behaves
-      exactly as before.
+- [ ] Visible at: starting a scan on a program with 300 in-scope hosts
+      produces 250 targets in passive mode and 50 in active mode, new hosts
+      first in both; a program with `active_host_cap` set overrides that; a
+      legacy scan with no `program_id` behaves exactly as before.
 
 ## Out of scope
 

@@ -29,6 +29,11 @@ provider references can be detected and reported.
   so that authorization is declared once rather than per URL.
   - Acceptance: a program persists both lists and is referenced by subsequent
     scans.
+- As an operator scanning several companies, each engagement is one program
+  covering all of that company's domains, so that an exclusion is written once
+  rather than repeated per domain.
+  - Acceptance: a program accepts multiple apexes in its in-scope list, and a
+    single out-of-scope entry applies across all of them.
 - As an operator, creating a program from a submitted URL seeds its apex into
   the in-scope list, so that the common case takes one step.
   - Acceptance: creating a program from `https://example.com/x` proposes
@@ -78,8 +83,9 @@ provider references can be detected and reported.
     time; a newly appeared host is not emitted as a finding.
 - As an operator, scanning is capped per scan while recording is not, so that
   a large estate neither truncates my inventory nor blows up scan time.
-  - Acceptance: all enumerated hosts are recorded; at most 50 are scanned per
-    scan.
+  - Acceptance: all enumerated hosts are recorded; at most 250 are scanned
+    per passive-mode scan and at most 50 per active-mode scan, both
+    overridable per program.
 - As an operator, newly appeared hosts are scanned first, so that the freshest
   surface is checked soonest.
   - Acceptance: selection takes hosts unscanned since first seen, then the
@@ -114,6 +120,8 @@ New `programs`:
 |---|---|---|
 | id | integer, pk | no |
 | name | text | no |
+| passive_host_cap | integer (null = default 250) | yes |
+| active_host_cap | integer (null = default 50) | yes |
 | enumeration_error | text | yes |
 | last_enumerated_at | integer, timestamp | yes |
 | created_at | integer, timestamp | no |
@@ -246,8 +254,22 @@ MODIFY   src/db/schema.ts — the tables above.
 - **Scheme probe**: try both, keep whichever responds, prefer HTTPS when both
   do. A host answering on neither has `endpoint_url` null and spawns no
   target.
-- **Recording is uncapped; scanning is capped at 50 hosts per scan.**
-  Truncating the inventory would make it look complete when it is not.
+- **A program is one engagement, not one domain.** Its in-scope list holds
+  however many apexes the engagement covers, and its exclusions are written
+  once across all of them — avoiding the exclusion drift that per-domain
+  programs invite, where a host excluded in five programs is still scanned by
+  the sixth. A single-domain program is just an engagement with one entry.
+- **Recording is uncapped; scanning is capped per scan, split by mode:**
+  250 hosts in passive mode, 50 in active mode, both configurable per
+  program. Truncating the inventory would make it look complete when it is
+  not, but scanning costs real requests against the target — and the two
+  modes do not cost the same, since active checks additionally launch a
+  browser and inject payloads per target. One flat cap would either throttle
+  passive pointlessly or let active run wild.
+- **Time-to-full-coverage is bounded by the cap, not the inventory.** A
+  500-host program at 250 passive per scan is covered in two scans; the
+  selection order exists so that the hosts most likely to be broken (newly
+  appeared ones) are never the ones waiting at the back.
 - **Selection order**: hosts never scanned since first seen, then
   least-recently-scanned, up to the cap.
 - **Non-resolving hosts are retained forever** with `last_resolved_at`;

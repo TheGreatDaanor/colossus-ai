@@ -26,8 +26,13 @@ and the classification rule that every later issue depends on.
 
 ## Layers touched
 
-- Schema: `programs`, `scope_entries` (with `confirmed_at`, written but not yet
-  enforced — enforcement is 033).
+- Schema: `programs` (including the nullable `passive_host_cap` /
+  `active_host_cap` overrides consumed in 037), `scope_entries` (with
+  `confirmed_at`, written but not yet enforced — enforcement is 033).
+
+  A program is **one engagement, not one domain**: the apex seeded from the
+  submitted URL is the first entry in a list expected to hold several, and a
+  single out-of-scope entry applies across all of them.
 - Service: `src/services/programs.ts` — apex computation via the Public Suffix
   List, and `classifyHost(hostname, scope): ScopeStatus` as one ordered rule,
   out-of-scope evaluated first.
@@ -40,7 +45,9 @@ and the classification rule that every later issue depends on.
 - [ ] Implementation makes it green
 - [ ] `test`, `typecheck`, `lint` all pass
 - [ ] Visible at: `POST /programs {"url":"https://example.com/x"}` returns a
-      program with `example.com` in scope; `GET /programs/:id/classify?host=vpn.internal.example.com`
+      program with `example.com` in scope; adding `example-shop.com` as a
+      second apex puts hosts under both in scope;
+      `GET /programs/:id/classify?host=vpn.internal.example.com`
       returns `out_of_scope` once `*.internal.example.com` is excluded.
 
 ## Out of scope
