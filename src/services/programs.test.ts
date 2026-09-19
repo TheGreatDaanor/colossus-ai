@@ -392,6 +392,21 @@ describe('ProgramsService.recordHosts', () => {
     ]);
   });
 
+  it('records the wildcard flag an observation carries', async () => {
+    const service = buildService();
+    const program = await service.createProgram({ url: 'https://example.com' });
+
+    const recorded = await service.recordHosts(program.id, [
+      { hostname: 'example.com', source: 'ct-log', isWildcard: true },
+      { hostname: 'blog.example.com', source: 'ct-log' },
+    ]);
+
+    expect(recorded.map((h) => [h.hostname, h.isWildcard])).toEqual([
+      ['example.com', true],
+      ['blog.example.com', false],
+    ]);
+  });
+
   it('records a host matching neither list rather than dropping it', async () => {
     const service = buildService();
     const program = await service.createProgram({ url: 'https://example.com' });
