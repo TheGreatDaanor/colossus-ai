@@ -1,6 +1,7 @@
 import { Hono } from 'hono';
 import {
   ProgramValidationError,
+  type EnumeratedHost,
   type AddScopeEntryOptions,
   type CreateProgramOptions,
   type ProgramWithScope,
@@ -39,6 +40,11 @@ function parseScopeEntryBody(body: unknown): AddScopeEntryOptions | null {
 function serializeScopeEntry(entry: ScopeEntry) {
   const { programId, confirmedAt, ...rest } = entry;
   return { ...rest, program_id: programId, confirmed_at: confirmedAt };
+}
+
+function serializeHost(host: EnumeratedHost) {
+  const { programId, scopeStatus, firstSeenAt, ...rest } = host;
+  return { ...rest, program_id: programId, scope_status: scopeStatus, first_seen_at: firstSeenAt };
 }
 
 function serializeProgram(program: ProgramWithScope) {
@@ -126,6 +132,30 @@ export function createProgramsRoutes(service: ProgramsService): Hono {
     if (!program) return c.json({ error: 'program not found' }, 404);
 
     return c.json({ host, status: await service.classify(id, host) });
+  });
+
+  app.post('/programs/:id/enumerate', async (c) => {
+    const id = Number(c.req.param('id'));
+    if (!Number.isInteger(id)) return c.json({ error: 'program id must be an integer' }, 400);
+
+    if (!(await service.getProgram(id))) return c.json({ error: 'program not found' }, 404);
+
+    // The service records a source outage on the program rather than throwing,
+    // so this is still a 200: the operator gets the inventory plus the reason.
+    const hosts = await service.enumerateProgram(id);
+    const program = await service.getProgram(id);
+    return c.json({ hosts: hosts.map(serializeHost), enumeration_error: program?.enumerationError ?? null });
+  });
+
+  app.get('/programs/:id/hosts', async (c) => {
+    const id = Number(c.req.param('id'));
+    if (!Number.isInteger(id)) return c.json({ error: 'program id must be an integer' }, 400);
+
+    const program = await service.getProgram(id);
+    if (!program) return c.json({ error: 'program not found' }, 404);
+
+    const hosts = await service.listHosts(id);
+    return c.json({ hosts: hosts.map(serializeHost), enumeration_error: program.enumerationError });
   });
 
   return app;

@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { createDb } from '../db/client.js';
-import { ProgramsService } from '../services/programs.js';
+import { EnumerationError } from '../services/enumeration.js';
+import { ProgramsService, type ProgramsServiceOptions } from '../services/programs.js';
 import { createProgramsRoutes } from './programs.js';
 
 async function json<T>(res: Response): Promise<T> {
@@ -11,9 +12,11 @@ type ScopeEntryBody = { id: number; list: string; pattern: string; confirmed_at:
 type ProgramBody = { id: number; name: string; scope_entries: ScopeEntryBody[] };
 type ClassifyBody = { host: string; status: string };
 type ErrorBody = { error: string };
+type HostBody = { id: number; hostname: string; source: string; scope_status: string };
+type HostsBody = { hosts: HostBody[]; enumeration_error: string | null };
 
-function buildApp() {
-  const service = new ProgramsService(createDb(':memory:'));
+function buildApp(options: ProgramsServiceOptions = {}) {
+  const service = new ProgramsService(createDb(':memory:'), options);
   return { app: createProgramsRoutes(service), service };
 }
 
@@ -209,5 +212,82 @@ describe('GET /programs/:id/classify', () => {
     const { app } = buildApp();
 
     expect((await app.request('/programs/404/classify?host=example.com')).status).toBe(404);
+  });
+});
+
+describe('POST /programs/:id/enumerate', () => {
+  it('returns the hosts found, each with its scope status', async () => {
+    const { app } = buildApp({
+      enumerationImpl: {
+        enumerate: async () => [
+          { hostname: 'blog.example.com', source: 'ct-log' as const },
+          { hostname: 'partner.example.org', source: 'ct-log' as const },
+        ],
+      },
+    });
+    const created = await json<ProgramBody>(await postJson(app, '/programs', { url: 'https://example.com' }));
+
+    const res = await app.request(`/programs/${created.id}/enumerate`, { method: 'POST' });
+
+    expect(res.status).toBe(200);
+    const body = await json<HostsBody>(res);
+    expect(body.hosts).toEqual([
+      expect.objectContaining({ hostname: 'blog.example.com', scope_status: 'in_scope', source: 'ct-log' }),
+      expect.objectContaining({ hostname: 'partner.example.org', scope_status: 'unscoped' }),
+    ]);
+  });
+
+  it('returns the existing inventory and reports the error when the CT source fails', async () => {
+    const { app, service } = buildApp({
+      enumerationImpl: {
+        enumerate: async () => {
+          throw new EnumerationError('crt.sh: 502 Bad Gateway');
+        },
+      },
+    });
+    const created = await json<ProgramBody>(await postJson(app, '/programs', { url: 'https://example.com' }));
+    await service.recordHosts(created.id, [{ hostname: 'known.example.com', source: 'ct-log' }]);
+
+    const res = await app.request(`/programs/${created.id}/enumerate`, { method: 'POST' });
+
+    expect(res.status).toBe(200);
+    const body = await json<HostsBody>(res);
+    expect(body.hosts.map((h) => h.hostname)).toEqual(['known.example.com']);
+    expect(body.enumeration_error).toContain('502');
+  });
+
+  it('returns 404 for an unknown program', async () => {
+    const { app } = buildApp({ enumerationImpl: { enumerate: async () => [] } });
+
+    expect((await app.request('/programs/404/enumerate', { method: 'POST' })).status).toBe(404);
+  });
+});
+
+describe('GET /programs/:id/hosts', () => {
+  it('lists the recorded inventory with scope status', async () => {
+    const { app, service } = buildApp();
+    const created = await json<ProgramBody>(await postJson(app, '/programs', { url: 'https://example.com' }));
+    await service.recordHosts(created.id, [{ hostname: 'blog.example.com', source: 'ct-log' }]);
+
+    const res = await app.request(`/programs/${created.id}/hosts`);
+
+    expect(res.status).toBe(200);
+    const body = await json<HostsBody>(res);
+    expect(body.hosts).toEqual([
+      expect.objectContaining({ hostname: 'blog.example.com', scope_status: 'in_scope', source: 'ct-log' }),
+    ]);
+  });
+
+  it('returns an empty list for a program that has never been enumerated', async () => {
+    const { app } = buildApp();
+    const created = await json<ProgramBody>(await postJson(app, '/programs', { url: 'https://example.com' }));
+
+    expect((await json<HostsBody>(await app.request(`/programs/${created.id}/hosts`))).hosts).toEqual([]);
+  });
+
+  it('returns 404 for an unknown program', async () => {
+    const { app } = buildApp();
+
+    expect((await app.request('/programs/404/hosts')).status).toBe(404);
   });
 });

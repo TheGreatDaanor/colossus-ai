@@ -1,11 +1,13 @@
 import { and, asc, eq } from 'drizzle-orm';
 import psl from 'psl';
 import type { Db } from '../db/client.js';
-import { programs, scopeEntries, type ScopeList, type ScopeStatus } from '../db/schema.js';
+import { enumeratedHosts, programs, scopeEntries, type ScopeList, type ScopeStatus } from '../db/schema.js';
+import { EnumerationError, type ObservedHost } from './enumeration.js';
 
 export class ProgramValidationError extends Error {}
 
 export type Program = typeof programs.$inferSelect;
+export type EnumeratedHost = typeof enumeratedHosts.$inferSelect;
 export type ScopeEntry = typeof scopeEntries.$inferSelect;
 export type ProgramWithScope = Program & { scopeEntries: ScopeEntry[] };
 
@@ -21,6 +23,12 @@ export type CreateProgramOptions = {
 };
 
 export type AddScopeEntryOptions = { list: ScopeList; pattern: string };
+
+// The one thing this service needs from the enumeration side: given an apex,
+// what hosts exist. Injected so scope rules stay testable without a network.
+export type EnumerationImpl = { enumerate(apex: string): Promise<ObservedHost[]> };
+
+export type ProgramsServiceOptions = { enumerationImpl?: EnumerationImpl };
 
 export type { ScopeList, ScopeStatus };
 
@@ -124,9 +132,11 @@ function validatePattern(list: ScopeList, raw: string): string {
 
 export class ProgramsService {
   #db: Db;
+  #enumerationImpl: EnumerationImpl | null;
 
-  constructor(db: Db) {
+  constructor(db: Db, options: ProgramsServiceOptions = {}) {
     this.#db = db;
+    this.#enumerationImpl = options.enumerationImpl ?? null;
   }
 
   async createProgram(options: CreateProgramOptions): Promise<ProgramWithScope> {
@@ -201,6 +211,93 @@ export class ProgramsService {
   async classify(programId: number, hostname: string): Promise<ScopeStatus> {
     this.#requireProgram(programId);
     return classifyHost(hostname, toScope(this.#scopeEntriesOf(programId)));
+  }
+
+  // Records what a source observed, classifying each host as it lands. A host
+  // is kept whatever its status: an `unscoped` host is what the operator needs
+  // to see in order to widen scope deliberately, and is never scanned meanwhile.
+  async recordHosts(programId: number, hosts: ObservedHost[]): Promise<EnumeratedHost[]> {
+    this.#requireProgram(programId);
+    const scope = toScope(this.#scopeEntriesOf(programId));
+    const firstSeenAt = new Date();
+
+    const recorded: EnumeratedHost[] = [];
+    for (const host of hosts) {
+      const hostname = normaliseHostname(host.hostname);
+      const scopeStatus = classifyHost(hostname, scope);
+      const existing = this.#db
+        .select()
+        .from(enumeratedHosts)
+        .where(and(eq(enumeratedHosts.programId, programId), eq(enumeratedHosts.hostname, hostname)))
+        .get();
+
+      // A host already in the inventory keeps its identity and the date it was
+      // first seen; only its scope status is refreshed, because the operator may
+      // have changed the lists since.
+      const row = existing
+        ? this.#db
+            .update(enumeratedHosts)
+            .set({ scopeStatus })
+            .where(eq(enumeratedHosts.id, existing.id))
+            .returning()
+            .get()
+        : this.#db
+            .insert(enumeratedHosts)
+            .values({ programId, hostname, source: host.source, scopeStatus, firstSeenAt })
+            .returning()
+            .get();
+      if (!row) throw new Error('failed to record enumerated host');
+      recorded.push(row);
+    }
+
+    return recorded;
+  }
+
+  async listHosts(programId: number): Promise<EnumeratedHost[]> {
+    this.#requireProgram(programId);
+    return this.#db
+      .select()
+      .from(enumeratedHosts)
+      .where(eq(enumeratedHosts.programId, programId))
+      .orderBy(asc(enumeratedHosts.hostname))
+      .all();
+  }
+
+  // Enumerates every apex on the in-scope list and records what comes back.
+  // A source outage is recorded on the program rather than thrown: the operator
+  // still gets the inventory they already had, plus the reason nothing is new.
+  async enumerateProgram(programId: number): Promise<EnumeratedHost[]> {
+    this.#requireProgram(programId);
+    if (this.#enumerationImpl === null) throw new Error('programs service was built without an enumeration source');
+
+    const observed: ObservedHost[] = [];
+    const errors: string[] = [];
+    for (const apex of this.#apexesOf(programId)) {
+      try {
+        observed.push(...(await this.#enumerationImpl.enumerate(apex)));
+      } catch (err) {
+        if (!(err instanceof EnumerationError)) throw err;
+        errors.push(`${apex}: ${err.message}`);
+      }
+    }
+
+    await this.recordHosts(programId, observed);
+    this.#db
+      .update(programs)
+      .set({ lastEnumeratedAt: new Date(), enumerationError: errors.length === 0 ? null : errors.join('; ') })
+      .where(eq(programs.id, programId))
+      .run();
+
+    return this.listHosts(programId);
+  }
+
+  // Only apexes are enumerated: an exact-host entry authorizes that one host,
+  // and enumerating its domain would widen the engagement past what was agreed.
+  #apexesOf(programId: number): string[] {
+    const patterns = this.#scopeEntriesOf(programId)
+      .filter((entry) => entry.list === 'in')
+      .map((entry) => normaliseHostname(entry.pattern));
+    return [...new Set(patterns.filter((pattern) => apexOf(pattern) === pattern))];
   }
 
   #requireProgram(id: number): Program {

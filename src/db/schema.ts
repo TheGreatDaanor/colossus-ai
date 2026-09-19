@@ -1,4 +1,4 @@
-import { sqliteTable, integer, text, type AnySQLiteColumn } from 'drizzle-orm/sqlite-core';
+import { sqliteTable, integer, text, uniqueIndex, type AnySQLiteColumn } from 'drizzle-orm/sqlite-core';
 
 export type ScanStatus = 'pending' | 'running' | 'completed' | 'failed';
 export type ScanMode = 'passive' | 'active';
@@ -107,3 +107,23 @@ export const scopeEntries = sqliteTable('scope_entries', {
   pattern: text('pattern').notNull(),
   confirmedAt: integer('confirmed_at', { mode: 'timestamp' }),
 });
+
+export type HostSource = 'ct-log' | 'crawl';
+
+// One row per hostname per program: the program's inventory. A host is recorded
+// whatever its scope status — an `unscoped` host is kept so the operator can see
+// what exists and widen scope deliberately, and is never scanned in the meantime.
+export const enumeratedHosts = sqliteTable(
+  'enumerated_hosts',
+  {
+    id: integer('id').primaryKey({ autoIncrement: true }),
+    programId: integer('program_id')
+      .notNull()
+      .references(() => programs.id),
+    hostname: text('hostname').notNull(),
+    source: text('source').$type<HostSource>().notNull(),
+    scopeStatus: text('scope_status').$type<ScopeStatus>().notNull(),
+    firstSeenAt: integer('first_seen_at', { mode: 'timestamp' }).notNull(),
+  },
+  (table) => [uniqueIndex('enumerated_hosts_program_hostname').on(table.programId, table.hostname)],
+);
