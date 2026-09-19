@@ -434,6 +434,35 @@ describe('ProgramsService.recordHosts', () => {
     expect(await service.listHosts(theirs.id)).toEqual([]);
   });
 
+  it('records a hostname named twice in the same batch only once', async () => {
+    // One enumeration run can name the same host from two sources or two
+    // certificates; a batch that trips the unique index would lose the run.
+    const service = buildService();
+    const program = await service.createProgram({ url: 'https://example.com' });
+
+    await service.recordHosts(program.id, [
+      { hostname: 'blog.example.com', source: 'ct-log' },
+      { hostname: 'blog.example.com', source: 'ct-log' },
+    ]);
+
+    expect((await service.listHosts(program.id)).map((h) => h.hostname)).toEqual(['blog.example.com']);
+  });
+
+  it('records an inventory larger than one SQL statement can bind at once', async () => {
+    // A CT answer for a busy apex routinely names thousands of hosts, which is
+    // more bound parameters than SQLite accepts in a single statement.
+    const service = buildService();
+    const program = await service.createProgram({ url: 'https://example.com' });
+    const hosts = Array.from({ length: 2_000 }, (_, i) => ({
+      hostname: `host-${i}.example.com`,
+      source: 'ct-log' as const,
+    }));
+
+    await service.recordHosts(program.id, hosts);
+
+    expect(await service.listHosts(program.id)).toHaveLength(2_000);
+  });
+
   it('rejects recording against an unknown program', async () => {
     const service = buildService();
 
@@ -520,6 +549,23 @@ describe('ProgramsService.enumerateProgram', () => {
     await service.enumerateProgram(program.id);
 
     expect((await service.getProgram(program.id))?.enumerationError).toBeNull();
+  });
+
+  it('does not stamp lastEnumeratedAt when every apex failed', async () => {
+    // Nothing was enumerated, so claiming a successful enumeration time would
+    // tell the operator the inventory is fresh when no source was ever read.
+    const service = buildService({
+      enumerationImpl: {
+        enumerate: async () => {
+          throw new EnumerationError('crt.sh: 502 Bad Gateway');
+        },
+      },
+    });
+    const program = await service.createProgram({ url: 'https://example.com' });
+
+    await service.enumerateProgram(program.id);
+
+    expect((await service.getProgram(program.id))?.lastEnumeratedAt).toBeNull();
   });
 
   it('rejects enumerating an unknown program', async () => {

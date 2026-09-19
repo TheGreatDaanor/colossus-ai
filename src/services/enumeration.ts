@@ -17,6 +17,7 @@ export type EnumerationServiceOptions = {
   ctFetchImpl?: CtFetchImpl;
   userAgent?: string;
   cacheTtlMs?: number;
+  maxCacheEntries?: number;
   now?: () => number;
 };
 
@@ -29,6 +30,16 @@ const DEFAULT_USER_AGENT = 'colossus-scanner/1.0';
 // Long enough that an on-demand run straight after a scheduled one reuses the
 // answer, short enough that a certificate issued today still shows up today.
 const DEFAULT_CACHE_TTL_MS = 5 * 60 * 1000;
+
+// One long-lived process enumerates many programs, and an entry is one apex's
+// host list — so the cache is bounded by count, oldest evicted first, rather
+// than left to grow for as long as the process lives.
+const DEFAULT_MAX_CACHE_ENTRIES = 256;
+
+// crt.sh is frequently slow and sometimes never answers at all. Without a bound
+// an on-demand enumerate would hold its request open for as long as crt.sh
+// leaves the socket open.
+const DEFAULT_CT_TIMEOUT_MS = 30_000;
 
 const WILDCARD_PREFIX = '*.';
 
@@ -60,13 +71,31 @@ function isUnderApex(hostname: string, apex: string): boolean {
   return hostname === apex || hostname.endsWith(`.${apex}`);
 }
 
-function defaultCtFetchImpl(userAgent: string): CtFetchImpl {
+export type CtFetchOptions = { userAgent?: string; endpoint?: string; timeoutMs?: number };
+
+// The real crt.sh query. Every failure — refused, timed out, non-2xx, or a body
+// that is not JSON — leaves as an EnumerationError, because the caller's whole
+// contract is that a source outage is non-fatal and recorded on the program.
+export function createCtFetch(options: CtFetchOptions = {}): CtFetchImpl {
+  const userAgent = options.userAgent ?? DEFAULT_USER_AGENT;
+  const endpoint = options.endpoint ?? CRT_SH_ENDPOINT;
+  const timeoutMs = options.timeoutMs ?? DEFAULT_CT_TIMEOUT_MS;
+
   return async (apex) => {
-    const response = await fetch(`${CRT_SH_ENDPOINT}/?q=${encodeURIComponent(`%.${apex}`)}&output=json`, {
-      headers: { 'user-agent': userAgent },
-    });
-    if (!response.ok) throw new EnumerationError(`crt.sh: ${response.status} ${response.statusText}`);
-    return response.json();
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      const response = await fetch(`${endpoint}/?q=${encodeURIComponent(`%.${apex}`)}&output=json`, {
+        headers: { 'user-agent': userAgent },
+        signal: controller.signal,
+      });
+      if (!response.ok) throw new EnumerationError(`crt.sh: ${response.status} ${response.statusText}`);
+      return await response.json();
+    } catch (err) {
+      throw err instanceof EnumerationError ? err : new EnumerationError(`crt.sh query failed: ${String(err)}`);
+    } finally {
+      clearTimeout(timer);
+    }
   };
 }
 
@@ -77,12 +106,14 @@ type CacheEntry = { hosts: ObservedHost[]; storedAt: number };
 export class EnumerationService {
   #ctFetchImpl: CtFetchImpl;
   #cacheTtlMs: number;
+  #maxCacheEntries: number;
   #now: () => number;
   #cache = new Map<string, CacheEntry>();
 
   constructor(options: EnumerationServiceOptions = {}) {
-    this.#ctFetchImpl = options.ctFetchImpl ?? defaultCtFetchImpl(options.userAgent ?? DEFAULT_USER_AGENT);
+    this.#ctFetchImpl = options.ctFetchImpl ?? createCtFetch({ userAgent: options.userAgent ?? DEFAULT_USER_AGENT });
     this.#cacheTtlMs = options.cacheTtlMs ?? DEFAULT_CACHE_TTL_MS;
+    this.#maxCacheEntries = options.maxCacheEntries ?? DEFAULT_MAX_CACHE_ENTRIES;
     this.#now = options.now ?? Date.now;
   }
 
@@ -104,8 +135,18 @@ export class EnumerationService {
     }
 
     const hosts = collectHosts(payload, normalisedApex);
-    this.#cache.set(normalisedApex, { hosts, storedAt: this.#now() });
+    this.#remember(normalisedApex, hosts);
     return hosts;
+  }
+  // A Map iterates in insertion order, so the first key is the oldest entry.
+  #remember(apex: string, hosts: ObservedHost[]): void {
+    this.#cache.delete(apex);
+    this.#cache.set(apex, { hosts, storedAt: this.#now() });
+    while (this.#cache.size > this.#maxCacheEntries) {
+      const oldest = this.#cache.keys().next();
+      if (oldest.done) break;
+      this.#cache.delete(oldest.value);
+    }
   }
 }
 

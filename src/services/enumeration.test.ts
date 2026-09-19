@@ -1,5 +1,7 @@
+import { createServer } from 'node:http';
+import type { AddressInfo } from 'node:net';
 import { describe, expect, it, vi } from 'vitest';
-import { EnumerationError, EnumerationService, type CtFetchImpl } from './enumeration.js';
+import { createCtFetch, EnumerationError, EnumerationService, type CtFetchImpl } from './enumeration.js';
 
 // crt.sh answers with one record per certificate identity; `name_value` holds
 // newline-separated names, which is where wildcards and duplicates come from.
@@ -100,6 +102,20 @@ describe('EnumerationService.enumerate', () => {
     expect(ctFetchImpl).toHaveBeenCalledTimes(2);
   });
 
+  it('stops caching apexes once the cache is full, oldest first', async () => {
+    // One process enumerates many programs over its lifetime; an unbounded cache
+    // would hold every apex ever queried for as long as the process lives.
+    const ctFetchImpl = vi.fn(async () => ctRecords('blog.example.com'));
+    const service = new EnumerationService({ ctFetchImpl, maxCacheEntries: 2 });
+
+    await service.enumerate('one.com');
+    await service.enumerate('two.com');
+    await service.enumerate('three.com');
+    await service.enumerate('one.com');
+
+    expect(ctFetchImpl).toHaveBeenCalledTimes(4);
+  });
+
   it('throws EnumerationError when the CT source fails', async () => {
     const service = new EnumerationService({
       ctFetchImpl: async () => {
@@ -120,5 +136,24 @@ describe('EnumerationService.enumerate', () => {
     await expect(service.enumerate('example.com')).rejects.toBeInstanceOf(EnumerationError);
 
     expect(ctFetchImpl).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe('createCtFetch', () => {
+  // The one place in this module that does real I/O, so the timeout is exercised
+  // against a local server rather than stubbed.
+  it('gives up on a source that never answers, instead of hanging', async () => {
+    const server = createServer(() => {
+      // Never responds: the request is left open until the client gives up.
+    });
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+    const { port } = server.address() as AddressInfo;
+
+    try {
+      const fetchImpl = createCtFetch({ userAgent: 'test', endpoint: `http://127.0.0.1:${port}`, timeoutMs: 100 });
+      await expect(fetchImpl('example.com')).rejects.toBeInstanceOf(EnumerationError);
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
   });
 });

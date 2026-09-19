@@ -1,7 +1,7 @@
-import { and, asc, eq } from 'drizzle-orm';
+import { and, asc, eq, sql } from 'drizzle-orm';
 import psl from 'psl';
 import type { Db } from '../db/client.js';
-import { enumeratedHosts, programs, scopeEntries, type ScopeList, type ScopeStatus } from '../db/schema.js';
+import { enumeratedHosts, programs, scopeEntries, type HostSource, type ScopeList, type ScopeStatus } from '../db/schema.js';
 import { EnumerationError, type ObservedHost } from './enumeration.js';
 
 export class ProgramValidationError extends Error {}
@@ -33,6 +33,11 @@ export type ProgramsServiceOptions = { enumerationImpl?: EnumerationImpl };
 export type { ScopeList, ScopeStatus };
 
 const WILDCARD_PREFIX = '*.';
+
+// SQLite binds a limited number of parameters per statement and each row here
+// binds five, so a large inventory goes in as several statements inside one
+// transaction rather than one statement that would be refused.
+const UPSERT_BATCH_SIZE = 100;
 
 // DNS names are case-insensitive and a trailing dot only marks the root, so both
 // hosts and patterns are folded to one form before any comparison.
@@ -216,41 +221,58 @@ export class ProgramsService {
   // Records what a source observed, classifying each host as it lands. A host
   // is kept whatever its status: an `unscoped` host is what the operator needs
   // to see in order to widen scope deliberately, and is never scanned meanwhile.
+  //
+  // The program's passive/active host caps are deliberately not applied here:
+  // they bound what a *scan* reaches (issue 037), not what the inventory may
+  // know about. Capping the inventory would hide hosts from the operator.
   async recordHosts(programId: number, hosts: ObservedHost[]): Promise<EnumeratedHost[]> {
     this.#requireProgram(programId);
     const scope = toScope(this.#scopeEntriesOf(programId));
     const firstSeenAt = new Date();
 
-    const recorded: EnumeratedHost[] = [];
+    // One CT answer for a busy apex names thousands of hosts, so the rows go in
+    // as batched upserts rather than a select-then-write per host. The whole
+    // batch is one transaction: a run that fails partway must not leave the
+    // operator with an inventory that is neither the old one nor the new one.
+    const rows = new Map<string, { programId: number; hostname: string; source: HostSource; scopeStatus: ScopeStatus; firstSeenAt: Date }>();
     for (const host of hosts) {
       const hostname = normaliseHostname(host.hostname);
-      const scopeStatus = classifyHost(hostname, scope);
-      const existing = this.#db
-        .select()
-        .from(enumeratedHosts)
-        .where(and(eq(enumeratedHosts.programId, programId), eq(enumeratedHosts.hostname, hostname)))
-        .get();
-
-      // A host already in the inventory keeps its identity and the date it was
-      // first seen; only its scope status is refreshed, because the operator may
-      // have changed the lists since.
-      const row = existing
-        ? this.#db
-            .update(enumeratedHosts)
-            .set({ scopeStatus })
-            .where(eq(enumeratedHosts.id, existing.id))
-            .returning()
-            .get()
-        : this.#db
-            .insert(enumeratedHosts)
-            .values({ programId, hostname, source: host.source, scopeStatus, firstSeenAt })
-            .returning()
-            .get();
-      if (!row) throw new Error('failed to record enumerated host');
-      recorded.push(row);
+      // Last mention of a hostname wins, which matters only for `source`; a
+      // host already in the inventory keeps the source it was first seen with.
+      rows.set(hostname, {
+        programId,
+        hostname,
+        source: host.source,
+        scopeStatus: classifyHost(hostname, scope),
+        firstSeenAt,
+      });
     }
+    if (rows.size === 0) return [];
 
-    return recorded;
+    const batched = [...rows.values()];
+    this.#db.transaction((tx) => {
+      for (let i = 0; i < batched.length; i += UPSERT_BATCH_SIZE) {
+        tx.insert(enumeratedHosts)
+          .values(batched.slice(i, i + UPSERT_BATCH_SIZE))
+          // A host already in the inventory keeps its identity and the date it
+          // was first seen; only its scope status is refreshed, because the
+          // operator may have changed the lists since.
+          .onConflictDoUpdate({
+            target: [enumeratedHosts.programId, enumeratedHosts.hostname],
+            set: { scopeStatus: sql`excluded.scope_status` },
+          })
+          .run();
+      }
+    });
+
+    // Returned in the order the caller observed them, not the order they sit in
+    // the table: the caller is reporting on the run it just made.
+    const stored = new Map((await this.listHosts(programId)).map((row) => [row.hostname, row]));
+    return [...rows.keys()].flatMap((hostname) => {
+      const row = stored.get(hostname);
+      if (!row) throw new Error(`failed to record enumerated host ${hostname}`);
+      return [row];
+    });
   }
 
   async listHosts(programId: number): Promise<EnumeratedHost[]> {
@@ -270,9 +292,10 @@ export class ProgramsService {
     this.#requireProgram(programId);
     if (this.#enumerationImpl === null) throw new Error('programs service was built without an enumeration source');
 
+    const apexes = this.#apexesOf(programId);
     const observed: ObservedHost[] = [];
     const errors: string[] = [];
-    for (const apex of this.#apexesOf(programId)) {
+    for (const apex of apexes) {
       try {
         observed.push(...(await this.#enumerationImpl.enumerate(apex)));
       } catch (err) {
@@ -282,9 +305,17 @@ export class ProgramsService {
     }
 
     await this.recordHosts(programId, observed);
+
+    // `lastEnumeratedAt` answers "how fresh is this inventory", so it is stamped
+    // only when a source was actually read. A run where every apex failed left
+    // the inventory exactly as stale as it was, and must not claim otherwise.
+    const readAnySource = errors.length < apexes.length;
     this.#db
       .update(programs)
-      .set({ lastEnumeratedAt: new Date(), enumerationError: errors.length === 0 ? null : errors.join('; ') })
+      .set({
+        ...(readAnySource ? { lastEnumeratedAt: new Date() } : {}),
+        enumerationError: errors.length === 0 ? null : errors.join('; '),
+      })
       .where(eq(programs.id, programId))
       .run();
 
