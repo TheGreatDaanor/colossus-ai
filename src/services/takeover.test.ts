@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { checkTakeover, type DnsResolverImpl } from './takeover.js';
+import { checkTakeover, type DnsResolverImpl, type TakeoverFetchImpl } from './takeover.js';
 
 class DnsError extends Error {
   code: string;
@@ -36,16 +36,15 @@ describe('checkTakeover', () => {
 
     const evidence = await checkTakeover('blog.example.com', { resolverImpl });
 
-    expect(evidence).toEqual({
+    expect(evidence).toMatchObject({
       hostname: 'blog.example.com',
       cnameTarget: 'abandoned.s3.amazonaws.com',
-      provider: null,
       confidence: 'possible',
     });
   });
 
-  it('reports the dangling target at `possible` confidence, since no fingerprint was matched', async () => {
-    const resolverImpl = stubResolver({ cnames: { 'blog.example.com': 'abandoned.s3.amazonaws.com' } });
+  it('reports the dangling target at `possible` confidence when no provider response confirms it', async () => {
+    const resolverImpl = stubResolver({ cnames: { 'blog.example.com': 'abandoned.unknown-host.example' } });
 
     const evidence = await checkTakeover('blog.example.com', { resolverImpl });
 
@@ -156,5 +155,112 @@ describe('checkTakeover', () => {
     };
 
     expect(await checkTakeover('blog.example.com', { resolverImpl })).toBeNull();
+  });
+
+  // The provider is never contacted in these tests: a stub stands in for the
+  // fetch, so the suite makes no outbound request and no resource is claimed.
+  function stubFetch(body: string): TakeoverFetchImpl {
+    return async () => body;
+  }
+
+  const unreachableFetch: TakeoverFetchImpl = async () => {
+    throw new Error('connection refused');
+  };
+
+  describe('provider fingerprints', () => {
+    it('names the provider matched from the CNAME target', async () => {
+      const resolverImpl = stubResolver({ cnames: { 'blog.example.com': 'abandoned.s3.amazonaws.com' } });
+
+      const evidence = await checkTakeover('blog.example.com', { resolverImpl, fetchImpl: unreachableFetch });
+
+      expect(evidence?.provider).toBe('Amazon S3');
+    });
+
+    it('upgrades to definitive when the provider response matches an unclaimed fingerprint', async () => {
+      const resolverImpl = stubResolver({ cnames: { 'blog.example.com': 'abandoned.s3.amazonaws.com' } });
+
+      const evidence = await checkTakeover('blog.example.com', {
+        resolverImpl,
+        fetchImpl: stubFetch('<html><body>NoSuchBucket</body></html>'),
+      });
+
+      expect(evidence?.confidence).toBe('definitive');
+      expect(evidence?.provider).toBe('Amazon S3');
+    });
+
+    it('stays possible when the provider response does not match the fingerprint', async () => {
+      const resolverImpl = stubResolver({ cnames: { 'blog.example.com': 'abandoned.s3.amazonaws.com' } });
+
+      const evidence = await checkTakeover('blog.example.com', {
+        resolverImpl,
+        fetchImpl: stubFetch('<html><body>Hello from a live site</body></html>'),
+      });
+
+      expect(evidence?.confidence).toBe('possible');
+    });
+
+    it('stays possible when the provider cannot be reached at all', async () => {
+      // The usual shape of a dangling S3 reference: nothing resolves, so there is
+      // no response to fingerprint. DNS evidence alone is never `definitive`.
+      const resolverImpl = stubResolver({ cnames: { 'blog.example.com': 'abandoned.s3.amazonaws.com' } });
+
+      const evidence = await checkTakeover('blog.example.com', { resolverImpl, fetchImpl: unreachableFetch });
+
+      expect(evidence?.confidence).toBe('possible');
+    });
+
+    it('leaves the provider null and stays possible for a target no fingerprint covers', async () => {
+      const resolverImpl = stubResolver({ cnames: { 'blog.example.com': 'abandoned.unknown-host.example' } });
+
+      const evidence = await checkTakeover('blog.example.com', {
+        resolverImpl,
+        fetchImpl: stubFetch('NoSuchBucket'),
+      });
+
+      expect(evidence?.provider).toBeNull();
+      expect(evidence?.confidence).toBe('possible');
+    });
+
+    it.each([
+      ['abandoned.github.io', 'GitHub Pages', "There isn't a GitHub Pages site here."],
+      ['abandoned.herokudns.com', 'Heroku', 'No such app'],
+      ['abandoned.azurewebsites.net', 'Azure', 'Error 404 - Web app not found.'],
+      ['abandoned.fastly.net', 'Fastly', 'Fastly error: unknown domain'],
+      ['abandoned.myshopify.com', 'Shopify', 'Sorry, this shop is currently unavailable.'],
+    ])('fingerprints %s as %s', async (target, provider, marker) => {
+      const resolverImpl = stubResolver({ cnames: { 'blog.example.com': target } });
+
+      const evidence = await checkTakeover('blog.example.com', { resolverImpl, fetchImpl: stubFetch(marker) });
+
+      expect(evidence?.provider).toBe(provider);
+      expect(evidence?.confidence).toBe('definitive');
+    });
+
+    it('names the provider and the resource in the remediation, and claims nothing', async () => {
+      const resolverImpl = stubResolver({ cnames: { 'blog.example.com': 'abandoned.s3.amazonaws.com' } });
+
+      const evidence = await checkTakeover('blog.example.com', {
+        resolverImpl,
+        fetchImpl: stubFetch('NoSuchBucket'),
+      });
+
+      expect(evidence?.remediation).toContain('Amazon S3');
+      expect(evidence?.remediation).toContain('abandoned.s3.amazonaws.com');
+    });
+
+    it('requests the hostname itself, not the provider resource', async () => {
+      const resolverImpl = stubResolver({ cnames: { 'blog.example.com': 'abandoned.s3.amazonaws.com' } });
+      const seen: string[] = [];
+
+      await checkTakeover('blog.example.com', {
+        resolverImpl,
+        fetchImpl: async (url) => {
+          seen.push(url);
+          return 'NoSuchBucket';
+        },
+      });
+
+      expect(seen[0]).toBe('https://blog.example.com/');
+    });
   });
 });

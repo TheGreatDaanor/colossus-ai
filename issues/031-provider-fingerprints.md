@@ -1,7 +1,7 @@
 ---
 id: 031
 title: Upgrade takeover evidence to definitive with provider fingerprints
-status: open
+status: done
 type: afk
 blocked-by: [030]
 ---
@@ -29,10 +29,10 @@ unclaimed, instead of only saying the CNAME is dangling.
 
 ## Definition of done
 
-- [ ] Failing test written first, confirmed red
-- [ ] Implementation makes it green
-- [ ] `test`, `typecheck`, `lint` all pass
-- [ ] Visible at: `npx tsx scripts/check-takeover.ts <hostname>` prints
+- [x] Failing test written first, confirmed red
+- [x] Implementation makes it green
+- [x] `test`, `typecheck`, `lint` all pass
+- [x] Visible at: `npx tsx scripts/check-takeover.ts <hostname>` prints
       `definitive` plus the provider for a fingerprinted host, and `possible`
       for a dangling host with no fingerprint match.
 

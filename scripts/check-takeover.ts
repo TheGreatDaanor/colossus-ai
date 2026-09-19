@@ -1,5 +1,6 @@
 // Prints the takeover evidence for one hostname, or reports its CNAME chain is
-// healthy. Reporting only: nothing is persisted and no provider is contacted.
+// healthy. Reporting only: nothing is persisted, and the only provider request
+// is a plain GET of the hostname — no resource is ever claimed.
 //
 //   npx tsx scripts/check-takeover.ts <hostname>
 import { checkTakeover } from '../src/services/takeover.js';
@@ -20,5 +21,6 @@ if (evidence === null) {
 console.warn(`${evidence.hostname}: DANGLING CNAME -> ${evidence.cnameTarget}`);
 console.warn(`  provider:   ${evidence.provider ?? 'unknown (no fingerprint matched)'}`);
 console.warn(`  confidence: ${evidence.confidence}`);
+console.warn(`  remediation: ${evidence.remediation}`);
 console.warn('  The CNAME target does not resolve. Whoever claims that provider resource');
-console.warn("  serves content under this hostname. Remove the record, or reclaim the resource.");
+console.warn('  serves content under this hostname.');

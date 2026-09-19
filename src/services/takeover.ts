@@ -9,16 +9,87 @@ export type DnsResolverImpl = {
   resolveAddresses(hostname: string): Promise<string[]>;
 };
 
+// Fetching the hostname is narrowed to "give me the response body as text", so
+// tests stub it and no test — and no fingerprint match — touches the network.
+export type TakeoverFetchImpl = (url: string) => Promise<string>;
+
 export type TakeoverEvidence = {
   hostname: string;
   cnameTarget: string;
-  // Null until the fingerprint table lands: with no provider matched, the
-  // dangling reference alone is all the evidence there is.
+  // Null when the CNAME target matches no entry in the fingerprint table: the
+  // dangling reference alone is then all the evidence there is.
   provider: string | null;
   confidence: FindingConfidence;
+  // What the operator should do. Names the provider and the resource so they can
+  // reclaim or remove it themselves — Colossus never claims it.
+  remediation: string;
 };
 
-export type CheckTakeoverOptions = { resolverImpl?: DnsResolverImpl };
+export type CheckTakeoverOptions = { resolverImpl?: DnsResolverImpl; fetchImpl?: TakeoverFetchImpl };
+
+// Hand-maintained in-repo and never fetched at runtime: a third party must not
+// be able to change what Colossus asserts as `definitive`. `cnameSuffixes` say
+// which provider a dangling target belongs to; `unclaimedMarkers` are strings
+// the provider itself serves when the resource behind the name is unclaimed.
+// The table grows on demand — an unlisted provider still reports at `possible`.
+type ProviderFingerprint = {
+  provider: string;
+  cnameSuffixes: readonly string[];
+  unclaimedMarkers: readonly string[];
+};
+
+const PROVIDER_FINGERPRINTS: readonly ProviderFingerprint[] = [
+  {
+    provider: 'Amazon S3',
+    cnameSuffixes: ['.s3.amazonaws.com', '.s3-website.amazonaws.com', '.amazonaws.com'],
+    unclaimedMarkers: ['NoSuchBucket', 'The specified bucket does not exist'],
+  },
+  {
+    provider: 'GitHub Pages',
+    cnameSuffixes: ['.github.io'],
+    unclaimedMarkers: ["There isn't a GitHub Pages site here.", 'For root URLs (like http://example.com/) you must provide an index.html file'],
+  },
+  {
+    provider: 'Heroku',
+    cnameSuffixes: ['.herokudns.com', '.herokuapp.com', '.herokussl.com'],
+    unclaimedMarkers: ['No such app', "There's nothing here, yet."],
+  },
+  {
+    provider: 'Azure',
+    cnameSuffixes: ['.azurewebsites.net', '.cloudapp.azure.com', '.trafficmanager.net'],
+    unclaimedMarkers: ['Error 404 - Web app not found.', '404 Web Site not found'],
+  },
+  {
+    provider: 'Fastly',
+    cnameSuffixes: ['.fastly.net', '.fastlylb.net'],
+    unclaimedMarkers: ['Fastly error: unknown domain'],
+  },
+  {
+    provider: 'Shopify',
+    cnameSuffixes: ['.myshopify.com'],
+    unclaimedMarkers: ['Sorry, this shop is currently unavailable.', 'Only one step left!'],
+  },
+];
+
+function matchProvider(cnameTarget: string): ProviderFingerprint | null {
+  return (
+    PROVIDER_FINGERPRINTS.find((entry) => entry.cnameSuffixes.some((suffix) => cnameTarget.endsWith(suffix))) ?? null
+  );
+}
+
+function remediationFor(hostname: string, cnameTarget: string, provider: string | null): string {
+  if (provider === null) {
+    return `Remove the CNAME on ${hostname}, or restore the resource it points at (${cnameTarget}). Colossus has not claimed it.`;
+  }
+  return `Reclaim the ${provider} resource "${cnameTarget}" or remove the CNAME on ${hostname}. Colossus has not claimed the resource.`;
+}
+
+function defaultFetchImpl(): TakeoverFetchImpl {
+  return async (url) => {
+    const response = await fetch(url, { redirect: 'follow' });
+    return response.text();
+  };
+}
 
 // A chain longer than this is pathological rather than a real delegation, and
 // the `seen` set below catches loops shorter than the cap.
@@ -89,6 +160,23 @@ async function resolveCnameChain(hostname: string, resolverImpl: DnsResolverImpl
   return null;
 }
 
+// Asks the hostname itself — not the provider resource — what it serves, because
+// that is the request an attacker's victim would make. A host that cannot be
+// reached is the common case for a dangling reference and is not an error here:
+// it simply yields no fingerprint evidence.
+async function servesUnclaimedMarker(
+  hostname: string,
+  fingerprint: ProviderFingerprint,
+  fetchImpl: TakeoverFetchImpl,
+): Promise<boolean> {
+  try {
+    const body = await fetchImpl(`https://${hostname}/`);
+    return fingerprint.unclaimedMarkers.some((marker) => body.includes(marker));
+  } catch {
+    return false;
+  }
+}
+
 // A takeover is a dangling *reference*: the host still CNAMEs somewhere, but the
 // provider resource at the end of that chain no longer resolves, so anyone who
 // claims that resource serves content under the operator's own name. A host with
@@ -107,8 +195,23 @@ export async function checkTakeover(hostname: string, options: CheckTakeoverOpti
   const addresses = await lookup(() => resolverImpl.resolveAddresses(cnameTarget));
   if (!('absent' in addresses)) return null;
 
-  // Confidence is `possible` at this stage: the dangling reference is observed,
-  // but nothing yet confirms the provider resource is actually claimable. The
-  // fingerprint upgrade to `definitive` is a later issue.
-  return { hostname: normalised, cnameTarget, provider: null, confidence: 'possible' };
+  const fingerprint = matchProvider(cnameTarget);
+  const provider = fingerprint?.provider ?? null;
+
+  // `definitive` needs the provider's own words: the dangling reference says the
+  // target is gone, but only an unclaimed-resource response proves the resource
+  // is there to be claimed. Anything less — no fingerprint for this provider, an
+  // unrecognised body, or nothing serving at all — stays `possible`.
+  const confidence: FindingConfidence =
+    fingerprint !== null && (await servesUnclaimedMarker(normalised, fingerprint, options.fetchImpl ?? defaultFetchImpl()))
+      ? 'definitive'
+      : 'possible';
+
+  return {
+    hostname: normalised,
+    cnameTarget,
+    provider,
+    confidence,
+    remediation: remediationFor(normalised, cnameTarget, provider),
+  };
 }
