@@ -77,3 +77,33 @@ export const findings = sqliteTable('findings', {
   // substring that proved the injection. XSS keeps using `evidencePath` (screenshot).
   evidenceSnippet: text('evidence_snippet'),
 });
+
+// A program is one engagement, not one domain: its in-scope list holds however
+// many apexes the engagement covers, and its exclusions are written once across
+// all of them. Null host caps mean the mode defaults apply (250 passive, 50
+// active), consumed when a program's inventory is scanned.
+export const programs = sqliteTable('programs', {
+  id: integer('id').primaryKey({ autoIncrement: true }),
+  name: text('name').notNull(),
+  passiveHostCap: integer('passive_host_cap'),
+  activeHostCap: integer('active_host_cap'),
+  enumerationError: text('enumeration_error'),
+  lastEnumeratedAt: integer('last_enumerated_at', { mode: 'timestamp' }),
+  createdAt: integer('created_at', { mode: 'timestamp' }).notNull(),
+});
+
+export type ScopeList = 'in' | 'out';
+export type ScopeStatus = 'in_scope' | 'out_of_scope' | 'unscoped';
+
+// `pattern` is an apex, an exact host, or — on the `out` list only — a
+// `*.`-prefixed subtree. `confirmedAt` is null until an operator confirms an
+// entry that a parser inferred; it is written here but not yet enforced.
+export const scopeEntries = sqliteTable('scope_entries', {
+  id: integer('id').primaryKey({ autoIncrement: true }),
+  programId: integer('program_id')
+    .notNull()
+    .references(() => programs.id),
+  list: text('list').$type<ScopeList>().notNull(),
+  pattern: text('pattern').notNull(),
+  confirmedAt: integer('confirmed_at', { mode: 'timestamp' }),
+});

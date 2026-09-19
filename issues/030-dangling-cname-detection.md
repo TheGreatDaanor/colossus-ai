@@ -1,7 +1,7 @@
 ---
 id: 030
 title: Detect a dangling CNAME for a single hostname
-status: open
+status: done
 type: afk
 blocked-by: []
 ---
@@ -30,10 +30,10 @@ of a DNS name alone, so it can be built and proven in parallel with 029.
 
 ## Definition of done
 
-- [ ] Failing test written first, confirmed red
-- [ ] Implementation makes it green
-- [ ] `test`, `typecheck`, `lint` all pass
-- [ ] Visible at: `npx tsx scripts/check-takeover.ts <hostname>` prints the
+- [x] Failing test written first, confirmed red
+- [x] Implementation makes it green
+- [x] `test`, `typecheck`, `lint` all pass
+- [x] Visible at: `npx tsx scripts/check-takeover.ts <hostname>` prints the
       dangling CNAME target, or reports the chain is healthy.
 
 ## Out of scope
