@@ -41,7 +41,10 @@ type ProviderFingerprint = {
 const PROVIDER_FINGERPRINTS: readonly ProviderFingerprint[] = [
   {
     provider: 'Amazon S3',
-    cnameSuffixes: ['.s3.amazonaws.com', '.s3-website.amazonaws.com', '.amazonaws.com'],
+    // Deliberately no bare `.amazonaws.com`: that suffix also covers ELB, API
+    // Gateway and every other AWS service, and naming the wrong provider sends
+    // the operator to the wrong console. An unlisted AWS service stays unknown.
+    cnameSuffixes: ['.s3.amazonaws.com', '.s3-website.amazonaws.com', '.s3.dualstack.amazonaws.com'],
     unclaimedMarkers: ['NoSuchBucket', 'The specified bucket does not exist'],
   },
   {
@@ -84,10 +87,53 @@ function remediationFor(hostname: string, cnameTarget: string, provider: string 
   return `Reclaim the ${provider} resource "${cnameTarget}" or remove the CNAME on ${hostname}. Colossus has not claimed the resource.`;
 }
 
-function defaultFetchImpl(): TakeoverFetchImpl {
+// A host that never answers must not hold a check open, and a body is read only
+// as far as a fingerprint could possibly match: the response comes from a name
+// the operator no longer controls, so its size is not ours to trust.
+const DEFAULT_FETCH_TIMEOUT_MS = 10_000;
+const DEFAULT_MAX_BODY_BYTES = 64 * 1024;
+
+export type TakeoverFetchOptions = { timeoutMs?: number; maxBytes?: number };
+
+async function readBoundedText(response: Response, maxBytes: number): Promise<string> {
+  const body = response.body;
+  if (body === null) return '';
+
+  const reader = body.getReader();
+  const decoder = new TextDecoder();
+  let text = '';
+  let bytes = 0;
+
+  try {
+    while (bytes < maxBytes) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (!value) continue;
+      const chunk = value.subarray(0, maxBytes - bytes);
+      bytes += chunk.length;
+      text += decoder.decode(chunk, { stream: true });
+    }
+    text += decoder.decode();
+  } finally {
+    await reader.cancel().catch(() => {});
+  }
+
+  return text;
+}
+
+export function createTakeoverFetch(options: TakeoverFetchOptions = {}): TakeoverFetchImpl {
+  const timeoutMs = options.timeoutMs ?? DEFAULT_FETCH_TIMEOUT_MS;
+  const maxBytes = options.maxBytes ?? DEFAULT_MAX_BODY_BYTES;
+
   return async (url) => {
-    const response = await fetch(url, { redirect: 'follow' });
-    return response.text();
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      const response = await fetch(url, { redirect: 'follow', signal: controller.signal });
+      return await readBoundedText(response, maxBytes);
+    } finally {
+      clearTimeout(timer);
+    }
   };
 }
 
@@ -169,12 +215,18 @@ async function servesUnclaimedMarker(
   fingerprint: ProviderFingerprint,
   fetchImpl: TakeoverFetchImpl,
 ): Promise<boolean> {
-  try {
-    const body = await fetchImpl(`https://${hostname}/`);
-    return fingerprint.unclaimedMarkers.some((marker) => body.includes(marker));
-  } catch {
-    return false;
+  // https first, then plain http: a dangling reference typically has no
+  // certificate valid for this hostname, so https fails before the provider's
+  // own words are ever seen. The http attempt reads a response, nothing more.
+  for (const url of [`https://${hostname}/`, `http://${hostname}/`]) {
+    try {
+      const body = await fetchImpl(url);
+      return fingerprint.unclaimedMarkers.some((marker) => body.includes(marker));
+    } catch {
+      continue;
+    }
   }
+  return false;
 }
 
 // A takeover is a dangling *reference*: the host still CNAMEs somewhere, but the
@@ -203,7 +255,7 @@ export async function checkTakeover(hostname: string, options: CheckTakeoverOpti
   // is there to be claimed. Anything less — no fingerprint for this provider, an
   // unrecognised body, or nothing serving at all — stays `possible`.
   const confidence: FindingConfidence =
-    fingerprint !== null && (await servesUnclaimedMarker(normalised, fingerprint, options.fetchImpl ?? defaultFetchImpl()))
+    fingerprint !== null && (await servesUnclaimedMarker(normalised, fingerprint, options.fetchImpl ?? createTakeoverFetch()))
       ? 'definitive'
       : 'possible';
 

@@ -1,6 +1,7 @@
 // Prints the takeover evidence for one hostname, or reports its CNAME chain is
-// healthy. Reporting only: nothing is persisted, and the only provider request
-// is a plain GET of the hostname — no resource is ever claimed.
+// healthy. Reporting only: nothing is persisted, and the only outbound request
+// is a plain GET of the hostname itself (https, then http if that fails) — no
+// provider resource is ever claimed.
 //
 //   npx tsx scripts/check-takeover.ts <hostname>
 import { checkTakeover } from '../src/services/takeover.js';
