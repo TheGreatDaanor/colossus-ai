@@ -3,7 +3,7 @@ import type { AddressInfo } from 'node:net';
 import { readFile, rm } from 'node:fs/promises';
 import { afterAll, describe, expect, it, vi } from 'vitest';
 import { createDb } from '../db/client.js';
-import { findings } from '../db/schema.js';
+import { findings, scans, scanTargets } from '../db/schema.js';
 import {
   ScannerService,
   ScanValidationError,
@@ -1448,6 +1448,88 @@ describe('ScannerService active-mode XSS confirmation', () => {
   });
 });
 
+// Stands in for the SSRF-guarded content fetch the ssti/sqli/lfi classes use, driving
+// each oracle to a confirmation off the URL alone: the injected param carries the
+// arithmetic expression (ssti), the lone quote (sqli) or the passwd traversal (lfi),
+// while baseline URLs (neutral param values) return none of those signals.
+function oracleBody(url: string): string {
+  for (const value of new URL(url).searchParams.values()) {
+    const product = /(\d+)\*(\d+)/.exec(value);
+    if (product !== null) return `<p>total ${Number(product[1]) * Number(product[2])} items</p>`;
+    if (value === "'") return 'DB error: You have an error in your SQL syntax; check the manual';
+    if (value.includes('etc/passwd')) return 'root:x:0:0:root:/root:/bin/bash';
+  }
+  return '<p>ok</p>';
+}
+
+describe('ScannerService active-mode injection classes', () => {
+  async function waitCompleted(svc: ScannerService, scanId: number): Promise<void> {
+    await vi.waitFor(
+      async () => {
+        const s = await svc.getScan(scanId);
+        if (!s || s.status !== 'completed') throw new Error('not yet completed');
+      },
+      { timeout: 5000 },
+    );
+  }
+
+  it('confirms xss, ssti, sqli and lfi together on a multi-vuln target', async () => {
+    const fetchImpl: FetchImpl = vi.fn(async () => okResponse(FULLY_HARDENED_HEADERS));
+    const xssConfirmImpl = vi.fn(async () => ({ outcome: 'confirmed' as const }));
+    const bodyFetchImpl = vi.fn(async (url: string) => oracleBody(url));
+    const svc = new ScannerService(createDb(':memory:'), {
+      fetchImpl,
+      tlsCheckImpl: okTlsCheckImpl(),
+      xssConfirmImpl,
+      bodyFetchImpl,
+    });
+    const scan = await svc.startScan(['https://example.com/?q=test'], {
+      mode: 'active',
+      confirmAuthorized: true,
+    });
+    await waitCompleted(svc, scan.id);
+
+    const target = (await svc.getScan(scan.id))?.targets[0];
+    const byCategory = new Map((target?.findings ?? []).map((f) => [f.category, f]));
+    for (const category of ['xss', 'ssti', 'sqli', 'lfi']) {
+      expect(byCategory.get(category)?.confidence).toBe('definitive');
+      expect(byCategory.get(category)?.severity).toBe('high');
+      expect(byCategory.get(category)?.injectionPoint).toBe('q');
+    }
+    expect(byCategory.get('ssti')?.evidenceSnippet).toBeTruthy();
+    expect(byCategory.get('sqli')?.evidenceSnippet).toContain('SQL syntax');
+    expect(byCategory.get('lfi')?.evidenceSnippet).toContain('root:');
+  });
+
+  it('runs the fetch-based classes above the browser cap, not throttled by it', async () => {
+    const fetchImpl: FetchImpl = vi.fn(async () => okResponse(FULLY_HARDENED_HEADERS));
+    const xssConfirmImpl = vi.fn(async () => ({ outcome: 'not_vulnerable' as const }));
+    let inFlight = 0;
+    let peak = 0;
+    const bodyFetchImpl = vi.fn(async () => {
+      inFlight += 1;
+      peak = Math.max(peak, inFlight);
+      await new Promise((r) => setTimeout(r, 20));
+      inFlight -= 1;
+      return '<p>ok</p>';
+    });
+    const svc = new ScannerService(createDb(':memory:'), {
+      fetchImpl,
+      tlsCheckImpl: okTlsCheckImpl(),
+      xssConfirmImpl,
+      bodyFetchImpl,
+      browserConcurrency: 2,
+    });
+    const urls = Array.from({ length: 6 }, (_, i) => `https://example.com/p${i}?q=test`);
+    const scan = await svc.startScan(urls, { mode: 'active', confirmAuthorized: true });
+    await waitCompleted(svc, scan.id);
+
+    // The fetch classes draw on the wider passive fetch budget, so their confirmations
+    // overrun the browser cap of 2 — proof they aren't serialized behind it.
+    expect(peak).toBeGreaterThan(2);
+  });
+});
+
 // Confirmed findings write a PNG under data/evidence/<scan>/; clean up what the
 // evidence tests leave behind.
 const evidenceDirs: string[] = [];
@@ -1654,5 +1736,36 @@ describe('ScannerService robots.txt bounds', () => {
     });
 
     expect(completed.targets.map((t) => t.url).sort()).toEqual(['https://example.com/', 'https://example.com/ok']);
+  });
+});
+
+describe('ScannerService oracle-confirmed finding storage', () => {
+  it('round-trips an ssti finding with a non-null evidence_snippet through getScan', async () => {
+    const db = createDb(':memory:');
+    const svc = new ScannerService(db);
+
+    const scan = db
+      .insert(scans)
+      .values({ name: 'x', status: 'completed', urls: ['https://example.com'], createdAt: new Date() })
+      .returning({ id: scans.id })
+      .get();
+    const target = db
+      .insert(scanTargets)
+      .values({ scanId: scan.id, url: 'https://example.com/?q=1', status: 'ok' })
+      .returning({ id: scanTargets.id })
+      .get();
+    db.insert(findings)
+      .values({
+        scanTargetId: target.id,
+        category: 'ssti',
+        severity: 'high',
+        confidence: 'definitive',
+        evidenceSnippet: '49',
+      })
+      .run();
+
+    const finding = (await svc.getScan(scan.id))?.targets[0]?.findings.find((f) => f.category === 'ssti');
+    expect(finding).toBeDefined();
+    expect(finding?.evidenceSnippet).toBe('49');
   });
 });

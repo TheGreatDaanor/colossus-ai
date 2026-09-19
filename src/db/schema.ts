@@ -6,6 +6,11 @@ export type ScanTargetStatus = 'pending' | 'ok' | 'unreachable' | 'timeout' | 'i
 export type FindingSeverity = 'critical' | 'high' | 'medium' | 'low' | 'info';
 export type FindingConfidence = 'definitive' | 'possible';
 
+// Oracle-confirmed active-scan categories. Passive/CVE detectors emit many more
+// free-form category strings, so this is a documented subset the injection-class
+// confirmers annotate against, not an exhaustive enum of the `category` column.
+export type FindingCategory = 'xss' | 'ssti' | 'sqli' | 'lfi';
+
 export type XssOutcome = 'confirmed' | 'not_vulnerable' | 'unavailable';
 
 // An active-mode canary injection attempt against one query parameter, recorded per
@@ -68,4 +73,7 @@ export const findings = sqliteTable('findings', {
   // Set only on browser-confirmed findings: relative path to the evidence screenshot
   // under data/evidence/<scan_id>/<finding_id>.png. Written once, never deleted.
   evidencePath: text('evidence_path'),
+  // Set only on oracle-confirmed non-XSS findings (ssti/sqli/lfi): the response
+  // substring that proved the injection. XSS keeps using `evidencePath` (screenshot).
+  evidenceSnippet: text('evidence_snippet'),
 });

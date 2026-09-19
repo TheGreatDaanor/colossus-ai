@@ -1,7 +1,14 @@
 import { createServer, type Server } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { afterAll, describe, expect, it } from 'vitest';
-import { confirmXss, generateCanaryPayload } from './active-scanner.js';
+import {
+  confirmXss,
+  generateCanaryPayload,
+  makeLfiInjectionClass,
+  makeSqliInjectionClass,
+  makeSstiInjectionClass,
+  xssInjectionClass,
+} from './active-scanner.js';
 
 // A real loopback server, not `page.route()` — 012 uses that hook as production
 // behaviour, and a test that owns it too would fight the code under test.
@@ -100,4 +107,189 @@ describe('confirmXss', () => {
     expect(result.error).toContain('169.254.169.254');
     expect(result.error).toMatch(/disallowed|blocked/i);
   }, 30_000);
+});
+
+describe('xssInjectionClass', () => {
+  it('reports the xss finding category', () => {
+    expect(xssInjectionClass.category).toBe('xss');
+  });
+
+  it('enumerates one injection point per query parameter behind the interface', () => {
+    const points = xssInjectionClass.enumerate(new URL('https://example.com/search?q=1&page=2'));
+
+    expect(points.map((p) => p.injectionPoint).sort()).toEqual(['page', 'q']);
+    expect(points[0]?.payload).not.toEqual(points[1]?.payload);
+  });
+
+  it('confirms execution through the browser and captures a screenshot for a reflected canary', async () => {
+    const origin = await fixture((q) => `<html><body>${q}</body></html>`);
+    const [point] = xssInjectionClass.enumerate(new URL(`${origin}/?q=test`));
+
+    const result = await xssInjectionClass.confirm(point!);
+
+    expect(result.outcome).toBe('confirmed');
+    expect(result.screenshot?.length).toBeGreaterThan(0);
+  }, 30_000);
+});
+
+describe('sstiInjectionClass', () => {
+  // A plain (unguarded) fetch: the SSTI class fetches through an injected fetch so
+  // loopback fixtures aren't rejected by the SSRF guard the real default enforces.
+  const fetchText = async (url: string): Promise<string> => (await fetch(url)).text();
+
+  it('reports the ssti finding category', () => {
+    expect(makeSstiInjectionClass(fetchText).category).toBe('ssti');
+  });
+
+  it('enumerates one injection point per query parameter with distinct payloads', () => {
+    const points = makeSstiInjectionClass(fetchText).enumerate(
+      new URL('https://example.com/p?a=1&b=2'),
+    );
+
+    expect(points.map((p) => p.injectionPoint).sort()).toEqual(['a', 'b']);
+    expect(points[0]?.payload).not.toEqual(points[1]?.payload);
+  });
+
+  it('confirms and captures the product as evidence when the engine evaluates the expression', async () => {
+    // A vulnerable engine: it evaluates any `<int>*<int>` in the param and reflects
+    // the product instead of the literal expression.
+    const origin = await fixture((q) => {
+      const m = /(\d+)\*(\d+)/.exec(q);
+      const body = m ? String(Number(m[1]) * Number(m[2])) : q;
+      return `<html><body>result: ${body}</body></html>`;
+    });
+    const ssti = makeSstiInjectionClass(fetchText);
+    const [point] = ssti.enumerate(new URL(`${origin}/?q=seed`));
+
+    const result = await ssti.confirm(point!);
+
+    const m = /(\d+)\*(\d+)/.exec(point!.payload)!;
+    const product = String(Number(m[1]) * Number(m[2]));
+    expect(result.outcome).toBe('confirmed');
+    expect(result.evidenceSnippet).toContain(product);
+  });
+
+  it('reports not_vulnerable when the target echoes the literal expression unchanged', async () => {
+    const origin = await fixture((q) => `<html><body>result: ${q}</body></html>`);
+    const ssti = makeSstiInjectionClass(fetchText);
+    const [point] = ssti.enumerate(new URL(`${origin}/?q=seed`));
+
+    const result = await ssti.confirm(point!);
+
+    expect(result.outcome).toBe('not_vulnerable');
+    expect(result.evidenceSnippet).toBeUndefined();
+  });
+});
+
+describe('sqliInjectionClass', () => {
+  const fetchText = async (url: string): Promise<string> => (await fetch(url)).text();
+
+  it('reports the sqli finding category', () => {
+    expect(makeSqliInjectionClass(fetchText).category).toBe('sqli');
+  });
+
+  it('enumerates one injection point per query parameter', () => {
+    const points = makeSqliInjectionClass(fetchText).enumerate(
+      new URL('https://example.com/p?a=1&b=2'),
+    );
+
+    expect(points.map((p) => p.injectionPoint).sort()).toEqual(['a', 'b']);
+  });
+
+  it('confirms and captures the error line when the injected token provokes a DB error', async () => {
+    // A vulnerable backend: the syntax-breaking quote reaches the DB and the raw
+    // error is reflected on the page; a neutral value returns a clean page.
+    const origin = await fixture((q) =>
+      q.includes("'")
+        ? `<html><body>You have an error in your SQL syntax near "'"</body></html>`
+        : `<html><body>results for ${q}</body></html>`,
+    );
+    const sqli = makeSqliInjectionClass(fetchText);
+    const [point] = sqli.enumerate(new URL(`${origin}/?q=seed`));
+
+    const result = await sqli.confirm(point!);
+
+    expect(result.outcome).toBe('confirmed');
+    expect(result.evidenceSnippet).toContain('SQL syntax');
+  });
+
+  it('reports not_vulnerable when the DB error signature is already in the baseline', async () => {
+    // The signature is present regardless of the token, so the differential fails.
+    const origin = await fixture(
+      () => `<html><body>You have an error in your SQL syntax near "x"</body></html>`,
+    );
+    const sqli = makeSqliInjectionClass(fetchText);
+    const [point] = sqli.enumerate(new URL(`${origin}/?q=seed`));
+
+    const result = await sqli.confirm(point!);
+
+    expect(result.outcome).toBe('not_vulnerable');
+    expect(result.evidenceSnippet).toBeUndefined();
+  });
+
+  it('reports not_vulnerable when no DB error signature appears', async () => {
+    const origin = await fixture((q) => `<html><body>results for ${q}</body></html>`);
+    const sqli = makeSqliInjectionClass(fetchText);
+    const [point] = sqli.enumerate(new URL(`${origin}/?q=seed`));
+
+    const result = await sqli.confirm(point!);
+
+    expect(result.outcome).toBe('not_vulnerable');
+  });
+});
+
+describe('lfiInjectionClass', () => {
+  const fetchText = async (url: string): Promise<string> => (await fetch(url)).text();
+  const PASSWD = 'root:x:0:0:root:/root:/bin/bash\ndaemon:x:1:1:daemon:/usr/sbin:/usr/sbin/nologin';
+
+  it('reports the lfi finding category', () => {
+    expect(makeLfiInjectionClass(fetchText).category).toBe('lfi');
+  });
+
+  it('enumerates one injection point per query parameter', () => {
+    const points = makeLfiInjectionClass(fetchText).enumerate(
+      new URL('https://example.com/p?a=1&b=2'),
+    );
+
+    expect(points.map((p) => p.injectionPoint).sort()).toEqual(['a', 'b']);
+  });
+
+  it('confirms and captures the passwd line when the traversal payload returns /etc/passwd', async () => {
+    // A vulnerable file-inclusion endpoint: the traversal payload resolves to the
+    // real file and its contents are served; a neutral value returns a clean page.
+    const origin = await fixture((q) =>
+      q.includes('etc/passwd')
+        ? PASSWD
+        : `<html><body>results for ${q}</body></html>`,
+    );
+    const lfi = makeLfiInjectionClass(fetchText);
+    const [point] = lfi.enumerate(new URL(`${origin}/?q=seed`));
+
+    const result = await lfi.confirm(point!);
+
+    expect(result.outcome).toBe('confirmed');
+    expect(result.evidenceSnippet).toContain('root:x:0:0:');
+  });
+
+  it('reports not_vulnerable when the passwd signature is already in the baseline', async () => {
+    // The signature is present regardless of the payload, so the differential fails.
+    const origin = await fixture(() => PASSWD);
+    const lfi = makeLfiInjectionClass(fetchText);
+    const [point] = lfi.enumerate(new URL(`${origin}/?q=seed`));
+
+    const result = await lfi.confirm(point!);
+
+    expect(result.outcome).toBe('not_vulnerable');
+    expect(result.evidenceSnippet).toBeUndefined();
+  });
+
+  it('reports not_vulnerable when the payload is echoed without file contents', async () => {
+    const origin = await fixture((q) => `<html><body>results for ${q}</body></html>`);
+    const lfi = makeLfiInjectionClass(fetchText);
+    const [point] = lfi.enumerate(new URL(`${origin}/?q=seed`));
+
+    const result = await lfi.confirm(point!);
+
+    expect(result.outcome).toBe('not_vulnerable');
+  });
 });

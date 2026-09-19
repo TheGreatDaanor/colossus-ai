@@ -1,7 +1,16 @@
 import { connect as tlsConnect } from 'node:tls';
 import { eq } from 'drizzle-orm';
 import type { Db } from '../db/client.js';
-import { confirmXss, enumerateInjectionPoints, saveEvidence, type XssConfirmImpl } from './active-scanner.js';
+import {
+  makeXssInjectionClass,
+  makeSstiInjectionClass,
+  makeSqliInjectionClass,
+  makeLfiInjectionClass,
+  saveEvidence,
+  type InjectionClass,
+  type XssConfirmImpl,
+  type BodyFetchImpl,
+} from './active-scanner.js';
 import { discoverLinks } from './discovery.js';
 import { findDisallowedAddress, isDisallowedAddress } from './ssrf-guard.js';
 import {
@@ -383,10 +392,21 @@ export class ScannerService {
   readonly #maxExtraRequests: number;
   readonly #concurrency: number;
   readonly #defaultUserAgent: string;
-  readonly #xssConfirmImpl: XssConfirmImpl;
+  // The XSS strategy, reached through the InjectionClass interface. Built from the
+  // injected confirmer so tests keep mocking confirmation at the same boundary.
+  readonly #xssClass: InjectionClass;
+  // The fetch-based injection classes (SSTI, SQLi, LFI): each confirms by comparing an
+  // injected response body against a baseline, so they share one content fetcher rather
+  // than the browser. Kept separate from #xssClass because they run under a different
+  // concurrency budget — the wider passive fetch budget, not the browser cap.
+  readonly #oracleClasses: InjectionClass[];
   // Caps concurrent browser contexts during active scanning, independent of the
   // target batch size — passive work continues at full width. See the Semaphore note.
   readonly #browserSemaphore: Semaphore;
+  // The passive fetch budget the oracle (ssti/sqli/lfi) confirmations share: sized to
+  // the target concurrency, deliberately wider than the browser cap so payload-body
+  // fetches aren't serialized behind the two headless-browser slots XSS reserves.
+  readonly #fetchSemaphore: Semaphore;
   // Hostnames the SSRF guard is told to permit even though they resolve to a
   // disallowed (e.g. loopback) address. Empty in production and set only by tests
   // that serve a fixture on 127.0.0.1 — deliberately a constructor option, not an
@@ -405,6 +425,7 @@ export class ScannerService {
       concurrency?: number;
       defaultUserAgent?: string;
       xssConfirmImpl?: XssConfirmImpl;
+      bodyFetchImpl?: BodyFetchImpl;
       browserConcurrency?: number;
       allowedHosts?: string[];
     } = {},
@@ -417,8 +438,14 @@ export class ScannerService {
     this.#maxExtraRequests = options.maxExtraRequests ?? 6;
     this.#concurrency = options.concurrency ?? 10;
     this.#defaultUserAgent = options.defaultUserAgent ?? 'colossus-scanner/1.0';
-    this.#xssConfirmImpl = options.xssConfirmImpl ?? confirmXss;
+    this.#xssClass = makeXssInjectionClass(options.xssConfirmImpl);
+    this.#oracleClasses = [
+      makeSstiInjectionClass(options.bodyFetchImpl),
+      makeSqliInjectionClass(options.bodyFetchImpl),
+      makeLfiInjectionClass(options.bodyFetchImpl),
+    ];
     this.#browserSemaphore = new Semaphore(options.browserConcurrency ?? 2);
+    this.#fetchSemaphore = new Semaphore(this.#concurrency);
     this.#allowedHosts = new Set(options.allowedHosts ?? []);
     this.#tlsCheckImpl =
       options.tlsCheckImpl ?? ((hostname, port) => defaultTlsCheck(hostname, port, this.#timeoutMs));
@@ -672,6 +699,7 @@ export class ScannerService {
 
       if (mode === 'active') {
         await this.#injectQueryParams(target, targetUrl, userAgent);
+        await this.#runOracleClasses(target, targetUrl);
       }
 
       // Discovery runs regardless of mode — it's non-intrusive HTML parsing, not a
@@ -756,7 +784,7 @@ export class ScannerService {
   // URLs share the target's host, which the SSRF guard already cleared;
   // per-navigation redirect guarding is 012.
   async #injectQueryParams(target: ScanTarget, targetUrl: URL, userAgent: string): Promise<void> {
-    const points = enumerateInjectionPoints(targetUrl);
+    const points = this.#xssClass.enumerate(targetUrl);
     if (points.length === 0) return;
 
     const attempts: InjectionAttempt[] = [];
@@ -768,7 +796,7 @@ export class ScannerService {
         console.warn(`[scan ${target.scanId}] ${point.url} injection fetch failed: ${message}`);
       }
 
-      const result = await this.#browserSemaphore.run(() => this.#xssConfirmImpl(point.url, point.payload));
+      const result = await this.#browserSemaphore.run(() => this.#xssClass.confirm(point));
       attempts.push({ injectionPoint: point.injectionPoint, payload: point.payload, ...result });
 
       if (result.outcome === 'confirmed') {
@@ -776,7 +804,7 @@ export class ScannerService {
           .insert(findings)
           .values({
             scanTargetId: target.id,
-            category: 'xss',
+            category: this.#xssClass.category,
             severity: 'high',
             confidence: 'definitive',
             injectionPoint: point.injectionPoint,
@@ -795,6 +823,38 @@ export class ScannerService {
     }
 
     this.#db.update(scanTargets).set({ injectionAttempts: attempts }).where(eq(scanTargets.id, target.id)).run();
+  }
+
+  // Active-mode only: run every fetch-based injection class (SSTI, SQLi, LFI) against
+  // the target's query parameters. Each class enumerates a payload per param and confirms
+  // by fetching the mutated body — those fetches share the wider passive fetch budget
+  // (#fetchSemaphore), not the browser cap XSS reserves, so adding classes doesn't
+  // serialize their network work behind the two headless-browser slots. A confirmed
+  // outcome writes a definitive finding for that class; other outcomes write nothing
+  // (the per-attempt record is XSS-specific — see #injectQueryParams). Points and classes
+  // run concurrently under the semaphore; the synchronous better-sqlite3 inserts don't race.
+  async #runOracleClasses(target: ScanTarget, targetUrl: URL): Promise<void> {
+    await Promise.all(
+      this.#oracleClasses.flatMap((injectionClass) =>
+        injectionClass.enumerate(targetUrl).map(async (point) => {
+          const result = await this.#fetchSemaphore.run(() => injectionClass.confirm(point));
+          if (result.outcome !== 'confirmed') return;
+
+          this.#db
+            .insert(findings)
+            .values({
+              scanTargetId: target.id,
+              category: injectionClass.category,
+              severity: 'high',
+              confidence: 'definitive',
+              injectionPoint: point.injectionPoint,
+              payload: point.payload,
+              evidenceSnippet: result.evidenceSnippet ?? null,
+            })
+            .run();
+        }),
+      ),
+    );
   }
 
   async #fetchRobotsTxt(targetUrl: URL, userAgent: string, budget: Budget): Promise<string | null> {
