@@ -43,8 +43,14 @@ function serializeScopeEntry(entry: ScopeEntry) {
 }
 
 function serializeHost(host: EnumeratedHost) {
-  const { programId, scopeStatus, firstSeenAt, ...rest } = host;
-  return { ...rest, program_id: programId, scope_status: scopeStatus, first_seen_at: firstSeenAt };
+  const { programId, scopeStatus, isWildcard, firstSeenAt, ...rest } = host;
+  return {
+    ...rest,
+    program_id: programId,
+    scope_status: scopeStatus,
+    is_wildcard: isWildcard,
+    first_seen_at: firstSeenAt,
+  };
 }
 
 function serializeProgram(program: ProgramWithScope) {

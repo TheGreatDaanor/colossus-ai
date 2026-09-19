@@ -12,7 +12,7 @@ type ScopeEntryBody = { id: number; list: string; pattern: string; confirmed_at:
 type ProgramBody = { id: number; name: string; scope_entries: ScopeEntryBody[] };
 type ClassifyBody = { host: string; status: string };
 type ErrorBody = { error: string };
-type HostBody = { id: number; hostname: string; source: string; scope_status: string };
+type HostBody = { id: number; hostname: string; source: string; scope_status: string; is_wildcard: boolean };
 type HostsBody = { hosts: HostBody[]; enumeration_error: string | null };
 
 function buildApp(options: ProgramsServiceOptions = {}) {
@@ -275,6 +275,28 @@ describe('GET /programs/:id/hosts', () => {
     const body = await json<HostsBody>(res);
     expect(body.hosts).toEqual([
       expect.objectContaining({ hostname: 'blog.example.com', scope_status: 'in_scope', source: 'ct-log' }),
+    ]);
+  });
+
+  it('marks wildcard hosts, and lists no host the wildcard apex only implied', async () => {
+    const { app, service } = buildApp({
+      // A wildcard apex: the `*.` identity is recorded against the apex, and the
+      // host it merely implied is not in the inventory at all.
+      enumerationImpl: {
+        enumerate: async () => [
+          { hostname: 'example.com', source: 'ct-log', isWildcard: true },
+          { hostname: 'blog.example.com', source: 'ct-log' },
+        ],
+      },
+    });
+    const created = await json<ProgramBody>(await postJson(app, '/programs', { url: 'https://example.com' }));
+    await service.enumerateProgram(created.id);
+
+    const body = await json<HostsBody>(await app.request(`/programs/${created.id}/hosts`));
+
+    expect(body.hosts.map((h) => [h.hostname, h.is_wildcard])).toEqual([
+      ['blog.example.com', false],
+      ['example.com', true],
     ]);
   });
 

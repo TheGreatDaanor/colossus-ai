@@ -1,9 +1,14 @@
+import { Resolver } from 'node:dns/promises';
+import { randomBytes } from 'node:crypto';
 import type { HostSource } from '../db/schema.js';
 import { apexOf } from './programs.js';
 
 // A host observed by some source, before anything is known about its scope. The
 // scope decision belongs to programs.ts and is made when the host is recorded.
-export type ObservedHost = { hostname: string; source: HostSource };
+// `isWildcard` marks a host that stands for a subtree rather than a name anyone
+// has seen answer: a `*.` certificate identity, or every inferred host under an
+// apex whose random-nonce label resolves. Absent means an ordinary host.
+export type ObservedHost = { hostname: string; source: HostSource; isWildcard?: boolean };
 
 // The CT query narrowed to "give me the decoded JSON for this apex". Injected so
 // every test stubs it and no test contacts the real crt.sh endpoint.
@@ -13,8 +18,15 @@ export type CtFetchImpl = (apex: string) => Promise<unknown>;
 // means: a scan treats it as non-fatal and keeps the inventory it already has.
 export class EnumerationError extends Error {}
 
+// The DNS surface wildcard detection needs, narrowed to one question: does this
+// name resolve to an address? Injected so every test stubs it and none performs
+// live DNS. A name that does not resolve raises, which is not an error here.
+export type WildcardResolverImpl = { resolveAddresses(hostname: string): Promise<string[]> };
+
 export type EnumerationServiceOptions = {
   ctFetchImpl?: CtFetchImpl;
+  resolverImpl?: WildcardResolverImpl;
+  nonceLabel?: () => string;
   userAgent?: string;
   cacheTtlMs?: number;
   maxCacheEntries?: number;
@@ -43,6 +55,29 @@ const DEFAULT_CT_TIMEOUT_MS = 30_000;
 
 const WILDCARD_PREFIX = '*.';
 
+// Long enough that no operator has ever registered it as a real subdomain, so a
+// resolving answer means the apex answers for everything rather than for this.
+const NONCE_LABEL_BYTES = 12;
+
+function randomNonceLabel(): string {
+  return `colossus-wildcard-probe-${randomBytes(NONCE_LABEL_BYTES).toString('hex')}`;
+}
+
+// Real DNS. Errors are swallowed by the caller: NXDOMAIN and SERVFAIL both mean
+// "no evidence of a wildcard", and neither is an enumeration failure.
+function createWildcardResolver(): WildcardResolverImpl {
+  const resolver = new Resolver();
+  return {
+    async resolveAddresses(hostname) {
+      const [v4, v6] = await Promise.allSettled([resolver.resolve4(hostname), resolver.resolve6(hostname)]);
+      return [
+        ...(v4.status === 'fulfilled' ? v4.value : []),
+        ...(v6.status === 'fulfilled' ? v6.value : []),
+      ];
+    },
+  };
+}
+
 function normaliseHostname(raw: string): string {
   return raw.trim().toLowerCase().replace(/\.$/, '');
 }
@@ -57,12 +92,13 @@ function namesIn(record: unknown): string[] {
 }
 
 // A wildcard certificate names the subtree, not a host that exists. Recording
-// the root keeps the evidence without inventing a hostname nobody has seen;
-// wildcard detection proper is a later issue.
-function toHostname(rawName: string): string | null {
+// the root keeps the evidence without inventing a hostname nobody has seen, and
+// the wildcard flag travels with it so the host is never scanned.
+function toHostname(rawName: string): { hostname: string; isWildcard: boolean } | null {
   const name = normaliseHostname(rawName);
-  const hostname = name.startsWith(WILDCARD_PREFIX) ? name.slice(WILDCARD_PREFIX.length) : name;
-  return hostname === '' ? null : hostname;
+  const isWildcard = name.startsWith(WILDCARD_PREFIX);
+  const hostname = isWildcard ? name.slice(WILDCARD_PREFIX.length) : name;
+  return hostname === '' ? null : { hostname, isWildcard };
 }
 
 // Only the apex being enumerated was authorized. A certificate covering other
@@ -105,6 +141,8 @@ type CacheEntry = { hosts: ObservedHost[]; storedAt: number };
 // stay a pure function with no network behind them.
 export class EnumerationService {
   #ctFetchImpl: CtFetchImpl;
+  #resolverImpl: WildcardResolverImpl;
+  #nonceLabel: () => string;
   #cacheTtlMs: number;
   #maxCacheEntries: number;
   #now: () => number;
@@ -112,6 +150,8 @@ export class EnumerationService {
 
   constructor(options: EnumerationServiceOptions = {}) {
     this.#ctFetchImpl = options.ctFetchImpl ?? createCtFetch({ userAgent: options.userAgent ?? DEFAULT_USER_AGENT });
+    this.#resolverImpl = options.resolverImpl ?? createWildcardResolver();
+    this.#nonceLabel = options.nonceLabel ?? randomNonceLabel;
     this.#cacheTtlMs = options.cacheTtlMs ?? DEFAULT_CACHE_TTL_MS;
     this.#maxCacheEntries = options.maxCacheEntries ?? DEFAULT_MAX_CACHE_ENTRIES;
     this.#now = options.now ?? Date.now;
@@ -135,8 +175,40 @@ export class EnumerationService {
     }
 
     const hosts = collectHosts(payload, normalisedApex);
-    this.#remember(normalisedApex, hosts);
-    return hosts;
+    const withWildcards = (await this.#isWildcardApex(normalisedApex))
+      ? withWildcardApex(await this.#keepCorroborated(hosts, normalisedApex), normalisedApex)
+      : hosts;
+    this.#remember(normalisedApex, withWildcards);
+    return withWildcards;
+  }
+
+  // Under a wildcard apex, a host inferred from a `*.` identity has nothing
+  // behind it but the subtree the certificate covers. It is kept only when it
+  // resolves in its own right; otherwise it would be a fictitious host.
+  async #keepCorroborated(hosts: ObservedHost[], apex: string): Promise<ObservedHost[]> {
+    const kept: ObservedHost[] = [];
+    for (const host of hosts) {
+      if (host.isWildcard !== true || host.hostname === apex) {
+        kept.push(host);
+        continue;
+      }
+      if (await this.#resolves(host.hostname)) kept.push(host);
+    }
+    return kept;
+  }
+
+  async #resolves(hostname: string): Promise<boolean> {
+    try {
+      return (await this.#resolverImpl.resolveAddresses(hostname)).length > 0;
+    } catch {
+      return false;
+    }
+  }
+
+  // An apex that answers for a name nobody has ever registered answers for
+  // everything, so resolution stops being evidence that a host exists.
+  async #isWildcardApex(apex: string): Promise<boolean> {
+    return this.#resolves(`${this.#nonceLabel()}.${apex}`);
   }
   // A Map iterates in insertion order, so the first key is the oldest entry.
   #remember(apex: string, hosts: ObservedHost[]): void {
@@ -150,19 +222,35 @@ export class EnumerationService {
   }
 }
 
+// The apex carries the wildcard flag into the inventory, so the operator reading
+// the host list can see why the hosts under it are not to be trusted. Nothing is
+// invented: the apex is the name that was authorized and enumerated.
+function withWildcardApex(hosts: ObservedHost[], apex: string): ObservedHost[] {
+  const others = hosts.filter((host) => host.hostname !== apex);
+  return [...others, { hostname: apex, source: 'ct-log' as const, isWildcard: true }].sort((a, b) =>
+    a.hostname < b.hostname ? -1 : a.hostname > b.hostname ? 1 : 0,
+  );
+}
+
 function collectHosts(payload: unknown, apex: string): ObservedHost[] {
   if (!Array.isArray(payload)) return [];
 
-  const hostnames = new Set<string>();
+  // A hostname named both bare and behind a `*.` is a real host, so an ordinary
+  // observation of it outweighs the wildcard identity that also covers it.
+  const hostnames = new Map<string, boolean>();
   for (const record of payload) {
     for (const rawName of namesIn(record)) {
-      const hostname = toHostname(rawName);
-      if (hostname === null) continue;
-      if (apexOf(hostname) === null) continue;
-      if (!isUnderApex(hostname, apex)) continue;
-      hostnames.add(hostname);
+      const name = toHostname(rawName);
+      if (name === null) continue;
+      if (apexOf(name.hostname) === null) continue;
+      if (!isUnderApex(name.hostname, apex)) continue;
+      hostnames.set(name.hostname, (hostnames.get(name.hostname) ?? true) && name.isWildcard);
     }
   }
 
-  return [...hostnames].sort().map((hostname) => ({ hostname, source: 'ct-log' as const }));
+  return [...hostnames.keys()].sort().map((hostname) => ({
+    hostname,
+    source: 'ct-log' as const,
+    ...(hostnames.get(hostname) === true ? { isWildcard: true } : {}),
+  }));
 }

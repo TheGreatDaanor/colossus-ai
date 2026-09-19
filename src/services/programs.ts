@@ -234,7 +234,10 @@ export class ProgramsService {
     // as batched upserts rather than a select-then-write per host. The whole
     // batch is one transaction: a run that fails partway must not leave the
     // operator with an inventory that is neither the old one nor the new one.
-    const rows = new Map<string, { programId: number; hostname: string; source: HostSource; scopeStatus: ScopeStatus; firstSeenAt: Date }>();
+    const rows = new Map<
+      string,
+      { programId: number; hostname: string; source: HostSource; scopeStatus: ScopeStatus; isWildcard: boolean; firstSeenAt: Date }
+    >();
     for (const host of hosts) {
       const hostname = normaliseHostname(host.hostname);
       // Last mention of a hostname wins, which matters only for `source`; a
@@ -244,6 +247,7 @@ export class ProgramsService {
         hostname,
         source: host.source,
         scopeStatus: classifyHost(hostname, scope),
+        isWildcard: host.isWildcard === true,
         firstSeenAt,
       });
     }
@@ -255,11 +259,12 @@ export class ProgramsService {
         tx.insert(enumeratedHosts)
           .values(batched.slice(i, i + UPSERT_BATCH_SIZE))
           // A host already in the inventory keeps its identity and the date it
-          // was first seen; only its scope status is refreshed, because the
-          // operator may have changed the lists since.
+          // was first seen; its scope status is refreshed because the operator
+          // may have changed the lists since, and its wildcard flag because a
+          // host first seen behind a `*.` may since have been seen bare.
           .onConflictDoUpdate({
             target: [enumeratedHosts.programId, enumeratedHosts.hostname],
-            set: { scopeStatus: sql`excluded.scope_status` },
+            set: { scopeStatus: sql`excluded.scope_status`, isWildcard: sql`excluded.is_wildcard` },
           })
           .run();
       }

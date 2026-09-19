@@ -123,6 +123,10 @@ export const enumeratedHosts = sqliteTable(
     hostname: text('hostname').notNull(),
     source: text('source').$type<HostSource>().notNull(),
     scopeStatus: text('scope_status').$type<ScopeStatus>().notNull(),
+    // True when the row stands for a subtree rather than a name anyone has seen
+    // answer — a `*.` certificate identity, or an apex whose random-nonce label
+    // resolves. A wildcard host is shown to the operator and never scanned.
+    isWildcard: integer('is_wildcard', { mode: 'boolean' }).notNull().default(false),
     firstSeenAt: integer('first_seen_at', { mode: 'timestamp' }).notNull(),
   },
   (table) => [uniqueIndex('enumerated_hosts_program_hostname').on(table.programId, table.hostname)],

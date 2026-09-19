@@ -1,0 +1,1 @@
+ALTER TABLE `enumerated_hosts` ADD `is_wildcard` integer DEFAULT false NOT NULL;

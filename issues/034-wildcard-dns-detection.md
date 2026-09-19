@@ -1,7 +1,7 @@
 ---
 id: 034
 title: Flag wildcard DNS so the inventory stays trustworthy
-status: open
+status: done
 type: afk
 blocked-by: [032]
 ---
@@ -27,10 +27,10 @@ everything resolves.
 
 ## Definition of done
 
-- [ ] Failing test written first, confirmed red
-- [ ] Implementation makes it green
-- [ ] `test`, `typecheck`, `lint` all pass
-- [ ] Visible at: `GET /programs/:id/hosts` against a stubbed wildcard apex
+- [x] Failing test written first, confirmed red
+- [x] Implementation makes it green
+- [x] `test`, `typecheck`, `lint` all pass
+- [x] Visible at: `GET /programs/:id/hosts` against a stubbed wildcard apex
       shows the wildcard entry flagged and no fictitious hosts listed.
 
 ## Out of scope

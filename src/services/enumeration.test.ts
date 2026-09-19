@@ -1,7 +1,14 @@
 import { createServer } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { describe, expect, it, vi } from 'vitest';
-import { createCtFetch, EnumerationError, EnumerationService, type CtFetchImpl } from './enumeration.js';
+import {
+  createCtFetch,
+  EnumerationError,
+  EnumerationService,
+  type CtFetchImpl,
+  type EnumerationServiceOptions,
+  type WildcardResolverImpl,
+} from './enumeration.js';
 
 // crt.sh answers with one record per certificate identity; `name_value` holds
 // newline-separated names, which is where wildcards and duplicates come from.
@@ -14,9 +21,20 @@ function stubCt(payload: unknown): CtFetchImpl {
   return async () => payload;
 }
 
+// No name resolves, so no apex looks like a wildcard. Injected into every
+// service below: the default resolver is real DNS, and no test performs any.
+const noWildcard: WildcardResolverImpl = { resolveAddresses: async () => [] };
+
+// Resolves everything, which is exactly what a wildcard apex looks like.
+const everythingResolves: WildcardResolverImpl = { resolveAddresses: async () => ['192.0.2.1'] };
+
+function enumerationService(options: EnumerationServiceOptions = {}): EnumerationService {
+  return new EnumerationService({ resolverImpl: noWildcard, ...options });
+}
+
 describe('EnumerationService.enumerate', () => {
   it('returns the hosts named in the CT records, tagged as ct-log', async () => {
-    const service = new EnumerationService({ ctFetchImpl: stubCt(ctRecords('blog.example.com', 'api.example.com')) });
+    const service = enumerationService({ ctFetchImpl: stubCt(ctRecords('blog.example.com', 'api.example.com')) });
 
     expect(await service.enumerate('example.com')).toEqual([
       { hostname: 'api.example.com', source: 'ct-log' },
@@ -25,7 +43,7 @@ describe('EnumerationService.enumerate', () => {
   });
 
   it('splits the newline-separated names inside one record', async () => {
-    const service = new EnumerationService({ ctFetchImpl: stubCt(ctRecords('blog.example.com\napi.example.com')) });
+    const service = enumerationService({ ctFetchImpl: stubCt(ctRecords('blog.example.com\napi.example.com')) });
 
     const hosts = await service.enumerate('example.com');
 
@@ -33,23 +51,66 @@ describe('EnumerationService.enumerate', () => {
   });
 
   it('deduplicates names that many certificates share', async () => {
-    const service = new EnumerationService({
+    const service = enumerationService({
       ctFetchImpl: stubCt(ctRecords('blog.example.com', 'BLOG.example.com.', 'blog.example.com')),
     });
 
     expect(await service.enumerate('example.com')).toEqual([{ hostname: 'blog.example.com', source: 'ct-log' }]);
   });
 
-  it('reduces a wildcard name to the subtree root', async () => {
-    const service = new EnumerationService({ ctFetchImpl: stubCt(ctRecords('*.example.com')) });
+  it('reduces a wildcard name to the subtree root, flagged as a wildcard host', async () => {
+    const service = enumerationService({ ctFetchImpl: stubCt(ctRecords('*.example.com')) });
 
-    expect(await service.enumerate('example.com')).toEqual([{ hostname: 'example.com', source: 'ct-log' }]);
+    expect(await service.enumerate('example.com')).toEqual([
+      { hostname: 'example.com', source: 'ct-log', isWildcard: true },
+    ]);
+  });
+
+  it('flags the apex as wildcard when a random nonce label under it resolves', async () => {
+    const service = enumerationService({
+      ctFetchImpl: stubCt(ctRecords('blog.example.com')),
+      resolverImpl: everythingResolves,
+    });
+
+    expect(await service.enumerate('example.com')).toEqual([
+      { hostname: 'blog.example.com', source: 'ct-log' },
+      { hostname: 'example.com', source: 'ct-log', isWildcard: true },
+    ]);
+  });
+
+  it('suppresses an inferred host under a wildcard apex that does not itself resolve', async () => {
+    // Under a wildcard apex the `*.foo` identity is the only evidence `foo` is
+    // anything, and DNS cannot corroborate it — so it is not put in the
+    // inventory as a host. The apex keeps the flag that explains why.
+    const service = enumerationService({
+      ctFetchImpl: stubCt(ctRecords('*.foo.example.com', 'blog.example.com')),
+      nonceLabel: () => 'nonce',
+      resolverImpl: { resolveAddresses: async (h) => (h === 'nonce.example.com' ? ['192.0.2.1'] : []) },
+    });
+
+    expect(await service.enumerate('example.com')).toEqual([
+      { hostname: 'blog.example.com', source: 'ct-log' },
+      { hostname: 'example.com', source: 'ct-log', isWildcard: true },
+    ]);
+  });
+
+  it('keeps an inferred host under a wildcard apex that resolves on its own', async () => {
+    const service = enumerationService({
+      ctFetchImpl: stubCt(ctRecords('*.foo.example.com')),
+      nonceLabel: () => 'nonce',
+      resolverImpl: everythingResolves,
+    });
+
+    expect(await service.enumerate('example.com')).toEqual([
+      { hostname: 'example.com', source: 'ct-log', isWildcard: true },
+      { hostname: 'foo.example.com', source: 'ct-log', isWildcard: true },
+    ]);
   });
 
   it('drops names that are neither the apex nor under it', async () => {
     // One certificate routinely covers several unrelated domains; only the apex
     // being enumerated was authorized, so the rest are not this program's.
-    const service = new EnumerationService({
+    const service = enumerationService({
       ctFetchImpl: stubCt(ctRecords('blog.example.com', 'other.example.net', 'notexample.com')),
     });
 
@@ -57,7 +118,7 @@ describe('EnumerationService.enumerate', () => {
   });
 
   it('ignores entries that are not shaped like a CT record', async () => {
-    const service = new EnumerationService({
+    const service = enumerationService({
       ctFetchImpl: stubCt([{ name_value: 'blog.example.com' }, { other: 1 }, null, 'nonsense']),
     });
 
@@ -65,14 +126,14 @@ describe('EnumerationService.enumerate', () => {
   });
 
   it('returns nothing when the response is not a list of records at all', async () => {
-    const service = new EnumerationService({ ctFetchImpl: stubCt({ error: 'rate limited' }) });
+    const service = enumerationService({ ctFetchImpl: stubCt({ error: 'rate limited' }) });
 
     expect(await service.enumerate('example.com')).toEqual([]);
   });
 
   it('caches a result so an on-demand run straight after a scheduled one does not re-query', async () => {
     const ctFetchImpl = vi.fn(async () => ctRecords('blog.example.com'));
-    const service = new EnumerationService({ ctFetchImpl });
+    const service = enumerationService({ ctFetchImpl });
 
     await service.enumerate('example.com');
     await service.enumerate('example.com');
@@ -83,7 +144,7 @@ describe('EnumerationService.enumerate', () => {
   it('re-queries once the cached result has aged out', async () => {
     let now = 0;
     const ctFetchImpl = vi.fn(async () => ctRecords('blog.example.com'));
-    const service = new EnumerationService({ ctFetchImpl, cacheTtlMs: 1000, now: () => now });
+    const service = enumerationService({ ctFetchImpl, cacheTtlMs: 1000, now: () => now });
 
     await service.enumerate('example.com');
     now = 1001;
@@ -94,7 +155,7 @@ describe('EnumerationService.enumerate', () => {
 
   it('caches per apex rather than globally', async () => {
     const ctFetchImpl = vi.fn(async () => ctRecords('blog.example.com'));
-    const service = new EnumerationService({ ctFetchImpl });
+    const service = enumerationService({ ctFetchImpl });
 
     await service.enumerate('example.com');
     await service.enumerate('example.net');
@@ -106,7 +167,7 @@ describe('EnumerationService.enumerate', () => {
     // One process enumerates many programs over its lifetime; an unbounded cache
     // would hold every apex ever queried for as long as the process lives.
     const ctFetchImpl = vi.fn(async () => ctRecords('blog.example.com'));
-    const service = new EnumerationService({ ctFetchImpl, maxCacheEntries: 2 });
+    const service = enumerationService({ ctFetchImpl, maxCacheEntries: 2 });
 
     await service.enumerate('one.com');
     await service.enumerate('two.com');
@@ -117,7 +178,7 @@ describe('EnumerationService.enumerate', () => {
   });
 
   it('throws EnumerationError when the CT source fails', async () => {
-    const service = new EnumerationService({
+    const service = enumerationService({
       ctFetchImpl: async () => {
         throw new Error('502 Bad Gateway');
       },
@@ -130,7 +191,7 @@ describe('EnumerationService.enumerate', () => {
     const ctFetchImpl = vi.fn(async () => {
       throw new Error('502 Bad Gateway');
     });
-    const service = new EnumerationService({ ctFetchImpl });
+    const service = enumerationService({ ctFetchImpl });
 
     await expect(service.enumerate('example.com')).rejects.toBeInstanceOf(EnumerationError);
     await expect(service.enumerate('example.com')).rejects.toBeInstanceOf(EnumerationError);
