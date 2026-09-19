@@ -583,6 +583,105 @@ describe('ProgramsService.enumerateProgram', () => {
     expect((await service.getProgram(program.id))?.lastEnumeratedAt).toBeNull();
   });
 
+  it('records the endpoint each host answers on', async () => {
+    const service = buildService({
+      enumerationImpl: {
+        ...stubEnumeration(['blog.example.com']),
+        resolveEndpoint: async (hostname: string) => `https://${hostname}`,
+      },
+    });
+    const program = await service.createProgram({ url: 'https://example.com' });
+
+    await service.enumerateProgram(program.id);
+
+    const [host] = await service.listHosts(program.id);
+    expect(host?.endpointUrl).toBe('https://blog.example.com');
+    expect(host?.lastResolvedAt).toBeInstanceOf(Date);
+  });
+
+  it('retains a host that stops resolving, with the endpoint it last answered on', async () => {
+    let answers = true;
+    const service = buildService({
+      enumerationImpl: {
+        ...stubEnumeration(['blog.example.com']),
+        resolveEndpoint: async (hostname: string) => (answers ? `https://${hostname}` : null),
+      },
+    });
+    const program = await service.createProgram({ url: 'https://example.com' });
+
+    await service.enumerateProgram(program.id);
+    const resolvedAt = (await service.listHosts(program.id))[0]?.lastResolvedAt;
+    answers = false;
+    await service.enumerateProgram(program.id);
+    await service.enumerateProgram(program.id);
+    await service.enumerateProgram(program.id);
+
+    const [host] = await service.listHosts(program.id);
+    expect(host?.endpointUrl).toBe('https://blog.example.com');
+    expect(host?.lastResolvedAt).toEqual(resolvedAt);
+    expect(host?.failedResolutions).toBe(3);
+  });
+
+  it('clears the failure count once a dormant host answers again', async () => {
+    let answers = false;
+    const service = buildService({
+      enumerationImpl: {
+        ...stubEnumeration(['blog.example.com']),
+        resolveEndpoint: async (hostname: string) => (answers ? `http://${hostname}` : null),
+      },
+    });
+    const program = await service.createProgram({ url: 'https://example.com' });
+
+    await service.enumerateProgram(program.id);
+    answers = true;
+    await service.enumerateProgram(program.id);
+
+    const [host] = await service.listHosts(program.id);
+    expect(host?.failedResolutions).toBe(0);
+    expect(host?.endpointUrl).toBe('http://blog.example.com');
+  });
+
+  it('does not probe a wildcard host, which would answer whatever the name', async () => {
+    const probed: string[] = [];
+    const service = buildService({
+      enumerationImpl: {
+        enumerate: async () => [{ hostname: 'example.com', source: 'ct-log' as const, isWildcard: true }],
+        resolveEndpoint: async (hostname: string) => {
+          probed.push(hostname);
+          return `https://${hostname}`;
+        },
+      },
+    });
+    const program = await service.createProgram({ url: 'https://example.com' });
+
+    await service.enumerateProgram(program.id);
+
+    expect(probed).toEqual([]);
+    expect((await service.listHosts(program.id))[0]?.endpointUrl).toBeNull();
+  });
+
+  it('stops offering a host for scanning after three consecutive failed resolutions', async () => {
+    let answers = true;
+    const service = buildService({
+      enumerationImpl: {
+        ...stubEnumeration(['blog.example.com']),
+        resolveEndpoint: async (hostname: string) => (answers ? `https://${hostname}` : null),
+      },
+    });
+    const program = await service.createProgram({ url: 'https://example.com' });
+
+    await service.enumerateProgram(program.id);
+    answers = false;
+    await service.enumerateProgram(program.id);
+    await service.enumerateProgram(program.id);
+    expect((await service.listScannableHosts(program.id)).map((h) => h.hostname)).toEqual(['blog.example.com']);
+
+    await service.enumerateProgram(program.id);
+
+    expect(await service.listScannableHosts(program.id)).toEqual([]);
+    expect(await service.listHosts(program.id)).toHaveLength(1);
+  });
+
   it('rejects enumerating an unknown program', async () => {
     const service = buildService({ enumerationImpl: stubEnumeration([]) });
 

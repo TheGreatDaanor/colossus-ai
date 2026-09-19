@@ -1,5 +1,6 @@
 import { Hono } from 'hono';
 import {
+  isDormant,
   ProgramValidationError,
   type EnumeratedHost,
   type AddScopeEntryOptions,
@@ -43,12 +44,18 @@ function serializeScopeEntry(entry: ScopeEntry) {
 }
 
 function serializeHost(host: EnumeratedHost) {
-  const { programId, scopeStatus, isWildcard, firstSeenAt, ...rest } = host;
+  const { programId, scopeStatus, isWildcard, endpointUrl, lastResolvedAt, failedResolutions, firstSeenAt, ...rest } = host;
   return {
     ...rest,
     program_id: programId,
     scope_status: scopeStatus,
     is_wildcard: isWildcard,
+    endpoint_url: endpointUrl,
+    last_resolved_at: lastResolvedAt,
+    failed_resolutions: failedResolutions,
+    // Derived rather than stored: the threshold is the service's rule, and the
+    // operator reading the inventory should not have to apply it themselves.
+    is_dormant: isDormant(host),
     first_seen_at: firstSeenAt,
   };
 }

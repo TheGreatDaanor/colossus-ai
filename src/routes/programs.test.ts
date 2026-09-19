@@ -12,7 +12,16 @@ type ScopeEntryBody = { id: number; list: string; pattern: string; confirmed_at:
 type ProgramBody = { id: number; name: string; scope_entries: ScopeEntryBody[] };
 type ClassifyBody = { host: string; status: string };
 type ErrorBody = { error: string };
-type HostBody = { id: number; hostname: string; source: string; scope_status: string; is_wildcard: boolean };
+type HostBody = {
+  id: number;
+  hostname: string;
+  source: string;
+  scope_status: string;
+  is_wildcard: boolean;
+  endpoint_url: string | null;
+  last_resolved_at: string | null;
+  is_dormant: boolean;
+};
 type HostsBody = { hosts: HostBody[]; enumeration_error: string | null };
 
 function buildApp(options: ProgramsServiceOptions = {}) {
@@ -298,6 +307,36 @@ describe('GET /programs/:id/hosts', () => {
       ['blog.example.com', false],
       ['example.com', true],
     ]);
+  });
+
+  it('shows the endpoint each host answers on, and marks a host that has gone dark', async () => {
+    let answers = true;
+    const { app, service } = buildApp({
+      enumerationImpl: {
+        enumerate: async () => [
+          { hostname: 'blog.example.com', source: 'ct-log' as const },
+          { hostname: 'legacy.example.com', source: 'ct-log' as const },
+        ],
+        resolveEndpoint: async (hostname: string) => {
+          if (hostname === 'legacy.example.com') return `http://${hostname}`;
+          return answers ? `https://${hostname}` : null;
+        },
+      },
+    });
+    const created = await json<ProgramBody>(await postJson(app, '/programs', { url: 'https://example.com' }));
+    await service.enumerateProgram(created.id);
+    answers = false;
+    await service.enumerateProgram(created.id);
+    await service.enumerateProgram(created.id);
+    await service.enumerateProgram(created.id);
+
+    const body = await json<HostsBody>(await app.request(`/programs/${created.id}/hosts`));
+
+    expect(body.hosts.map((h) => [h.hostname, h.endpoint_url, h.is_dormant])).toEqual([
+      ['blog.example.com', 'https://blog.example.com', true],
+      ['legacy.example.com', 'http://legacy.example.com', false],
+    ]);
+    expect(body.hosts[0]?.last_resolved_at).not.toBeNull();
   });
 
   it('returns an empty list for a program that has never been enumerated', async () => {

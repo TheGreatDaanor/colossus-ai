@@ -200,6 +200,36 @@ describe('EnumerationService.enumerate', () => {
   });
 });
 
+describe('EnumerationService.resolveEndpoint', () => {
+  it('prefers https when a host answers on both schemes', async () => {
+    const service = enumerationService({ endpointProbeImpl: async () => true });
+
+    expect(await service.resolveEndpoint('api.example.com')).toBe('https://api.example.com');
+  });
+
+  it('falls back to http for a host that answers on nothing else', async () => {
+    const service = enumerationService({ endpointProbeImpl: async (url) => url.startsWith('http://') });
+
+    expect(await service.resolveEndpoint('legacy.example.com')).toBe('http://legacy.example.com');
+  });
+
+  it('is null for a host that answers on neither scheme', async () => {
+    const service = enumerationService({ endpointProbeImpl: async () => false });
+
+    expect(await service.resolveEndpoint('gone.example.com')).toBeNull();
+  });
+
+  it('treats a probe that throws as a host that did not answer', async () => {
+    const service = enumerationService({
+      endpointProbeImpl: async () => {
+        throw new Error('ECONNREFUSED');
+      },
+    });
+
+    expect(await service.resolveEndpoint('gone.example.com')).toBeNull();
+  });
+});
+
 describe('createCtFetch', () => {
   // The one place in this module that does real I/O, so the timeout is exercised
   // against a local server rather than stubbed.
