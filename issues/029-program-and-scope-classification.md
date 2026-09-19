@@ -1,7 +1,7 @@
 ---
 id: 029
 title: Create a program with scope lists and classify hosts against them
-status: open
+status: done
 type: afk
 blocked-by: []
 ---
@@ -41,10 +41,10 @@ and the classification rule that every later issue depends on.
 
 ## Definition of done
 
-- [ ] Failing test written first, confirmed red
-- [ ] Implementation makes it green
-- [ ] `test`, `typecheck`, `lint` all pass
-- [ ] Visible at: `POST /programs {"url":"https://example.com/x"}` returns a
+- [x] Failing test written first, confirmed red
+- [x] Implementation makes it green
+- [x] `test`, `typecheck`, `lint` all pass
+- [x] Visible at: `POST /programs {"url":"https://example.com/x"}` returns a
       program with `example.com` in scope; adding `example-shop.com` as a
       second apex puts hosts under both in scope;
       `GET /programs/:id/classify?host=vpn.internal.example.com`
