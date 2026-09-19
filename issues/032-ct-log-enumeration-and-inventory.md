@@ -1,7 +1,7 @@
 ---
 id: 032
 title: Enumerate hosts from CT logs into the program inventory
-status: open
+status: done
 type: afk
 blocked-by: [029]
 ---
@@ -31,10 +31,10 @@ in Certificate Transparency logs, each already classified `in_scope`,
 
 ## Definition of done
 
-- [ ] Failing test written first, confirmed red
-- [ ] Implementation makes it green
-- [ ] `test`, `typecheck`, `lint` all pass
-- [ ] Visible at: `POST /programs/:id/enumerate` then
+- [x] Failing test written first, confirmed red
+- [x] Implementation makes it green
+- [x] `test`, `typecheck`, `lint` all pass
+- [x] Visible at: `POST /programs/:id/enumerate` then
       `GET /programs/:id/hosts` lists hosts with their scope status; with the
       CT client stubbed to fail, the error is recorded on the program and the
       existing inventory is still returned.

@@ -4,6 +4,7 @@ import { createDb } from './db/client.js';
 import { createDashboardRoutes } from './routes/dashboard.js';
 import { createProgramsRoutes } from './routes/programs.js';
 import { createScansRoutes } from './routes/scans.js';
+import { EnumerationService } from './services/enumeration.js';
 import { ProgramsService } from './services/programs.js';
 import { ScannerService } from './services/scanner.js';
 
@@ -13,7 +14,7 @@ const defaultUserAgent = process.env['SCANNER_USER_AGENT'] ?? 'colossus-scanner/
 
 const db = createDb(dbPath);
 const service = new ScannerService(db, { defaultUserAgent });
-const programsService = new ProgramsService(db);
+const programsService = new ProgramsService(db, { enumerationImpl: new EnumerationService({ userAgent: defaultUserAgent }) });
 
 const app = new Hono();
 app.route('/', createScansRoutes(service));

@@ -1,13 +1,21 @@
 import { describe, expect, it } from 'vitest';
 import { createDb } from '../db/client.js';
-import { apexOf, classifyHost, ProgramValidationError, ProgramsService, type Scope } from './programs.js';
+import { EnumerationError } from './enumeration.js';
+import {
+  apexOf,
+  classifyHost,
+  ProgramValidationError,
+  ProgramsService,
+  type ProgramsServiceOptions,
+  type Scope,
+} from './programs.js';
 
 function scope(inList: string[], outList: string[] = []): Scope {
   return { in: inList, out: outList };
 }
 
-function buildService() {
-  return new ProgramsService(createDb(':memory:'));
+function buildService(options: ProgramsServiceOptions = {}) {
+  return new ProgramsService(createDb(':memory:'), options);
 }
 
 describe('apexOf', () => {
@@ -362,5 +370,207 @@ describe('ProgramsService.classify', () => {
     const service = buildService();
 
     await expect(service.classify(404, 'example.com')).rejects.toThrow(ProgramValidationError);
+  });
+});
+
+describe('ProgramsService.recordHosts', () => {
+  it('records each observed host with its scope status', async () => {
+    const service = buildService();
+    const program = await service.createProgram({ url: 'https://example.com' });
+    await service.addScopeEntry(program.id, { list: 'out', pattern: '*.internal.example.com' });
+
+    const recorded = await service.recordHosts(program.id, [
+      { hostname: 'blog.example.com', source: 'ct-log' },
+      { hostname: 'vpn.internal.example.com', source: 'ct-log' },
+      { hostname: 'partner.example.org', source: 'ct-log' },
+    ]);
+
+    expect(recorded.map((h) => [h.hostname, h.scopeStatus])).toEqual([
+      ['blog.example.com', 'in_scope'],
+      ['vpn.internal.example.com', 'out_of_scope'],
+      ['partner.example.org', 'unscoped'],
+    ]);
+  });
+
+  it('records a host matching neither list rather than dropping it', async () => {
+    const service = buildService();
+    const program = await service.createProgram({ url: 'https://example.com' });
+
+    await service.recordHosts(program.id, [{ hostname: 'partner.example.org', source: 'ct-log' }]);
+
+    expect((await service.listHosts(program.id)).map((h) => h.hostname)).toContain('partner.example.org');
+  });
+
+  it('keeps one row per hostname when the same host is seen again', async () => {
+    const service = buildService();
+    const program = await service.createProgram({ url: 'https://example.com' });
+
+    const first = await service.recordHosts(program.id, [{ hostname: 'blog.example.com', source: 'ct-log' }]);
+    const second = await service.recordHosts(program.id, [{ hostname: 'blog.example.com', source: 'crawl' }]);
+
+    expect(await service.listHosts(program.id)).toHaveLength(1);
+    expect(second[0]?.id).toBe(first[0]?.id);
+    expect(second[0]?.firstSeenAt).toEqual(first[0]?.firstSeenAt);
+  });
+
+  it('reclassifies a host already in the inventory when the scope has changed', async () => {
+    const service = buildService();
+    const program = await service.createProgram({ url: 'https://example.com' });
+    await service.recordHosts(program.id, [{ hostname: 'vpn.example.com', source: 'ct-log' }]);
+
+    await service.addScopeEntry(program.id, { list: 'out', pattern: 'vpn.example.com' });
+    const recorded = await service.recordHosts(program.id, [{ hostname: 'vpn.example.com', source: 'ct-log' }]);
+
+    expect(recorded[0]?.scopeStatus).toBe('out_of_scope');
+  });
+
+  it('keeps each program inventory separate', async () => {
+    const service = buildService();
+    const mine = await service.createProgram({ url: 'https://example.com' });
+    const theirs = await service.createProgram({ url: 'https://example.org' });
+
+    await service.recordHosts(mine.id, [{ hostname: 'blog.example.com', source: 'ct-log' }]);
+
+    expect(await service.listHosts(theirs.id)).toEqual([]);
+  });
+
+  it('records a hostname named twice in the same batch only once', async () => {
+    // One enumeration run can name the same host from two sources or two
+    // certificates; a batch that trips the unique index would lose the run.
+    const service = buildService();
+    const program = await service.createProgram({ url: 'https://example.com' });
+
+    await service.recordHosts(program.id, [
+      { hostname: 'blog.example.com', source: 'ct-log' },
+      { hostname: 'blog.example.com', source: 'ct-log' },
+    ]);
+
+    expect((await service.listHosts(program.id)).map((h) => h.hostname)).toEqual(['blog.example.com']);
+  });
+
+  it('records an inventory larger than one SQL statement can bind at once', async () => {
+    // A CT answer for a busy apex routinely names thousands of hosts, which is
+    // more bound parameters than SQLite accepts in a single statement.
+    const service = buildService();
+    const program = await service.createProgram({ url: 'https://example.com' });
+    const hosts = Array.from({ length: 2_000 }, (_, i) => ({
+      hostname: `host-${i}.example.com`,
+      source: 'ct-log' as const,
+    }));
+
+    await service.recordHosts(program.id, hosts);
+
+    expect(await service.listHosts(program.id)).toHaveLength(2_000);
+  });
+
+  it('rejects recording against an unknown program', async () => {
+    const service = buildService();
+
+    await expect(service.recordHosts(404, [{ hostname: 'blog.example.com', source: 'ct-log' }])).rejects.toThrow(
+      ProgramValidationError,
+    );
+  });
+});
+
+describe('ProgramsService.enumerateProgram', () => {
+  function stubEnumeration(hosts: string[]) {
+    return { enumerate: async () => hosts.map((hostname) => ({ hostname, source: 'ct-log' as const })) };
+  }
+
+  it('records the hosts the enumeration source returned for each in-scope apex', async () => {
+    const service = buildService({ enumerationImpl: stubEnumeration(['blog.example.com', 'api.example.com']) });
+    const program = await service.createProgram({ url: 'https://example.com' });
+
+    const hosts = await service.enumerateProgram(program.id);
+
+    expect(hosts.map((h) => h.hostname)).toEqual(['api.example.com', 'blog.example.com']);
+  });
+
+  it('enumerates the apexes on the in-scope list, not exact-host entries', async () => {
+    const apexes: string[] = [];
+    const service = buildService({
+      enumerationImpl: {
+        enumerate: async (apex: string) => {
+          apexes.push(apex);
+          return [];
+        },
+      },
+    });
+    const program = await service.createProgram({ url: 'https://example.com' });
+    await service.addScopeEntry(program.id, { list: 'in', pattern: 'partner.example.org' });
+
+    await service.enumerateProgram(program.id);
+
+    expect(apexes).toEqual(['example.com']);
+  });
+
+  it('stamps the program with the time it was last enumerated', async () => {
+    const service = buildService({ enumerationImpl: stubEnumeration([]) });
+    const program = await service.createProgram({ url: 'https://example.com' });
+
+    await service.enumerateProgram(program.id);
+
+    expect((await service.getProgram(program.id))?.lastEnumeratedAt).toBeInstanceOf(Date);
+  });
+
+  it('records the error on the program instead of failing when the source is down', async () => {
+    // A CT outage must not fail the operator's run: the inventory they already
+    // have is still the truth, and the error explains why nothing new arrived.
+    const service = buildService({
+      enumerationImpl: {
+        enumerate: async () => {
+          throw new EnumerationError('crt.sh: 502 Bad Gateway');
+        },
+      },
+    });
+    const program = await service.createProgram({ url: 'https://example.com' });
+    await service.recordHosts(program.id, [{ hostname: 'known.example.com', source: 'ct-log' }]);
+
+    const hosts = await service.enumerateProgram(program.id);
+
+    expect(hosts.map((h) => h.hostname)).toEqual(['known.example.com']);
+    expect((await service.getProgram(program.id))?.enumerationError).toContain('502');
+  });
+
+  it('clears a previous enumeration error once a run succeeds', async () => {
+    let fail = true;
+    const service = buildService({
+      enumerationImpl: {
+        enumerate: async () => {
+          if (fail) throw new EnumerationError('crt.sh: 502 Bad Gateway');
+          return [{ hostname: 'blog.example.com', source: 'ct-log' as const }];
+        },
+      },
+    });
+    const program = await service.createProgram({ url: 'https://example.com' });
+
+    await service.enumerateProgram(program.id);
+    fail = false;
+    await service.enumerateProgram(program.id);
+
+    expect((await service.getProgram(program.id))?.enumerationError).toBeNull();
+  });
+
+  it('does not stamp lastEnumeratedAt when every apex failed', async () => {
+    // Nothing was enumerated, so claiming a successful enumeration time would
+    // tell the operator the inventory is fresh when no source was ever read.
+    const service = buildService({
+      enumerationImpl: {
+        enumerate: async () => {
+          throw new EnumerationError('crt.sh: 502 Bad Gateway');
+        },
+      },
+    });
+    const program = await service.createProgram({ url: 'https://example.com' });
+
+    await service.enumerateProgram(program.id);
+
+    expect((await service.getProgram(program.id))?.lastEnumeratedAt).toBeNull();
+  });
+
+  it('rejects enumerating an unknown program', async () => {
+    const service = buildService({ enumerationImpl: stubEnumeration([]) });
+
+    await expect(service.enumerateProgram(404)).rejects.toThrow(ProgramValidationError);
   });
 });
