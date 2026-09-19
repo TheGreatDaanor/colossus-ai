@@ -44,19 +44,22 @@ function serializeScopeEntry(entry: ScopeEntry) {
 }
 
 function serializeHost(host: EnumeratedHost) {
-  const { programId, scopeStatus, isWildcard, endpointUrl, lastResolvedAt, failedResolutions, firstSeenAt, ...rest } = host;
+  // Listed field by field rather than spread: the row carries the raw failure
+  // counter, and a spread would put it on the wire by accident.
   return {
-    ...rest,
-    program_id: programId,
-    scope_status: scopeStatus,
-    is_wildcard: isWildcard,
-    endpoint_url: endpointUrl,
-    last_resolved_at: lastResolvedAt,
-    failed_resolutions: failedResolutions,
-    // Derived rather than stored: the threshold is the service's rule, and the
-    // operator reading the inventory should not have to apply it themselves.
+    id: host.id,
+    hostname: host.hostname,
+    source: host.source,
+    program_id: host.programId,
+    scope_status: host.scopeStatus,
+    is_wildcard: host.isWildcard,
+    endpoint_url: host.endpointUrl,
+    last_resolved_at: host.lastResolvedAt,
+    // Derived rather than stored, and the raw failure counter is deliberately
+    // not on the wire: the threshold is the service's rule, and a client given
+    // the count would only re-derive it and drift from it.
     is_dormant: isDormant(host),
-    first_seen_at: firstSeenAt,
+    first_seen_at: host.firstSeenAt,
   };
 }
 

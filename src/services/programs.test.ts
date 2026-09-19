@@ -641,6 +641,28 @@ describe('ProgramsService.enumerateProgram', () => {
     expect(host?.endpointUrl).toBe('http://blog.example.com');
   });
 
+  it('probes only in-scope hosts, so no traffic reaches a host outside the engagement', async () => {
+    const probed: string[] = [];
+    const service = buildService({
+      enumerationImpl: {
+        enumerate: async () => [
+          { hostname: 'blog.example.com', source: 'ct-log' as const },
+          { hostname: 'secret.example.com', source: 'ct-log' as const },
+        ],
+        resolveEndpoint: async (hostname: string) => {
+          probed.push(hostname);
+          return `https://${hostname}`;
+        },
+      },
+    });
+    const program = await service.createProgram({ url: 'https://example.com' });
+    await service.addScopeEntry(program.id, { list: 'out', pattern: 'secret.example.com' });
+
+    await service.enumerateProgram(program.id);
+
+    expect(probed).toEqual(['blog.example.com']);
+  });
+
   it('does not probe a wildcard host, which would answer whatever the name', async () => {
     const probed: string[] = [];
     const service = buildService({

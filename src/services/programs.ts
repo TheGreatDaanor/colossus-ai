@@ -335,7 +335,7 @@ export class ProgramsService {
     }
 
     await this.recordHosts(programId, observed);
-    await this.probeEndpoints(programId);
+    await this.#probeEndpoints(programId);
 
     // `lastEnumeratedAt` answers "how fresh is this inventory", so it is stamped
     // only when a source was actually read. A run where every apex failed left
@@ -353,22 +353,25 @@ export class ProgramsService {
     return this.listHosts(programId);
   }
 
-  // Probes every host in the inventory for the scheme it answers on. A host
-  // that answers has its endpoint and resolution time refreshed and its failure
-  // count cleared; one that does not keeps its row, its last known endpoint and
-  // its last resolution time, and has its failure count raised.
+  // Probes each in-scope host for the scheme it answers on. A host that answers
+  // has its endpoint and resolution time refreshed and its failure count
+  // cleared; one that does not keeps its row, its last known endpoint and its
+  // last resolution time, and has its failure count raised.
   //
-  // Wildcard hosts are skipped: under a wildcard every name answers, so a probe
-  // would record an endpoint for a host nobody has seen.
-  async probeEndpoints(programId: number): Promise<EnumeratedHost[]> {
-    this.#requireProgram(programId);
-    const resolveEndpoint = this.#enumerationImpl?.resolveEndpoint;
-    if (resolveEndpoint === undefined) return this.listHosts(programId);
-
+  // Only in-scope hosts are probed. A probe is a live request, and an
+  // `out_of_scope` or `unscoped` host is one the engagement does not authorize
+  // traffic to — the inventory may know it exists without touching it.
+  //
+  // Wildcard hosts are skipped too: under a wildcard every name answers, so a
+  // probe would record an endpoint for a host nobody has seen.
+  async #probeEndpoints(programId: number): Promise<void> {
     const probedAt = new Date();
     for (const host of await this.listHosts(programId)) {
-      if (host.isWildcard) continue;
-      const endpointUrl = await resolveEndpoint.call(this.#enumerationImpl, host.hostname);
+      if (host.isWildcard || host.scopeStatus !== 'in_scope') continue;
+      const endpointUrl = await this.#enumerationImpl?.resolveEndpoint?.(host.hostname);
+      // A source that does not probe at all leaves the inventory as it is,
+      // rather than counting a probe that never happened as a failure.
+      if (endpointUrl === undefined) return;
       this.#db
         .update(enumeratedHosts)
         .set(
@@ -379,8 +382,6 @@ export class ProgramsService {
         .where(eq(enumeratedHosts.id, host.id))
         .run();
     }
-
-    return this.listHosts(programId);
   }
 
   // Only apexes are enumerated: an exact-host entry authorizes that one host,
