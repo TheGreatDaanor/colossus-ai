@@ -243,6 +243,64 @@ describe('sqliInjectionClass', () => {
 
     expect(result.outcome).toBe('not_vulnerable');
   });
+
+  it('confirms a MySQL/MariaDB backend from the manual-version error', async () => {
+    const origin = await fixture((q) =>
+      q.includes("'")
+        ? `<html><body>check the manual that corresponds to your MariaDB server version for the right syntax</body></html>`
+        : `<html><body>results for ${q}</body></html>`,
+    );
+    const sqli = makeSqliInjectionClass(fetchText);
+    const [point] = sqli.enumerate(new URL(`${origin}/?q=seed`));
+
+    const result = await sqli.confirm(point!);
+
+    expect(result.outcome).toBe('confirmed');
+    expect(result.evidenceSnippet).toContain('MariaDB server version');
+  });
+
+  it('confirms an MSSQL backend from the incorrect-syntax error', async () => {
+    const origin = await fixture((q) =>
+      q.includes("'")
+        ? `<html><body>Incorrect syntax near ')'.</body></html>`
+        : `<html><body>results for ${q}</body></html>`,
+    );
+    const sqli = makeSqliInjectionClass(fetchText);
+    const [point] = sqli.enumerate(new URL(`${origin}/?q=seed`));
+
+    const result = await sqli.confirm(point!);
+
+    expect(result.outcome).toBe('confirmed');
+    expect(result.evidenceSnippet).toContain('Incorrect syntax near');
+  });
+
+  it('confirms a DB2 backend from the SQLCODE error', async () => {
+    const origin = await fixture((q) =>
+      q.includes("'")
+        ? `<html><body>DB2 SQL Error: SQLCODE=-104, SQLSTATE=42601</body></html>`
+        : `<html><body>results for ${q}</body></html>`,
+    );
+    const sqli = makeSqliInjectionClass(fetchText);
+    const [point] = sqli.enumerate(new URL(`${origin}/?q=seed`));
+
+    const result = await sqli.confirm(point!);
+
+    expect(result.outcome).toBe('confirmed');
+    expect(result.evidenceSnippet).toContain('DB2 SQL Error');
+  });
+
+  it('clears a page that shows a DB2 error signature unconditionally', async () => {
+    const origin = await fixture(
+      () => `<html><body>DB2 SQL Error: SQLCODE=-204, SQLSTATE=42704</body></html>`,
+    );
+    const sqli = makeSqliInjectionClass(fetchText);
+    const [point] = sqli.enumerate(new URL(`${origin}/?q=seed`));
+
+    const result = await sqli.confirm(point!);
+
+    expect(result.outcome).toBe('not_vulnerable');
+    expect(result.evidenceSnippet).toBeUndefined();
+  });
 });
 
 describe('lfiInjectionClass', () => {

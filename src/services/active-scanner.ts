@@ -342,6 +342,7 @@ const SQLI_TOKEN = "'";
 const SQL_ERROR_SIGNATURES: RegExp[] = [
   /You have an error in your SQL syntax/i, // MySQL / MariaDB
   /SQL syntax.*MySQL/i,
+  /check the manual that corresponds to your (?:MySQL|MariaDB) server version/i, // MySQL / MariaDB
   /ORA-\d{5}/, // Oracle
   /PG::\w*Error/, // PostgreSQL (Rails/pg)
   /PostgreSQL.*ERROR/i,
@@ -349,7 +350,10 @@ const SQL_ERROR_SIGNATURES: RegExp[] = [
   /unrecognized token/i, // SQLite parser
   /SqlException/, // .NET / SQL Server
   /Unclosed quotation mark after the character string/i, // SQL Server
+  /Incorrect syntax near/i, // SQL Server (MSSQL)
   /Microsoft OLE DB Provider for (?:ODBC|SQL Server)/i,
+  /DB2 SQL Error/i, // IBM DB2
+  /SQLCODE[=:]?\s*-?\d+/, // IBM DB2 error code
 ];
 
 // The first line of the injected body that carries a DB error signature, so the finding's

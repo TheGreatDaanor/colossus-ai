@@ -1,7 +1,7 @@
 ---
 id: 045
 title: Deepen SQLi error signatures to cover MySQL, MSSQL, and DB2
-status: open
+status: done
 type: afk
 blocked-by: []
 ---
