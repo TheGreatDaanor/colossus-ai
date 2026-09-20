@@ -240,6 +240,14 @@ export class ProgramsService {
     if (!removed) throw new ProgramValidationError(`scope entry ${entryId} not found on program ${programId}`);
   }
 
+  // The scope lists as one value, for a caller that classifies many hostnames
+  // in a row (the crawler, every link on every page) and must not pay a query
+  // each time.
+  async scopeOf(programId: number): Promise<Scope> {
+    this.#requireProgram(programId);
+    return toScope(this.#scopeEntriesOf(programId));
+  }
+
   async classify(programId: number, hostname: string): Promise<ScopeStatus> {
     this.#requireProgram(programId);
     return classifyHost(hostname, toScope(this.#scopeEntriesOf(programId)));

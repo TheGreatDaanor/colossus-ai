@@ -1,7 +1,7 @@
 ---
 id: 038
 title: Follow crawled links to any in-scope host
-status: open
+status: done
 type: afk
 blocked-by: [032]
 ---
@@ -28,10 +28,10 @@ never had a certificate.
 
 ## Definition of done
 
-- [ ] Failing test written first, confirmed red
-- [ ] Implementation makes it green
-- [ ] `test`, `typecheck`, `lint` all pass
-- [ ] Visible at: a scan of a stubbed page linking to an in-scope subdomain
+- [x] Failing test written first, confirmed red
+- [x] Implementation makes it green
+- [x] `test`, `typecheck`, `lint` all pass
+- [x] Visible at: a scan of a stubbed page linking to an in-scope subdomain
       follows it and records the host with source `crawl`; a link to an
       out-of-scope host is not followed.
 

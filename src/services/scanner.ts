@@ -12,7 +12,7 @@ import {
   type BodyFetchImpl,
 } from './active-scanner.js';
 import { discoverLinks } from './discovery.js';
-import { hostCapFor, ProgramsService, type EnumeratedHost } from './programs.js';
+import { hostCapFor, ProgramsService, type EnumeratedHost, type Scope } from './programs.js';
 import { findDisallowedAddress, isDisallowedAddress } from './ssrf-guard.js';
 import {
   detectHeaderFindings,
@@ -376,6 +376,11 @@ async function readHtmlBody(response: Response): Promise<string> {
 // root, per-root count, and which URLs are already a target) only makes sense for the
 // scan currently running, mirroring how cveCache/llmCache are scan-scoped.
 type DiscoveryContext = {
+  // The program this scan belongs to, if any, and its scope lists. With them,
+  // the crawl may cross to any in-scope host and every host it sees lands in
+  // the inventory; without them it stays on the submitted origin.
+  programId: number | null;
+  scope: Scope | null;
   seenUrls: Set<string>;
   depthOf: Map<number, number>;
   rootOf: Map<number, number>;
@@ -542,7 +547,7 @@ export class ScannerService {
 
     const targetRows = [...submittedRows, ...inventoryRows];
 
-    void this.#runScan(scan.id, targetRows, scan.userAgent ?? this.#defaultUserAgent, scan.mode);
+    void this.#runScan(scan.id, targetRows, scan.userAgent ?? this.#defaultUserAgent, scan.mode, programId);
 
     return scan;
   }
@@ -577,7 +582,13 @@ export class ScannerService {
     return this.#db.select().from(scans).orderBy(scans.createdAt).all().reverse();
   }
 
-  async #runScan(scanId: number, targetRows: ScanTarget[], userAgent: string, mode: ScanMode): Promise<void> {
+  async #runScan(
+    scanId: number,
+    targetRows: ScanTarget[],
+    userAgent: string,
+    mode: ScanMode,
+    programId: number | null,
+  ): Promise<void> {
     this.#db.update(scans).set({ status: 'running' }).where(eq(scans.id, scanId)).run();
 
     // Cached per scan run, not on the instance: the PRD requires CVE lookups to be
@@ -591,7 +602,15 @@ export class ScannerService {
     // Roots are the operator-submitted targets: depth 0, and their own discovery
     // budget. Discovery can add new rows to the queue mid-run, so this loop drains a
     // growing queue rather than iterating the fixed initial batch.
+    // Read once per run, not per page: the operator may edit the lists while a
+    // scan is in flight, and a crawl that changed its mind halfway would be
+    // impossible to reason about afterwards.
+    const scope =
+      programId === null || this.#programsService === null ? null : await this.#programsService.scopeOf(programId);
+
     const discovery: DiscoveryContext = {
+      programId,
+      scope,
       seenUrls: new Set(targetRows.map((t) => t.url)),
       depthOf: new Map(targetRows.map((t) => [t.id, 0])),
       rootOf: new Map(targetRows.map((t) => [t.id, t.id])),
@@ -750,7 +769,7 @@ export class ScannerService {
 
       // Discovery runs regardless of mode — it's non-intrusive HTML parsing, not a
       // payload-sending check, so it isn't gated behind the active-mode attestation.
-      const discovered = this.#discoverTargets(target, targetUrl, html, robotsBody, discovery);
+      const discovered = await this.#discoverTargets(target, targetUrl, html, robotsBody, discovery);
 
       console.warn(`[scan ${target.scanId}] ${target.url} succeeded`);
       return discovered;
@@ -780,18 +799,30 @@ export class ScannerService {
   // operator-submitted root (walking `discoveredFrom` back to the root would also
   // work but requires a DB round-trip per target; the in-memory maps are scoped to
   // one #runScan call and cost nothing extra).
-  #discoverTargets(
+  async #discoverTargets(
     target: ScanTarget,
     targetUrl: URL,
     html: string,
     robotsTxt: string | null,
     discovery: DiscoveryContext,
-  ): ScanTarget[] {
+  ): Promise<ScanTarget[]> {
+    const { links, hostnames } = discoverLinks({ url: targetUrl, html }, robotsTxt, discovery.scope);
+
+    // Recorded before the depth cap is applied: a host named by a page is a host
+    // the operator should see in the inventory even when the crawl has run out of
+    // depth to visit it. Out-of-scope and unscoped hosts are recorded too —
+    // `recordHosts` classifies them, and neither is ever selected for a scan.
+    if (discovery.programId !== null && hostnames.length > 0) {
+      await this.#programsService?.recordHosts(
+        discovery.programId,
+        hostnames.map((hostname) => ({ hostname, source: 'crawl' as const })),
+      );
+    }
+
     const depth = discovery.depthOf.get(target.id) ?? 0;
     if (depth >= MAX_DISCOVERY_DEPTH) return [];
 
     const rootId = discovery.rootOf.get(target.id) ?? target.id;
-    const links = discoverLinks({ url: targetUrl, html }, robotsTxt);
     const rows: (typeof scanTargets.$inferInsert)[] = [];
 
     for (const url of links) {

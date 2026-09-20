@@ -147,6 +147,100 @@ describe('ScannerService program scans', () => {
   });
 });
 
+describe('ScannerService scope-aware crawl discovery', () => {
+  const HTML_HEADERS = { 'content-type': 'text/html; charset=utf-8' };
+
+  // A page that links out to one in-scope host, one excluded host and one host the
+  // program never mentioned. Only the first is authorized to be fetched.
+  const ROOT_HTML = `
+    <a href="https://blog.example.com/post">In scope</a>
+    <a href="https://secret.example.com/x">Out of scope</a>
+    <a href="https://evil.example/steal">Unscoped</a>
+  `;
+
+  async function seedScopedProgram(db: ReturnType<typeof createDb>) {
+    const programsService = new ProgramsService(db, {
+      enumerationImpl: {
+        enumerate: async () => [],
+        resolveEndpoint: async (hostname: string) => `https://${hostname}`,
+      },
+    });
+    const program = await programsService.createProgram({ url: 'https://example.com' });
+    for (const entry of program.scopeEntries) await programsService.confirmScopeEntry(program.id, entry.id);
+    await programsService.addScopeEntry(program.id, { list: 'out', pattern: 'secret.example.com' });
+    return { programsService, program };
+  }
+
+  async function runProgramScan(db: ReturnType<typeof createDb>, programsService: ProgramsService, programId: number) {
+    const fetchImpl: FetchImpl = vi.fn(async (url) =>
+      String(url) === 'https://example.com/'
+        ? new Response(ROOT_HTML, { status: 200, headers: HTML_HEADERS })
+        : new Response('', { status: 200, headers: HTML_HEADERS }),
+    );
+    const svc = new ScannerService(db, { fetchImpl, tlsCheckImpl: okTlsCheckImpl(), programsService });
+    const scan = await svc.startScan(['https://example.com/'], { programId });
+    const completed = await vi.waitFor(
+      async () => {
+        const s = await svc.getScan(scan.id);
+        if (!s || s.status !== 'completed') throw new Error('not yet completed');
+        return s;
+      },
+      { timeout: 5000 },
+    );
+    return { completed, fetchImpl };
+  }
+
+  it('follows a link to an in-scope host and leaves out-of-scope and unscoped links alone', async () => {
+    const db = createDb(':memory:');
+    const { programsService, program } = await seedScopedProgram(db);
+
+    const { completed, fetchImpl } = await runProgramScan(db, programsService, program.id);
+
+    expect(completed.targets.map((t) => t.url).sort()).toEqual([
+      'https://blog.example.com/post',
+      'https://example.com/',
+    ]);
+    const fetchedHosts = vi.mocked(fetchImpl).mock.calls.map(([url]) => new URL(String(url)).hostname);
+    expect(fetchedHosts).not.toContain('secret.example.com');
+    expect(fetchedHosts).not.toContain('evil.example');
+  });
+
+  it('records every crawled host in the inventory with source `crawl`', async () => {
+    const db = createDb(':memory:');
+    const { programsService, program } = await seedScopedProgram(db);
+
+    await runProgramScan(db, programsService, program.id);
+
+    const inventory = await programsService.listHosts(program.id);
+    expect(inventory.map((h) => [h.hostname, h.source, h.scopeStatus]).sort()).toEqual([
+      ['blog.example.com', 'crawl', 'in_scope'],
+      ['evil.example', 'crawl', 'unscoped'],
+      ['secret.example.com', 'crawl', 'out_of_scope'],
+    ]);
+  });
+
+  it('keeps the same-origin rule for a scan submitted without a program', async () => {
+    const db = createDb(':memory:');
+    const fetchImpl: FetchImpl = vi.fn(async (url) =>
+      String(url) === 'https://example.com/'
+        ? new Response(ROOT_HTML, { status: 200, headers: HTML_HEADERS })
+        : new Response('', { status: 200, headers: HTML_HEADERS }),
+    );
+    const svc = new ScannerService(db, { fetchImpl, tlsCheckImpl: okTlsCheckImpl() });
+    const scan = await svc.startScan(['https://example.com/']);
+    const completed = await vi.waitFor(
+      async () => {
+        const s = await svc.getScan(scan.id);
+        if (!s || s.status !== 'completed') throw new Error('not yet completed');
+        return s;
+      },
+      { timeout: 5000 },
+    );
+
+    expect(completed.targets.map((t) => t.url)).toEqual(['https://example.com/']);
+  });
+});
+
 describe('ScannerService active mode', () => {
   it('rejects mode: "active" without confirmAuthorized', async () => {
     const svc = new ScannerService(createDb(':memory:'));

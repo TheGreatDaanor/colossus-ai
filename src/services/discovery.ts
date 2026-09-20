@@ -1,8 +1,21 @@
+import { classifyHost, type Scope } from './programs.js';
+
 // Same-origin here means scheme + exact hostname + port, per the roadmap's
 // authorization-boundary reasoning: an operator attested for the URLs they
 // submitted, not for every subdomain or port a crawler happens to find.
 function isSameOrigin(candidate: URL, origin: URL): boolean {
   return candidate.protocol === origin.protocol && candidate.hostname === origin.hostname && candidate.port === origin.port;
+}
+
+// Inside a program, the authorization boundary is the program's scope, not the
+// page's origin: an operator who put `example.com` in scope authorized every
+// host under it, including ones no certificate ever named. Without a program
+// there is no such attestation, so the same-origin rule still holds.
+function mayFollow(candidate: URL, origin: URL, scope: Scope | null): boolean {
+  if (scope === null) return isSameOrigin(candidate, origin);
+  if (candidate.protocol !== 'https:' && candidate.protocol !== 'http:') return false;
+  if (candidate.hostname === origin.hostname) return isSameOrigin(candidate, origin);
+  return classifyHost(candidate.hostname, scope) === 'in_scope';
 }
 
 const HREF_PATTERN = /<a\b[^>]*\bhref\s*=\s*["']([^"']*)["']/gi;
@@ -30,12 +43,24 @@ function disallowedPrefixes(robotsTxt: string | null): string[] {
   return prefixes;
 }
 
+// What one page's links yielded: the URLs the crawl may fetch, and every other
+// host those links named. The hostnames are reported whether or not they are
+// followable — an unscoped host is exactly what an operator needs to see in
+// order to widen scope deliberately.
+export type DiscoveredLinks = { links: string[]; hostnames: string[] };
+
 // Pure, no I/O: takes a page's already-fetched HTML and its URL, and returns the
-// same-origin `<a href>`/`<form action>` links found in it, resolved to absolute
-// URLs and deduped, minus anything the target's robots.txt disallows.
-export function discoverLinks(page: { url: URL; html: string }, robotsTxt: string | null): string[] {
+// followable `<a href>`/`<form action>` links found in it, resolved to absolute
+// URLs and deduped, minus anything the target's robots.txt disallows. With a
+// program `scope`, followable means in-scope rather than same-origin.
+export function discoverLinks(
+  page: { url: URL; html: string },
+  robotsTxt: string | null,
+  scope: Scope | null = null,
+): DiscoveredLinks {
   const disallowed = disallowedPrefixes(robotsTxt);
   const found = new Set<string>();
+  const hostnames = new Set<string>();
 
   for (const pattern of [HREF_PATTERN, FORM_ACTION_PATTERN]) {
     pattern.lastIndex = 0;
@@ -50,7 +75,8 @@ export function discoverLinks(page: { url: URL; html: string }, robotsTxt: strin
       } catch {
         continue;
       }
-      if (!isSameOrigin(resolved, page.url)) continue;
+      if (resolved.hostname !== '' && resolved.hostname !== page.url.hostname) hostnames.add(resolved.hostname);
+      if (!mayFollow(resolved, page.url, scope)) continue;
       if (disallowed.some((prefix) => resolved.pathname.startsWith(prefix))) continue;
 
       resolved.hash = '';
@@ -58,5 +84,5 @@ export function discoverLinks(page: { url: URL; html: string }, robotsTxt: strin
     }
   }
 
-  return Array.from(found);
+  return { links: Array.from(found), hostnames: Array.from(hostnames) };
 }
