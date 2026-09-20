@@ -308,6 +308,52 @@ describe('ScannerService scope-aware crawl discovery', () => {
     expect(new Set(inventory.map((h) => h.firstSeenAt.getTime())).size).toBe(1);
   });
 
+  // The bug issue 041 was filed from, end to end through the real scanner rather
+  // than through `recordHosts` directly: on the walkthrough run, a host the
+  // crawl found after both enumerations took `is_new` away from the host the
+  // second enumeration had actually found, and `new_since` moved with it.
+  it('leaves the enumeration clock alone when a scan crawls into a new host', async () => {
+    const db = createDb(':memory:');
+    let tick = 0;
+    let call = 0;
+    const batches = [['a.example.com'], ['a.example.com', 'b.example.com']];
+    const programsService = new ProgramsService(db, {
+      now: () => new Date(1_700_000_000_000 + tick++ * 1000),
+      enumerationImpl: {
+        enumerate: async () => {
+          const batch = batches[Math.min(call, batches.length - 1)] ?? [];
+          call += 1;
+          return batch.map((hostname) => ({ hostname, source: 'ct-log' as const }));
+        },
+        resolveEndpoint: async () => null,
+      },
+    });
+    const program = await programsService.createProgram({ url: 'https://example.com' });
+    for (const entry of program.scopeEntries) await programsService.confirmScopeEntry(program.id, entry.id);
+    await programsService.enumerateProgram(program.id);
+    await programsService.enumerateProgram(program.id);
+
+    const before = await programsService.listInventory(program.id);
+    expect(before.hosts.filter((h) => h.isNew).map((h) => h.hostname)).toEqual(['b.example.com']);
+
+    const fetchImpl: FetchImpl = vi.fn(async (url) =>
+      String(url) === 'https://example.com/'
+        ? new Response('<a href="https://crawled.example.com/x">link</a>', { status: 200, headers: HTML_HEADERS })
+        : new Response('', { status: 200, headers: HTML_HEADERS }),
+    );
+    const svc = new ScannerService(db, { fetchImpl, tlsCheckImpl: okTlsCheckImpl(), programsService });
+    const scan = await svc.startScan(['https://example.com/'], { programId: program.id });
+    await completedScan(svc, scan.id);
+
+    const after = await programsService.listInventory(program.id);
+    // The scan found a host, and said so on its own field — without touching
+    // which host the last enumeration is credited with, or when it ran.
+    expect(after.hosts.filter((h) => h.isNew).map((h) => h.hostname)).toEqual(['b.example.com']);
+    expect(after.newSince).toEqual(before.newSince);
+    expect(after.hosts.filter((h) => h.isNewFromCrawl).map((h) => h.hostname)).toEqual(['crawled.example.com']);
+    expect(after.crawlFoundAt).not.toBeNull();
+  });
+
   it('gates a cross-host candidate on that host\'s own robots.txt, not the linking page\'s', async () => {
     const db = createDb(':memory:');
     const { programsService, program } = await seedScopedProgram(db);
