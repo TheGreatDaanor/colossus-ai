@@ -9,7 +9,7 @@ export type FindingConfidence = 'definitive' | 'possible';
 // Oracle-confirmed active-scan categories. Passive/CVE detectors emit many more
 // free-form category strings, so this is a documented subset the injection-class
 // confirmers annotate against, not an exhaustive enum of the `category` column.
-export type FindingCategory = 'xss' | 'ssti' | 'sqli' | 'lfi';
+export type FindingCategory = 'xss' | 'ssti' | 'sqli' | 'lfi' | 'crlf-injection';
 
 export type XssOutcome = 'confirmed' | 'not_vulnerable' | 'unavailable';
 
@@ -79,7 +79,7 @@ export const findings = sqliteTable('findings', {
   // Set only on browser-confirmed findings: relative path to the evidence screenshot
   // under data/evidence/<scan_id>/<finding_id>.png. Written once, never deleted.
   evidencePath: text('evidence_path'),
-  // Set only on oracle-confirmed non-XSS findings (ssti/sqli/lfi): the response
+  // Set only on oracle-confirmed non-XSS findings (ssti/sqli/lfi/crlf-injection): the response
   // substring that proved the injection. XSS keeps using `evidencePath` (screenshot).
   evidenceSnippet: text('evidence_snippet'),
 });

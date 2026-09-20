@@ -6,6 +6,7 @@ import {
   makeSstiInjectionClass,
   makeSqliInjectionClass,
   makeLfiInjectionClass,
+  makeCrlfInjectionClass,
   saveEvidence,
   type InjectionClass,
   type XssConfirmImpl,
@@ -487,6 +488,7 @@ export class ScannerService {
       makeSstiInjectionClass(options.bodyFetchImpl),
       makeSqliInjectionClass(options.bodyFetchImpl),
       makeLfiInjectionClass(options.bodyFetchImpl),
+      makeCrlfInjectionClass(options.bodyFetchImpl),
     ];
     this.#browserSemaphore = new Semaphore(options.browserConcurrency ?? 2);
     this.#fetchSemaphore = new Semaphore(this.#concurrency);

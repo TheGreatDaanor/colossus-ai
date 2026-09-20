@@ -228,10 +228,13 @@ export function makeXssInjectionClass(confirmImpl: XssConfirmImpl = confirmXss):
 // The default XSS class, backed by the real browser confirmer.
 export const xssInjectionClass: InjectionClass = makeXssInjectionClass();
 
-// Fetches a URL's body text. The SSTI class confirms by content, not by browser,
-// so it fetches through this seam — the scanner injects its SSRF-guarded fetch, and
-// `guardedFetchText` is the default for standalone use.
-export type BodyFetchImpl = (url: string) => Promise<string>;
+// Fetches a URL's response body and headers. The content-based classes confirm by
+// body, not by browser, so they fetch through this seam — the scanner injects its
+// SSRF-guarded fetch, and `guardedFetchText` is the default for standalone use.
+// Headers ride along so a class that needs them (CRLF injection) can inspect the
+// response without a second fetch; the body-based classes read `.body` and ignore
+// `.headers`.
+export type BodyFetchImpl = (url: string) => Promise<{ body: string; headers: Headers }>;
 
 // Produces a fresh arithmetic-oracle payload: two random factors wrapped in the two
 // most common template delimiters (`${...}` for JSP/EL/Freemarker, `{{...}}` for
@@ -276,11 +279,11 @@ function baselineUrlFor(point: InjectionPoint): string {
 // address before fetching, so the SSTI confirmer can't be pointed at internal
 // infrastructure. The scanner injects its own already-guarded fetch instead; this is
 // the default for standalone use.
-async function guardedFetchText(url: string): Promise<string> {
+async function guardedFetchText(url: string): Promise<{ body: string; headers: Headers }> {
   const disallowed = await findDisallowedAddress(new URL(url).hostname);
   if (disallowed !== null) throw new Error(`fetch to a disallowed address (${disallowed}) was blocked`);
   const response = await fetch(url, { redirect: 'manual' });
-  return await response.text();
+  return { body: await response.text(), headers: response.headers };
 }
 
 // Server-side template injection as an InjectionClass: enumeration mutates each query
@@ -299,7 +302,7 @@ export function makeSstiInjectionClass(fetchImpl: BodyFetchImpl = guardedFetchTe
 
       let injectedBody: string;
       try {
-        injectedBody = await fetchImpl(point.url);
+        injectedBody = (await fetchImpl(point.url)).body;
       } catch (err) {
         return { outcome: 'unavailable', error: `injection fetch failed: ${errorMessage(err)}` };
       }
@@ -314,7 +317,7 @@ export function makeSstiInjectionClass(fetchImpl: BodyFetchImpl = guardedFetchTe
       // fetch can't clear that doubt, so we can't confirm.
       let baselineBody: string;
       try {
-        baselineBody = await fetchImpl(baselineUrlFor(point));
+        baselineBody = (await fetchImpl(baselineUrlFor(point))).body;
       } catch (err) {
         return { outcome: 'unavailable', error: `baseline fetch failed: ${errorMessage(err)}` };
       }
@@ -339,6 +342,7 @@ const SQLI_TOKEN = "'";
 const SQL_ERROR_SIGNATURES: RegExp[] = [
   /You have an error in your SQL syntax/i, // MySQL / MariaDB
   /SQL syntax.*MySQL/i,
+  /check the manual that corresponds to your (?:MySQL|MariaDB) server version/i, // MySQL / MariaDB
   /ORA-\d{5}/, // Oracle
   /PG::\w*Error/, // PostgreSQL (Rails/pg)
   /PostgreSQL.*ERROR/i,
@@ -346,7 +350,10 @@ const SQL_ERROR_SIGNATURES: RegExp[] = [
   /unrecognized token/i, // SQLite parser
   /SqlException/, // .NET / SQL Server
   /Unclosed quotation mark after the character string/i, // SQL Server
+  /Incorrect syntax near/i, // SQL Server (MSSQL)
   /Microsoft OLE DB Provider for (?:ODBC|SQL Server)/i,
+  /DB2 SQL Error/i, // IBM DB2
+  /SQLCODE[=:]?\s*-?\d+/, // IBM DB2 error code
 ];
 
 // The first line of the injected body that carries a DB error signature, so the finding's
@@ -379,7 +386,7 @@ export function makeSqliInjectionClass(fetchImpl: BodyFetchImpl = guardedFetchTe
     confirm: async (point) => {
       let injectedBody: string;
       try {
-        injectedBody = await fetchImpl(point.url);
+        injectedBody = (await fetchImpl(point.url)).body;
       } catch (err) {
         return { outcome: 'unavailable', error: `injection fetch failed: ${errorMessage(err)}` };
       }
@@ -392,7 +399,7 @@ export function makeSqliInjectionClass(fetchImpl: BodyFetchImpl = guardedFetchTe
       // clear that doubt, so we can't confirm.
       let baselineBody: string;
       try {
-        baselineBody = await fetchImpl(sqliBaselineUrlFor(point));
+        baselineBody = (await fetchImpl(sqliBaselineUrlFor(point))).body;
       } catch (err) {
         return { outcome: 'unavailable', error: `baseline fetch failed: ${errorMessage(err)}` };
       }
@@ -410,18 +417,24 @@ export const sqliInjectionClass: InjectionClass = makeSqliInjectionClass();
 // systems. Enough `../` to climb out of any plausible include directory; the depth
 // is harmless when it overshoots, since a leading-slash-normalised path still lands
 // on the filesystem root.
-const LFI_PAYLOAD = '../../../../etc/passwd';
+// Two traversal payloads, one per OS family: `/etc/passwd` on Unix and `win.ini` on
+// Windows/IIS, so a vulnerable host doesn't read clean just because it isn't Unix.
+// Enough `../` (and `..\`) to climb out of any plausible include directory; the depth
+// is harmless when it overshoots, since a leading-slash-normalised path still lands
+// on the filesystem root.
+const LFI_PAYLOADS = ['../../../../etc/passwd', '..\\..\\..\\..\\windows\\win.ini'];
 
-// The `/etc/passwd` signature: the root account's entry, uid and gid zero. A line
-// this shaped doesn't appear on a page by accident, and its presence proves the
+// Signatures for the two target files. The `/etc/passwd` one matches the root account's
+// entry, uid and gid zero. The `win.ini` one matches its canonical section headers.
+// A line either shape doesn't appear on a page by accident, and its presence proves the
 // traversal resolved to the real file rather than being echoed as a string.
-const PASSWD_SIGNATURE = /root:.*:0:0:/;
+const FILE_SIGNATURES = [/root:.*:0:0:/, /^\s*\[(?:fonts|extensions)\]\s*$/im];
 
-// The first line of the body carrying the passwd signature, so the finding's evidence
+// The first line of the body carrying either file signature, so the finding's evidence
 // quotes the line that proved the inclusion rather than the whole file.
-function matchedPasswdLine(body: string): string | null {
+function matchedFileLine(body: string): string | null {
   for (const line of body.split(/\r?\n/)) {
-    if (PASSWD_SIGNATURE.test(line)) return line.trim();
+    if (FILE_SIGNATURES.some((signature) => signature.test(line))) return line.trim();
   }
   return null;
 }
@@ -436,41 +449,114 @@ function lfiBaselineUrlFor(point: InjectionPoint): string {
 }
 
 // Local file inclusion as an InjectionClass: enumeration mutates each query param with a
-// path-traversal payload toward `/etc/passwd`; confirmation fetches the injected and a
-// baseline response and confirms iff the passwd signature appears in the injected body
-// and was absent from the baseline. A page that echoes the payload or 404s (no signature)
+// path-traversal payload toward `/etc/passwd` (Unix) and `win.ini` (Windows); confirmation
+// fetches the injected and a baseline response and confirms iff a file signature appears in
+// the injected body and was absent from the baseline. A page that echoes the payload or 404s
 // is `not_vulnerable`; a page that shows the signature unconditionally is `not_vulnerable`;
 // a fetch that fails is `unavailable`.
 export function makeLfiInjectionClass(fetchImpl: BodyFetchImpl = guardedFetchText): InjectionClass {
   return {
     category: 'lfi',
-    enumerate: (target) => enumerateInjectionPoints(target, () => LFI_PAYLOAD),
+    enumerate: (target) =>
+      LFI_PAYLOADS.flatMap((payload) => enumerateInjectionPoints(target, () => payload)),
     confirm: async (point) => {
       let injectedBody: string;
       try {
-        injectedBody = await fetchImpl(point.url);
+        injectedBody = (await fetchImpl(point.url)).body;
       } catch (err) {
         return { outcome: 'unavailable', error: `injection fetch failed: ${errorMessage(err)}` };
       }
 
-      const passwdLine = matchedPasswdLine(injectedBody);
-      if (passwdLine === null) return { outcome: 'not_vulnerable' };
+      const fileLine = matchedFileLine(injectedBody);
+      if (fileLine === null) return { outcome: 'not_vulnerable' };
 
       // The signature is present, but only the traversal proves it: if the baseline shows
       // it too, the page emits it unconditionally. A baseline we can't fetch can't clear
       // that doubt, so we can't confirm.
       let baselineBody: string;
       try {
-        baselineBody = await fetchImpl(lfiBaselineUrlFor(point));
+        baselineBody = (await fetchImpl(lfiBaselineUrlFor(point))).body;
       } catch (err) {
         return { outcome: 'unavailable', error: `baseline fetch failed: ${errorMessage(err)}` };
       }
-      if (matchedPasswdLine(baselineBody) !== null) return { outcome: 'not_vulnerable' };
+      if (matchedFileLine(baselineBody) !== null) return { outcome: 'not_vulnerable' };
 
-      return { outcome: 'confirmed', evidenceSnippet: passwdLine };
+      return { outcome: 'confirmed', evidenceSnippet: fileLine };
     },
   };
 }
 
 // The default LFI class, backed by the SSRF-guarded content fetcher.
 export const lfiInjectionClass: InjectionClass = makeLfiInjectionClass();
+
+// A CRLF payload: a carriage-return/line-feed pair followed by a uniquely-valued
+// header line. Enumeration URL-encodes the CR and LF to `%0d%0a`, so a target that
+// copies the parameter into a response header unescaped terminates the current header
+// and starts ours. The name is fixed (recoverable) and the value is a nonce, so the
+// injected header can't collide with anything the server already sends.
+export function generateCrlfPayload(): string {
+  return `\r\nX-Colossus-CRLF: ${randomUUID().replace(/-/g, '')}`;
+}
+
+// Recovers the injected header's name and value from a payload generated above, or
+// null if the string carries no `\r\n<name>: <value>` line (so a hand-built or
+// malformed point is `unavailable`, never silently confirmed).
+function injectedHeaderOf(payload: string): { name: string; value: string } | null {
+  const match = /\r\n([\w-]+):[ \t]*(.+)$/.exec(payload);
+  if (match === null) return null;
+  return { name: match[1]!, value: match[2]! };
+}
+
+// A baseline URL for the same point with a neutral value carrying no CRLF, so an
+// injected header the differential attributes to us is only counted when it's absent
+// without the payload.
+function crlfBaselineUrlFor(point: InjectionPoint): string {
+  const url = new URL(point.url);
+  url.searchParams.set(point.injectionPoint, 'colossus_crlf_baseline');
+  return url.toString();
+}
+
+// CRLF (header) injection as an InjectionClass: enumeration mutates each query param
+// with a `%0d%0a`-crafted, nonce-named header payload; confirmation fetches the injected
+// and a baseline response and confirms iff the injected header appears in the injected
+// response's headers with its nonce value and was absent from the baseline's. A param
+// echoed into the body but not split into a header is `not_vulnerable`; a fetch that
+// fails is `unavailable`. The oracle proves only that a header was injected — not a full
+// response split.
+export function makeCrlfInjectionClass(fetchImpl: BodyFetchImpl = guardedFetchText): InjectionClass {
+  return {
+    category: 'crlf-injection',
+    enumerate: (target) => enumerateInjectionPoints(target, generateCrlfPayload),
+    confirm: async (point) => {
+      const header = injectedHeaderOf(point.payload);
+      if (header === null) return { outcome: 'unavailable', error: 'payload carries no injected header' };
+
+      let injectedHeaders: Headers;
+      try {
+        injectedHeaders = (await fetchImpl(point.url)).headers;
+      } catch (err) {
+        return { outcome: 'unavailable', error: `injection fetch failed: ${errorMessage(err)}` };
+      }
+
+      // The header the payload meant to inject isn't present with its nonce value:
+      // reflected into the body at most, not split into a header line.
+      if (injectedHeaders.get(header.name) !== header.value) return { outcome: 'not_vulnerable' };
+
+      // The injected header is present, but only the payload proves it: if the baseline
+      // already carries it, the server sends it unconditionally. A baseline we can't
+      // fetch can't clear that doubt, so we can't confirm.
+      let baselineHeaders: Headers;
+      try {
+        baselineHeaders = (await fetchImpl(crlfBaselineUrlFor(point))).headers;
+      } catch (err) {
+        return { outcome: 'unavailable', error: `baseline fetch failed: ${errorMessage(err)}` };
+      }
+      if (baselineHeaders.get(header.name) === header.value) return { outcome: 'not_vulnerable' };
+
+      return { outcome: 'confirmed', evidenceSnippet: `${header.name}: ${header.value}` };
+    },
+  };
+}
+
+// The default CRLF class, backed by the SSRF-guarded content fetcher.
+export const crlfInjectionClass: InjectionClass = makeCrlfInjectionClass();

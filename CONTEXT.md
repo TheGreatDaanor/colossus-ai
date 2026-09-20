@@ -141,3 +141,73 @@ Confirming one is a two-part observation: DNS shows the reference is
 dangling, and the provider's response confirms the resource is unclaimed.
 Colossus reports the defect and how to remediate it; it never claims the
 resource itself.
+
+## Injection class
+
+One kind of defect an **active check** confirms by sending a crafted payload
+into an injection point and observing how the target mishandles it. Each
+class is a self-contained strategy: it enumerates its injection points on a
+target and confirms a hit on its own oracle. Reflected XSS, SSTI,
+error-based SQLi, LFI, and CRLF injection are each an injection class.
+
+Confirmation is always a **deterministic differential** against a baseline
+(unmodified) response: a hit fires only on a positive, non-probabilistic
+signal — an evaluated arithmetic product, a known error signature, a
+known-file signature, an injected header reflected back. A class that can
+only be confirmed by timing or an out-of-band callback is **not** an
+injection class Colossus implements; the absence of a deterministic oracle
+is what keeps such classes out, not the class of vulnerability itself.
+
+Distinct from **finding category**: a category is the greppable identity a
+confirmed hit is recorded under, whereas an injection class is the probe
+that produces it. Most classes map to one category, but the mapping is not
+part of the definition.
+
+## Access-control check
+
+One kind of defect confirmed not by sending a payload but by **replaying a
+request as a different identity** and observing that the response does not
+depend on who asked when it should. Sibling to an **injection class**, not a
+member of it: both share the deterministic-differential doctrine — a hit
+fires only on a hard, non-probabilistic signal — but the differential axis is
+**identity, not payload**. An injection class varies the input to one
+requester; an access-control check holds the request fixed and varies the
+requester.
+
+The confirmation is a **three-way differential** on one URL: the **owner**
+identity establishes the ground-truth response, an **unauthorized** identity
+(a peer, or the empty no-auth identity) replays it, and the result is a hit
+only when the unauthorized identity receives the owner's ground-truth content
+*and* a negative control proves the resource was genuinely access-controlled.
+A resource that returns the same content to everyone is public, not a defect.
+
+Confirmed access-control findings **suppress the evidence snippet** that other
+findings carry, because the snippet would be the victim's private data — the
+very content the defect exposes. The recorded proof is a differential over
+response digests and statuses, never the private body itself.
+
+## Identity
+
+An **ephemeral scan input** representing one authenticated principal an
+access-control check replays as: an opaque bundle of request headers (a
+`Cookie` or `Authorization` set) the operator supplies and Colossus attaches
+verbatim, paired with a short list of URLs known to be private to that
+principal.
+
+Colossus never parses, refreshes, or performs a login flow to mint an
+identity — it is opaque session material, treated as a black box. An identity
+is the deliberate **inverse of an enumerated host**: a host is durable
+program state that accumulates and is diffed over time, whereas an identity is
+live credential material, held only for the duration of one scan and never
+persisted. The **empty identity** — no session at all — is a first-class
+identity used both as the negative control for a horizontal finding and as
+the probe for unauthenticated access.
+
+## Ground-truth resource
+
+The response an **owner** identity receives when it fetches its own private
+URL — the baseline an access-control check tests against. It plays the role
+the unmodified response plays for an injection class: the fixed point a hit is
+a deviation from. An access-control hit is confirmed when an identity that
+should not have the resource nonetheless receives a response matching the
+ground-truth resource.

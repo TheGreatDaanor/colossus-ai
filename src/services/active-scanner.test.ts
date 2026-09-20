@@ -4,6 +4,7 @@ import { afterAll, describe, expect, it } from 'vitest';
 import {
   confirmXss,
   generateCanaryPayload,
+  makeCrlfInjectionClass,
   makeLfiInjectionClass,
   makeSqliInjectionClass,
   makeSstiInjectionClass,
@@ -135,7 +136,10 @@ describe('xssInjectionClass', () => {
 describe('sstiInjectionClass', () => {
   // A plain (unguarded) fetch: the SSTI class fetches through an injected fetch so
   // loopback fixtures aren't rejected by the SSRF guard the real default enforces.
-  const fetchText = async (url: string): Promise<string> => (await fetch(url)).text();
+  const fetchText = async (url: string): Promise<{ body: string; headers: Headers }> => {
+    const response = await fetch(url);
+    return { body: await response.text(), headers: response.headers };
+  };
 
   it('reports the ssti finding category', () => {
     expect(makeSstiInjectionClass(fetchText).category).toBe('ssti');
@@ -182,7 +186,10 @@ describe('sstiInjectionClass', () => {
 });
 
 describe('sqliInjectionClass', () => {
-  const fetchText = async (url: string): Promise<string> => (await fetch(url)).text();
+  const fetchText = async (url: string): Promise<{ body: string; headers: Headers }> => {
+    const response = await fetch(url);
+    return { body: await response.text(), headers: response.headers };
+  };
 
   it('reports the sqli finding category', () => {
     expect(makeSqliInjectionClass(fetchText).category).toBe('sqli');
@@ -236,22 +243,88 @@ describe('sqliInjectionClass', () => {
 
     expect(result.outcome).toBe('not_vulnerable');
   });
+
+  it('confirms a MySQL/MariaDB backend from the manual-version error', async () => {
+    const origin = await fixture((q) =>
+      q.includes("'")
+        ? `<html><body>check the manual that corresponds to your MariaDB server version for the right syntax</body></html>`
+        : `<html><body>results for ${q}</body></html>`,
+    );
+    const sqli = makeSqliInjectionClass(fetchText);
+    const [point] = sqli.enumerate(new URL(`${origin}/?q=seed`));
+
+    const result = await sqli.confirm(point!);
+
+    expect(result.outcome).toBe('confirmed');
+    expect(result.evidenceSnippet).toContain('MariaDB server version');
+  });
+
+  it('confirms an MSSQL backend from the incorrect-syntax error', async () => {
+    const origin = await fixture((q) =>
+      q.includes("'")
+        ? `<html><body>Incorrect syntax near ')'.</body></html>`
+        : `<html><body>results for ${q}</body></html>`,
+    );
+    const sqli = makeSqliInjectionClass(fetchText);
+    const [point] = sqli.enumerate(new URL(`${origin}/?q=seed`));
+
+    const result = await sqli.confirm(point!);
+
+    expect(result.outcome).toBe('confirmed');
+    expect(result.evidenceSnippet).toContain('Incorrect syntax near');
+  });
+
+  it('confirms a DB2 backend from the SQLCODE error', async () => {
+    const origin = await fixture((q) =>
+      q.includes("'")
+        ? `<html><body>DB2 SQL Error: SQLCODE=-104, SQLSTATE=42601</body></html>`
+        : `<html><body>results for ${q}</body></html>`,
+    );
+    const sqli = makeSqliInjectionClass(fetchText);
+    const [point] = sqli.enumerate(new URL(`${origin}/?q=seed`));
+
+    const result = await sqli.confirm(point!);
+
+    expect(result.outcome).toBe('confirmed');
+    expect(result.evidenceSnippet).toContain('DB2 SQL Error');
+  });
+
+  it('clears a page that shows a DB2 error signature unconditionally', async () => {
+    const origin = await fixture(
+      () => `<html><body>DB2 SQL Error: SQLCODE=-204, SQLSTATE=42704</body></html>`,
+    );
+    const sqli = makeSqliInjectionClass(fetchText);
+    const [point] = sqli.enumerate(new URL(`${origin}/?q=seed`));
+
+    const result = await sqli.confirm(point!);
+
+    expect(result.outcome).toBe('not_vulnerable');
+    expect(result.evidenceSnippet).toBeUndefined();
+  });
 });
 
 describe('lfiInjectionClass', () => {
-  const fetchText = async (url: string): Promise<string> => (await fetch(url)).text();
+  const fetchText = async (url: string): Promise<{ body: string; headers: Headers }> => {
+    const response = await fetch(url);
+    return { body: await response.text(), headers: response.headers };
+  };
   const PASSWD = 'root:x:0:0:root:/root:/bin/bash\ndaemon:x:1:1:daemon:/usr/sbin:/usr/sbin/nologin';
 
   it('reports the lfi finding category', () => {
     expect(makeLfiInjectionClass(fetchText).category).toBe('lfi');
   });
 
-  it('enumerates one injection point per query parameter', () => {
+  const WIN_INI = '; for 16-bit app support\n[fonts]\n[extensions]\n[mci extensions]';
+
+  it('enumerates a Unix and a Windows traversal per query parameter', () => {
     const points = makeLfiInjectionClass(fetchText).enumerate(
       new URL('https://example.com/p?a=1&b=2'),
     );
 
-    expect(points.map((p) => p.injectionPoint).sort()).toEqual(['a', 'b']);
+    expect(points.map((p) => p.injectionPoint).sort()).toEqual(['a', 'a', 'b', 'b']);
+    const payloads = points.map((p) => p.payload);
+    expect(payloads.some((p) => p.includes('etc/passwd'))).toBe(true);
+    expect(payloads.some((p) => p.includes('win.ini'))).toBe(true);
   });
 
   it('confirms and captures the passwd line when the traversal payload returns /etc/passwd', async () => {
@@ -283,6 +356,39 @@ describe('lfiInjectionClass', () => {
     expect(result.evidenceSnippet).toBeUndefined();
   });
 
+  it('confirms and captures the win.ini line when the traversal payload returns win.ini', async () => {
+    // A vulnerable Windows/IIS endpoint: the win.ini traversal resolves to the real
+    // file; the passwd traversal and a neutral value return a clean page.
+    const origin = await fixture((q) =>
+      q.includes('win.ini')
+        ? WIN_INI
+        : `<html><body>results for ${q}</body></html>`,
+    );
+    const lfi = makeLfiInjectionClass(fetchText);
+    const winPoint = lfi
+      .enumerate(new URL(`${origin}/?q=seed`))
+      .find((p) => p.payload.includes('win.ini'));
+
+    const result = await lfi.confirm(winPoint!);
+
+    expect(result.outcome).toBe('confirmed');
+    expect(result.evidenceSnippet).toContain('[fonts]');
+  });
+
+  it('reports not_vulnerable when the win.ini signature is already in the baseline', async () => {
+    // The signature is present regardless of the payload, so the differential fails.
+    const origin = await fixture(() => WIN_INI);
+    const lfi = makeLfiInjectionClass(fetchText);
+    const winPoint = lfi
+      .enumerate(new URL(`${origin}/?q=seed`))
+      .find((p) => p.payload.includes('win.ini'));
+
+    const result = await lfi.confirm(winPoint!);
+
+    expect(result.outcome).toBe('not_vulnerable');
+    expect(result.evidenceSnippet).toBeUndefined();
+  });
+
   it('reports not_vulnerable when the payload is echoed without file contents', async () => {
     const origin = await fixture((q) => `<html><body>results for ${q}</body></html>`);
     const lfi = makeLfiInjectionClass(fetchText);
@@ -291,5 +397,69 @@ describe('lfiInjectionClass', () => {
     const result = await lfi.confirm(point!);
 
     expect(result.outcome).toBe('not_vulnerable');
+  });
+});
+
+describe('crlfInjectionClass', () => {
+  const fetchText = async (url: string): Promise<{ body: string; headers: Headers }> => {
+    const response = await fetch(url, { redirect: 'manual' });
+    return { body: await response.text(), headers: response.headers };
+  };
+
+  // A server that copies the `q` param, unescaped, into a response header by writing
+  // the response bytes raw — so a `%0d%0a`-crafted value genuinely splits a new header
+  // line, the way a vulnerable app would. When `reflect` is false the header is fixed.
+  function startHeaderFixture(reflect: boolean): Promise<string> {
+    return new Promise((resolve) => {
+      const server = createServer((req, res) => {
+        const url = new URL(req.url ?? '/', 'http://localhost');
+        const q = url.searchParams.get('q') ?? '';
+        const location = reflect ? q : 'safe';
+        res.socket?.write(
+          `HTTP/1.1 200 OK\r\ncontent-type: text/html\r\nLocation: ${location}\r\ncontent-length: 2\r\n\r\nok`,
+        );
+        res.socket?.end();
+      });
+      servers.push(server);
+      server.listen(0, '127.0.0.1', () => {
+        const { port } = server.address() as AddressInfo;
+        resolve(`http://127.0.0.1:${port}`);
+      });
+    });
+  }
+
+  it('reports the crlf-injection finding category', () => {
+    expect(makeCrlfInjectionClass(fetchText).category).toBe('crlf-injection');
+  });
+
+  it('enumerates one injection point per query parameter with distinct payloads', () => {
+    const points = makeCrlfInjectionClass(fetchText).enumerate(
+      new URL('https://example.com/p?a=1&b=2'),
+    );
+
+    expect(points.map((p) => p.injectionPoint).sort()).toEqual(['a', 'b']);
+    expect(points[0]?.payload).not.toEqual(points[1]?.payload);
+  });
+
+  it('confirms and captures the injected header when the param splits a new header line', async () => {
+    const origin = await startHeaderFixture(true);
+    const crlf = makeCrlfInjectionClass(fetchText);
+    const [point] = crlf.enumerate(new URL(`${origin}/?q=seed`));
+
+    const result = await crlf.confirm(point!);
+
+    expect(result.outcome).toBe('confirmed');
+    expect(result.evidenceSnippet).toContain('X-Colossus-CRLF');
+  });
+
+  it('reports not_vulnerable when the param is not reflected into a header', async () => {
+    const origin = await startHeaderFixture(false);
+    const crlf = makeCrlfInjectionClass(fetchText);
+    const [point] = crlf.enumerate(new URL(`${origin}/?q=seed`));
+
+    const result = await crlf.confirm(point!);
+
+    expect(result.outcome).toBe('not_vulnerable');
+    expect(result.evidenceSnippet).toBeUndefined();
   });
 });
