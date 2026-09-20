@@ -932,6 +932,66 @@ describe('ProgramsService.listInventory', () => {
     const inventory = await service.listInventory(program.id);
     expect(inventory.hosts.filter((host) => host.isNew).map((host) => host.hostname)).toEqual(['c.example.com']);
   });
+
+  // The reason this split exists: before it, a scan's crawler wrote the newest
+  // `firstSeenAt` in the inventory and took `is_new` with it, so running a scan
+  // silently unmarked the host the last enumeration had actually found.
+  it('leaves the last enumeration\'s new host marked when a later crawl finds another', async () => {
+    const service = buildService({
+      now: clock(),
+      enumerationImpl: enumerationOf([['a.example.com'], ['a.example.com', 'b.example.com']]),
+    });
+    const program = await enumeratedProgram(service, 2);
+    await service.recordHosts(program.id, [{ hostname: 'crawled.example.com', source: 'crawl' }]);
+
+    const inventory = await service.listInventory(program.id);
+    expect(inventory.hosts.filter((host) => host.isNew).map((host) => host.hostname)).toEqual(['b.example.com']);
+  });
+
+  it('marks a crawl-discovered host separately from an enumerated one, and dates the crawl that found it', async () => {
+    const service = buildService({
+      now: clock(),
+      enumerationImpl: enumerationOf([['a.example.com'], ['a.example.com', 'b.example.com']]),
+    });
+    const program = await enumeratedProgram(service, 2);
+    await service.recordHosts(program.id, [{ hostname: 'crawled.example.com', source: 'crawl' }]);
+
+    const inventory = await service.listInventory(program.id);
+    expect(inventory.hosts.map((host) => [host.hostname, host.isNew, host.isNewFromCrawl])).toEqual([
+      ['a.example.com', false, false],
+      ['b.example.com', true, false],
+      ['crawled.example.com', false, true],
+    ]);
+    const crawled = inventory.hosts.find((host) => host.hostname === 'crawled.example.com')!;
+    expect(inventory.crawlFoundAt).toEqual(crawled.firstSeenAt);
+  });
+
+  // The same reason the first enumeration marks nothing: with no earlier
+  // inventory, everything the crawl recorded is new in the trivial sense.
+  it('marks nothing from a crawl that is the whole inventory', async () => {
+    const service = buildService({ now: clock() });
+    const program = await service.createProgram({ url: 'https://example.com' });
+    await service.confirmScopeEntry(program.id, program.scopeEntries[0]!.id);
+    await service.recordHosts(program.id, [{ hostname: 'crawled.example.com', source: 'crawl' }]);
+
+    const inventory = await service.listInventory(program.id);
+    expect(inventory.hosts.map((host) => host.isNewFromCrawl)).toEqual([false]);
+    expect(inventory.crawlFoundAt).toBeNull();
+  });
+
+  // Only the latest crawl reads as a fresh discovery, the same way only the
+  // latest enumeration does.
+  it('stops a crawl-discovered host reading as newly found once a later crawl has found another', async () => {
+    const service = buildService({ now: clock(), enumerationImpl: enumerationOf([['a.example.com']]) });
+    const program = await enumeratedProgram(service, 1);
+    await service.recordHosts(program.id, [{ hostname: 'one.example.com', source: 'crawl' }]);
+    await service.recordHosts(program.id, [{ hostname: 'two.example.com', source: 'crawl' }]);
+
+    const inventory = await service.listInventory(program.id);
+    expect(inventory.hosts.filter((host) => host.isNewFromCrawl).map((host) => host.hostname)).toEqual([
+      'two.example.com',
+    ]);
+  });
 });
 
 describe('ProgramsService.enumerateDuePrograms', () => {

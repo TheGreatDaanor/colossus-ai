@@ -211,8 +211,18 @@ printf '\n      --- scan result (GET /scans/%s) ---\n' "$SCAN_ID"
 curl -fsS "${BASE}/scans/${SCAN_ID}" | python3 -m json.tool
 printf '      --- end scan result ---\n'
 
+# The inventory is printed a second time, after the scan, because that is where
+# issue 041's question lives: the scan's crawler records the in-scope hosts it
+# walked into, and this view has to still name the same `new_since` it named
+# before the scan ran. A host the crawl found shows up as `is_new_from_crawl`
+# with the crawl's own time in `crawl_found_at` — never by taking `is_new` from
+# whatever the last enumeration marked.
+printf '\n      --- inventory view after the scan (GET /programs/%s/hosts) ---\n' "$PROGRAM_ID"
+curl -fsS "${BASE}/programs/${PROGRAM_ID}/hosts" | python3 -m json.tool
+printf '      --- end inventory view ---\n'
+
 printf '\nDone. Things to look at:\n'
 printf '  program    %s/programs/%s\n' "$BASE" "$PROGRAM_ID"
-printf '  inventory  %s/programs/%s/hosts   <- the issue-039 view\n' "$BASE" "$PROGRAM_ID"
+printf '  inventory  %s/programs/%s/hosts   <- the issue-039/041 view\n' "$BASE" "$PROGRAM_ID"
 printf '  scan       %s/scans/%s\n' "$BASE" "$SCAN_ID"
 printf '  dashboard  %s/dashboard/scans/%s\n' "$BASE" "$SCAN_ID"

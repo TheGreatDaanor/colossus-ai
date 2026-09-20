@@ -37,16 +37,25 @@ export type EnumerationImpl = {
 // read off the times rows were written, and a test needs those to be distinct.
 export type ProgramsServiceOptions = { enumerationImpl?: EnumerationImpl; now?: () => Date };
 
-// An inventory host together with whether it appeared in the most recent
-// enumeration. `isNew` is deliberately not a finding and carries no severity: a
-// host that has just appeared is something to look at, not a defect.
-export type InventoryHost = EnumeratedHost & { isNew: boolean };
+// An inventory host together with how it came to be in the inventory recently.
+// The two flags are separate because the two ways a host arrives are not the
+// same claim: `isNew` says the last *enumeration* found it, `isNewFromCrawl`
+// says a scan's crawler walked into it. Neither is a finding or carries a
+// severity: a host that has just appeared is something to look at, not a defect.
+export type InventoryHost = EnumeratedHost & { isNew: boolean; isNewFromCrawl: boolean };
 
-// The program's inventory, with the newly appeared hosts marked. `newSince` is
-// when the previous enumeration ran — the point the new hosts appeared after —
-// and is null on a program that has only ever been enumerated once, where there
-// is no earlier inventory for anything to have appeared since.
-export type Inventory = { hosts: InventoryHost[]; newSince: Date | null };
+// The program's inventory, with the recently arrived hosts marked.
+//
+// `newSince` is when the previous enumeration ran — the point the hosts marked
+// `isNew` appeared after — and is null on a program that has not been
+// enumerated twice, where there is no earlier inventory for anything to have
+// appeared since. Only enumerations move it: a crawl is not a "last time".
+//
+// `crawlFoundAt` is a point rather than an interval, because a crawl is not a
+// survey of the program and so cannot bound one: it is simply when the latest
+// crawl that added something ran. Null when no crawl has added a host to an
+// inventory that already had one.
+export type Inventory = { hosts: InventoryHost[]; newSince: Date | null; crawlFoundAt: Date | null };
 
 export type EnumerateDueOptions = { cadenceMs: number };
 
@@ -347,26 +356,56 @@ export class ProgramsService {
       .all();
   }
 
-  // The inventory as an operator reads it: every host, with the ones that
-  // appeared in the most recent enumeration marked.
+  // The inventory as an operator reads it: every host, with the ones the latest
+  // enumeration found marked `isNew`, and the ones the latest crawl walked into
+  // marked `isNewFromCrawl`.
   //
-  // Newness is derived from `firstSeenAt` rather than stored: one enumeration
-  // stamps every host it records with the same time, so the distinct
-  // `firstSeenAt` values *are* the runs that found something, and the hosts
-  // carrying the latest one are the hosts that run added.
+  // Newness is derived from `firstSeenAt` rather than stored: one run stamps
+  // every host it records with the same time, so the distinct `firstSeenAt`
+  // values *are* the runs that found something, and the hosts carrying the
+  // latest one are the hosts that run added.
   //
-  // A program enumerated only once has a single such value, and nothing is
-  // marked: on a first run every host is new in the trivial sense, and saying so
-  // would bury the signal the view exists to show.
+  // The two clocks are read separately, per issue 041. Enumeration and crawling
+  // both write `firstSeenAt`, and on one clock the newest write wins outright:
+  // a scan crawling into one host displaced everything the enumeration before it
+  // had marked, so running a scan changed what the operator read as new without
+  // any enumeration having happened. Splitting them keeps each answer true to
+  // the question it is answering, and keeps a crawl discovery visible instead of
+  // hiding it until the next enumeration.
+  //
+  // A program enumerated only once has a single enumeration run, and nothing is
+  // marked `isNew`: on a first run every host is new in the trivial sense, and
+  // saying so would bury the signal the view exists to show. A crawl is held to
+  // the same standard by a different test — it is never a survey, so the
+  // question is whether the inventory already held anything older.
   async listInventory(programId: number): Promise<Inventory> {
     const hosts = await this.listHosts(programId);
-    const runs = [...new Set(hosts.map((host) => host.firstSeenAt.getTime()))].sort((a, b) => a - b);
-    if (runs.length < 2) return { hosts: hosts.map((host) => ({ ...host, isNew: false })), newSince: null };
+    const runsOf = (source: HostSource) => [
+      ...new Set(hosts.filter((host) => host.source === source).map((host) => host.firstSeenAt.getTime())),
+    ].sort((a, b) => a - b);
 
-    const latest = runs[runs.length - 1]!;
+    const enumerations = runsOf('ct-log');
+    const latestEnumeration = enumerations.length < 2 ? null : enumerations[enumerations.length - 1]!;
+
+    const crawls = runsOf('crawl');
+    const latestCrawl = crawls[crawls.length - 1];
+    // A crawl marks its hosts only against an inventory that predates it. The
+    // guard is "something older exists" rather than "two crawls have run",
+    // because the first crawl of an already-enumerated program is a real
+    // discovery, while a crawl that *is* the whole inventory is a baseline.
+    const crawlFoundAt =
+      latestCrawl !== undefined && hosts.some((host) => host.firstSeenAt.getTime() < latestCrawl)
+        ? latestCrawl
+        : null;
+
     return {
-      hosts: hosts.map((host) => ({ ...host, isNew: host.firstSeenAt.getTime() === latest })),
-      newSince: new Date(runs[runs.length - 2]!),
+      hosts: hosts.map((host) => ({
+        ...host,
+        isNew: host.source === 'ct-log' && host.firstSeenAt.getTime() === latestEnumeration,
+        isNewFromCrawl: host.source === 'crawl' && host.firstSeenAt.getTime() === crawlFoundAt,
+      })),
+      newSince: latestEnumeration === null ? null : new Date(enumerations[enumerations.length - 2]!),
+      crawlFoundAt: crawlFoundAt === null ? null : new Date(crawlFoundAt),
     };
   }
 
