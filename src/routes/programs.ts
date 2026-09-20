@@ -78,6 +78,11 @@ function serializeHost(host: InventoryHost) {
     // the rest of the host's facts and carries no severity or category: a host
     // that has just appeared is something to look at, not a defect.
     is_new: host.isNew,
+    // Whether a scan's crawler walked into this host on its latest crawl. Kept
+    // apart from `is_new` rather than folded into it: the two answer different
+    // questions, and a crawl is not an enumeration, so it must not be able to
+    // change who reads as new since the last one.
+    is_new_from_crawl: host.isNewFromCrawl,
   };
 }
 
@@ -201,6 +206,7 @@ export function createProgramsRoutes(service: ProgramsService): Hono {
     return c.json({
       hosts: inventory.hosts.map(serializeHost),
       new_since: inventory.newSince,
+      crawl_found_at: inventory.crawlFoundAt,
       enumeration_error: program?.enumerationError ?? null,
     });
   });
@@ -216,8 +222,13 @@ export function createProgramsRoutes(service: ProgramsService): Hono {
     return c.json({
       hosts: inventory.hosts.map(serializeHost),
       // When the previous enumeration ran — the point the hosts marked `is_new`
-      // appeared after. Null until a program has been enumerated twice.
+      // appeared after. Null until a program has been enumerated twice. Only
+      // enumerations move it; a scan's crawl never does.
       new_since: inventory.newSince,
+      // When the latest crawl that added a host ran — a point, not an interval,
+      // since a crawl surveys no more than the pages it happened to walk and so
+      // cannot bound a "since". Null when no crawl has added a host.
+      crawl_found_at: inventory.crawlFoundAt,
       enumeration_error: program.enumerationError,
     });
   });

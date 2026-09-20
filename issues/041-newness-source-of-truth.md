@@ -1,7 +1,7 @@
 ---
 id: 041
 title: Decide whether a crawl discovery counts as appearing since last time
-status: open
+status: done
 type: human
 blocked-by: [039]
 ---
@@ -61,6 +61,29 @@ Worth noting for whoever picks: on the observed run the crawl-discovered host
 was `unscoped` and off the program's own domain — the shadow-IT shape the PRD
 wanted. Option 1 would have hidden it until the next enumeration.
 
+### Decided: option 3 — separate the two
+
+Chosen because it is the only option that does not trade one truth for the
+other: option 1 buys an honest `new_since` by hiding a real discovery, and
+option 2 keeps the discovery by letting a scan redefine "last time". The data
+needed to split them was already in the row — `source` carries `ct-log` vs
+`crawl` — so neither had to be given up.
+
+As implemented:
+
+- `is_new` reads the enumeration clock alone. Only `ct-log` rows take part, so
+  a scan can no longer displace what the last enumeration marked, and
+  `new_since` again means what its route comment always claimed.
+- `is_new_from_crawl` marks the hosts the latest crawl added, alongside
+  `crawl_found_at`. That one is a *point*, not an interval: a crawl surveys no
+  more than the pages it happened to walk, so it cannot bound a "since" the way
+  an enumeration of the whole program can.
+- A crawl that *is* the whole inventory marks nothing, for the same reason a
+  first enumeration marks nothing — with nothing older on record, everything is
+  new in the trivial sense. The guard is "the inventory holds something older"
+  rather than "two crawls have run", because the first crawl of an
+  already-enumerated program is a genuine discovery.
+
 ## Layers touched
 
 - Schema: none for options 1–2. Option 3 may want the view to read `source`.
@@ -71,12 +94,14 @@ wanted. Option 1 would have hidden it until the next enumeration.
 
 ## Definition of done
 
-- [ ] Failing test written first, confirmed red
-- [ ] Implementation makes it green
-- [ ] `test`, `typecheck`, `lint` all pass
-- [ ] Visible at: `./scripts/walkthrough.sh --simulate-new HOST` — after a scan
+- [x] Failing test written first, confirmed red
+- [x] Implementation makes it green
+- [x] `test`, `typecheck`, `lint` all pass
+- [x] Visible at: `./scripts/walkthrough.sh --simulate-new HOST` — after a scan
       has crawled, the inventory view agrees with whichever rule was chosen,
-      and `new_since` names a moment the operator can account for.
+      and `new_since` names a moment the operator can account for. The script
+      now prints the inventory a second time after the scan, which is where the
+      two clocks can be seen not to interfere.
 
 ## Out of scope
 

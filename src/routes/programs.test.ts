@@ -34,8 +34,14 @@ type HostBody = {
   last_resolved_at: string | null;
   is_dormant: boolean;
   is_new: boolean;
+  is_new_from_crawl: boolean;
 };
-type HostsBody = { hosts: HostBody[]; enumeration_error: string | null; new_since: string | null };
+type HostsBody = {
+  hosts: HostBody[];
+  enumeration_error: string | null;
+  new_since: string | null;
+  crawl_found_at: string | null;
+};
 
 function buildApp(options: ProgramsServiceOptions = {}) {
   const service = new ProgramsService(createDb(':memory:'), options);
@@ -478,6 +484,30 @@ describe('GET /programs/:id/hosts — hosts that appeared since last time', () =
     // A new host is reported as inventory, never as a finding: nothing on the
     // wire gives it a severity or a category.
     expect(Object.keys(body.hosts[1]!)).not.toContain('severity');
+  });
+
+  it('reports a crawl discovery on its own field, leaving new_since an enumeration time', async () => {
+    const { app, service } = buildApp({
+      now: clock(),
+      enumerationImpl: enumerationOf([['a.example.com'], ['a.example.com', 'b.example.com']]),
+    });
+    const program = await createConfirmedProgram(app, 'https://example.com');
+    await postJson(app, `/programs/${program.id}/enumerate`, {});
+    const second = await postJson(app, `/programs/${program.id}/enumerate`, {});
+    const newSinceBeforeCrawl = (await json<HostsBody>(second)).new_since;
+
+    // What a scan's crawler does when it follows a link to an in-scope host.
+    await service.recordHosts(program.id, [{ hostname: 'crawled.example.com', source: 'crawl' }]);
+
+    const body = await json<HostsBody>(await app.request(`/programs/${program.id}/hosts`));
+    expect(body.hosts.map((host) => [host.hostname, host.is_new, host.is_new_from_crawl])).toEqual([
+      ['a.example.com', false, false],
+      ['b.example.com', true, false],
+      ['crawled.example.com', false, true],
+    ]);
+    // The scan did not move the enumeration clock, which is the whole point.
+    expect(body.new_since).toEqual(newSinceBeforeCrawl);
+    expect(body.crawl_found_at).not.toBeNull();
   });
 });
 
