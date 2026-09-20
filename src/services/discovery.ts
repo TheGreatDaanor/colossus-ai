@@ -27,7 +27,9 @@ const FORM_ACTION_PATTERN = /<form\b[^>]*\baction\s*=\s*["']([^"']*)["']/gi;
 
 // Only `Disallow` is honoured — `Allow`, crawl-delay and sitemap directives are
 // deliberately out of scope for this phase.
-function disallowedPrefixes(robotsTxt: string | null): string[] {
+// Exported because a scoped crawl reaches hosts whose robots.txt the caller must
+// fetch itself: only it can do I/O, and only that host's own rules govern it.
+export function disallowedPrefixes(robotsTxt: string | null): string[] {
   if (robotsTxt === null) return [];
 
   const prefixes: string[] = [];
@@ -81,7 +83,14 @@ export function discoverLinks(
       }
       if (resolved.hostname !== '' && resolved.hostname !== page.url.hostname) hostnames.add(resolved.hostname);
       if (!mayFollow(resolved, page.url, scope)) continue;
-      if (disallowed.some((prefix) => resolved.pathname.startsWith(prefix))) continue;
+      // A robots.txt speaks only for the origin it was served from. Now that a
+      // scoped crawl may cross hosts, applying this page's rules to another
+      // host's paths would block URLs nobody disallowed while still saying
+      // nothing about the ones that host does disallow. A cross-host candidate
+      // is returned and gated against its own robots.txt by the caller, which
+      // is the only place that can fetch it.
+      const ownHost = resolved.hostname === page.url.hostname;
+      if (ownHost && disallowed.some((prefix) => resolved.pathname.startsWith(prefix))) continue;
 
       resolved.hash = '';
       found.add(resolved.toString());

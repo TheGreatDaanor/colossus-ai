@@ -47,6 +47,23 @@ describe('discoverLinks robots.txt filtering', () => {
 
     expect(links).toEqual(['https://example.com/contact']);
   });
+
+  it('applies a Disallow rule only to the host whose robots.txt it came from', () => {
+    // A robots.txt speaks for its own origin. Once the crawl may cross to another
+    // in-scope host (038), applying this page's rules to that host's paths blocks
+    // URLs nobody disallowed — and says nothing about the ones that host does
+    // disallow. The cross-host candidate is returned here and gated against its
+    // own robots.txt by the caller, which is the only place that can fetch it.
+    const html = `
+      <a href="/admin/settings">Own admin</a>
+      <a href="https://api.example.com/admin/settings">Another host's admin</a>
+    `;
+    const robotsTxt = 'User-agent: *\nDisallow: /admin\n';
+    const scope = { in: ['example.com'], out: [] };
+    const { links } = discoverLinks({ url: new URL('https://example.com/'), html }, robotsTxt, scope);
+
+    expect(links).toEqual(['https://api.example.com/admin/settings']);
+  });
 });
 
 describe('discoverLinks program scope', () => {

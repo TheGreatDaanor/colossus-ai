@@ -11,7 +11,7 @@ import {
   type XssConfirmImpl,
   type BodyFetchImpl,
 } from './active-scanner.js';
-import { discoverLinks } from './discovery.js';
+import { disallowedPrefixes, discoverLinks } from './discovery.js';
 import { hostCapFor, ProgramsService, type EnumeratedHost, type Scope } from './programs.js';
 import { findDisallowedAddress, isDisallowedAddress } from './ssrf-guard.js';
 import {
@@ -398,6 +398,12 @@ type DiscoveryContext = {
   // here rather than read per page so that one scan reads as one run in the
   // inventory, however many pages it happened to walk.
   discoveredAt: Date;
+  // Disallow prefixes per origin, fetched once per run and shared by every page
+  // that links there. A scoped crawl crosses hosts, and a robots.txt speaks only
+  // for the origin it came from, so the linking page's copy cannot answer for
+  // them. Null means the host must not be crawled at all — its address is one
+  // the SSRF guard refuses.
+  robotsByOrigin: Map<string, Promise<string[] | null>>;
   seenUrls: Set<string>;
   depthOf: Map<number, number>;
   rootOf: Map<number, number>;
@@ -642,6 +648,7 @@ export class ScannerService {
       programId,
       scope,
       discoveredAt: new Date(),
+      robotsByOrigin: new Map(),
       seenUrls: new Set(targetRows.map((t) => t.url)),
       depthOf: new Map(targetRows.map((t) => [t.id, 0])),
       rootOf: new Map(targetRows.map((t) => [t.id, t.id])),
@@ -800,7 +807,7 @@ export class ScannerService {
 
       // Discovery runs regardless of mode — it's non-intrusive HTML parsing, not a
       // payload-sending check, so it isn't gated behind the active-mode attestation.
-      const discovered = await this.#discoverTargets(target, targetUrl, html, robotsBody, discovery);
+      const discovered = await this.#discoverTargets(target, targetUrl, html, robotsBody, userAgent, discovery);
 
       console.warn(`[scan ${target.scanId}] ${target.url} succeeded`);
       return discovered;
@@ -835,6 +842,7 @@ export class ScannerService {
     targetUrl: URL,
     html: string,
     robotsTxt: string | null,
+    userAgent: string,
     discovery: DiscoveryContext,
   ): Promise<ScanTarget[]> {
     const { links, hostnames } = discoverLinks({ url: targetUrl, html }, robotsTxt, discovery.scope);
@@ -859,6 +867,17 @@ export class ScannerService {
 
     for (const url of links) {
       if (discovery.seenUrls.has(url)) continue;
+
+      // `discoverLinks` applied this page's robots.txt to this page's own host,
+      // which is all it speaks for. A candidate on another host is gated here
+      // instead, against that host's own rules — checked before the budget is
+      // consumed, so a URL we may not fetch does not spend a page of it.
+      const candidate = new URL(url);
+      if (candidate.hostname !== targetUrl.hostname) {
+        const prefixes = await this.#disallowedPrefixesFor(candidate, userAgent, discovery);
+        if (prefixes === null) continue;
+        if (prefixes.some((prefix) => candidate.pathname.startsWith(prefix))) continue;
+      }
 
       // Breaking here leaves the rest of this page's links out of `seenUrls`, so a
       // sibling page under another root can still reach them — intended: the cap is
@@ -964,6 +983,25 @@ export class ScannerService {
         }),
       ),
     );
+  }
+
+  // One robots.txt per origin per run, memoised on the promise so that pages
+  // fetched concurrently share the single request rather than racing it.
+  async #disallowedPrefixesFor(origin: URL, userAgent: string, discovery: DiscoveryContext): Promise<string[] | null> {
+    const cached = discovery.robotsByOrigin.get(origin.origin);
+    if (cached !== undefined) return cached;
+
+    const pending = (async (): Promise<string[] | null> => {
+      // The candidate host has not cleared the SSRF guard yet — `#processTarget`
+      // only does that once a target exists — and fetching its robots.txt is
+      // already a request to it. Refused here means the crawl never goes near it.
+      if (!this.#allowedHosts.has(origin.hostname) && (await findDisallowedAddress(origin.hostname)) !== null) {
+        return null;
+      }
+      return disallowedPrefixes(await this.#fetchRobotsTxt(origin, userAgent, new Budget(1)));
+    })();
+    discovery.robotsByOrigin.set(origin.origin, pending);
+    return pending;
   }
 
   async #fetchRobotsTxt(targetUrl: URL, userAgent: string, budget: Budget): Promise<string | null> {

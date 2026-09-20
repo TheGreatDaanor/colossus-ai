@@ -308,6 +308,39 @@ describe('ScannerService scope-aware crawl discovery', () => {
     expect(new Set(inventory.map((h) => h.firstSeenAt.getTime())).size).toBe(1);
   });
 
+  it('gates a cross-host candidate on that host\'s own robots.txt, not the linking page\'s', async () => {
+    const db = createDb(':memory:');
+    const { programsService, program } = await seedScopedProgram(db);
+
+    // The linking page disallows nothing. The host it links to disallows
+    // `/private`. Only that host's own rules can decide its own paths.
+    const fetchImpl: FetchImpl = vi.fn(async (url) => {
+      const href = String(url);
+      if (href === 'https://example.com/') {
+        return new Response(
+          `<a href="https://blog.example.com/private/x">private</a>
+           <a href="https://blog.example.com/public/y">public</a>`,
+          { status: 200, headers: HTML_HEADERS },
+        );
+      }
+      if (href === 'https://example.com/robots.txt') return new Response('', { status: 404 });
+      if (href === 'https://blog.example.com/robots.txt') {
+        return new Response('User-agent: *\nDisallow: /private\n', { status: 200 });
+      }
+      return new Response('', { status: 200, headers: HTML_HEADERS });
+    });
+    const svc = new ScannerService(db, { fetchImpl, tlsCheckImpl: okTlsCheckImpl(), programsService });
+    const scan = await svc.startScan(['https://example.com/'], { programId: program.id });
+    const completed = await completedScan(svc, scan.id);
+
+    expect(completed.targets.map((t) => t.url).sort()).toEqual([
+      'https://blog.example.com/public/y',
+      'https://example.com/',
+    ]);
+    const fetched = vi.mocked(fetchImpl).mock.calls.map(([url]) => String(url));
+    expect(fetched).not.toContain('https://blog.example.com/private/x');
+  });
+
   it('keeps the same-origin rule for a scan submitted without a program', async () => {
     const db = createDb(':memory:');
     const fetchImpl: FetchImpl = vi.fn(async (url) =>
