@@ -1,7 +1,7 @@
 ---
 id: 037
 title: Run a scan against a program's host inventory
-status: open
+status: done
 type: afk
 blocked-by: [035]
 ---
@@ -34,10 +34,10 @@ enumeration finally feeds the pipeline.
 
 ## Definition of done
 
-- [ ] Failing test written first, confirmed red
-- [ ] Implementation makes it green
-- [ ] `test`, `typecheck`, `lint` all pass
-- [ ] Visible at: starting a scan on a program with 300 in-scope hosts
+- [x] Failing test written first, confirmed red
+- [x] Implementation makes it green
+- [x] `test`, `typecheck`, `lint` all pass
+- [x] Visible at: starting a scan on a program with 300 in-scope hosts
       produces 250 targets in passive mode and 50 in active mode, new hosts
       first in both; a program with `active_host_cap` set overrides that; a
       legacy scan with no `program_id` behaves exactly as before.

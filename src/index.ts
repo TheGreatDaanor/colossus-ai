@@ -15,8 +15,8 @@ const dbPath = process.env['DB_PATH'] ?? './data/scanner.db';
 const defaultUserAgent = process.env['SCANNER_USER_AGENT'] ?? 'colossus-scanner/1.0';
 
 const db = createDb(dbPath);
-const service = new ScannerService(db, { defaultUserAgent });
 const programsService = new ProgramsService(db, { enumerationImpl: new EnumerationService({ userAgent: defaultUserAgent }) });
+const service = new ScannerService(db, { defaultUserAgent, programsService });
 const takeoverService = new TakeoverService(db);
 
 const app = new Hono();

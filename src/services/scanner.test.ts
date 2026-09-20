@@ -14,6 +14,7 @@ import {
   type OsvCheckImpl,
   type LlmEnrichImpl,
 } from './scanner.js';
+import { ProgramsService, type CreateProgramOptions } from './programs.js';
 
 function deferred<T>(): { promise: Promise<T>; resolve: (v: T) => void } {
   let resolve!: (v: T) => void;
@@ -42,6 +43,109 @@ function okResponse(body: Record<string, string> = { 'x-test': '1' }): Response 
 function okTlsCheckImpl(): TlsCheckImpl {
   return vi.fn(async () => ({ version: 'TLSv1.3', certExpiresAt: new Date('2099-01-01T00:00:00Z') }));
 }
+
+describe('ScannerService program scans', () => {
+  // A program whose inventory is already enumerated and probed, sharing one
+  // database with the scanner under test — the two services meet at the tables.
+  async function seedProgram(db: ReturnType<typeof createDb>, hosts: string[], caps: CreateProgramOptions = {}) {
+    const programsService = new ProgramsService(db, {
+      enumerationImpl: {
+        enumerate: async () => hosts.map((hostname) => ({ hostname, source: 'ct-log' as const })),
+        resolveEndpoint: async (hostname: string) => `https://${hostname}`,
+      },
+    });
+    const program = await programsService.createProgram({ url: 'https://example.com', ...caps });
+    for (const entry of program.scopeEntries) await programsService.confirmScopeEntry(program.id, entry.id);
+    await programsService.enumerateProgram(program.id);
+    return { programsService, program };
+  }
+
+  function buildScanner(db: ReturnType<typeof createDb>, programsService: ProgramsService) {
+    return new ScannerService(db, {
+      fetchImpl: vi.fn(async () => okResponse()),
+      tlsCheckImpl: okTlsCheckImpl(),
+      programsService,
+    });
+  }
+
+  it('resolves targets from the program inventory for hosts the operator never submitted', async () => {
+    const db = createDb(':memory:');
+    const { programsService, program } = await seedProgram(db, ['a.example.com', 'b.example.com']);
+    const svc = buildScanner(db, programsService);
+
+    const scan = await svc.startScan([], { programId: program.id });
+
+    const stored = await svc.getScan(scan.id);
+    expect(stored?.targets.map((t) => t.url).sort()).toEqual(['https://a.example.com', 'https://b.example.com']);
+  });
+
+  it('scans submitted URLs alongside the inventory, marking which targets came from the inventory', async () => {
+    const db = createDb(':memory:');
+    const { programsService, program } = await seedProgram(db, ['a.example.com']);
+    const svc = buildScanner(db, programsService);
+
+    const scan = await svc.startScan(['https://submitted.example.com'], { programId: program.id });
+
+    const stored = await svc.getScan(scan.id);
+    const byUrl = new Map(stored?.targets.map((t) => [t.url, t.enumeratedHostId]));
+    expect(byUrl.get('https://submitted.example.com')).toBeNull();
+    expect(byUrl.get('https://a.example.com')).toEqual(expect.any(Number));
+  });
+
+  it('caps a run at the program override rather than the mode default', async () => {
+    const db = createDb(':memory:');
+    const hosts = ['a.example.com', 'b.example.com', 'c.example.com', 'd.example.com'];
+    const { programsService, program } = await seedProgram(db, hosts, { passiveHostCap: 2 });
+    const svc = buildScanner(db, programsService);
+
+    const scan = await svc.startScan([], { programId: program.id });
+
+    expect((await svc.getScan(scan.id))?.targets).toHaveLength(2);
+  });
+
+  it('reaches the hosts a capped earlier run left behind on the next run', async () => {
+    const db = createDb(':memory:');
+    const hosts = ['a.example.com', 'b.example.com', 'c.example.com', 'd.example.com'];
+    const { programsService, program } = await seedProgram(db, hosts, { passiveHostCap: 2 });
+    const svc = buildScanner(db, programsService);
+    await svc.startScan([], { programId: program.id });
+
+    const second = await svc.startScan([], { programId: program.id });
+
+    const stored = await svc.getScan(second.id);
+    expect(stored?.targets.map((t) => t.url).sort()).toEqual(['https://c.example.com', 'https://d.example.com']);
+  });
+
+  it('fails a program scan that has no reachable hosts and no submitted URLs', async () => {
+    const db = createDb(':memory:');
+    const { programsService, program } = await seedProgram(db, []);
+    const svc = buildScanner(db, programsService);
+
+    const scan = await svc.startScan([], { programId: program.id });
+
+    expect(scan.status).toBe('failed');
+    expect(scan.error).toBe('no targets to scan');
+  });
+
+  it('leaves a scan with no program drawing only on the URLs the operator submitted', async () => {
+    const db = createDb(':memory:');
+    const { programsService } = await seedProgram(db, ['a.example.com']);
+    const svc = buildScanner(db, programsService);
+
+    const scan = await svc.startScan(['https://submitted.example.com']);
+
+    expect(scan.programId).toBeNull();
+    expect((await svc.getScan(scan.id))?.targets.map((t) => t.url)).toEqual(['https://submitted.example.com']);
+  });
+
+  it('rejects a scan against a program that does not exist', async () => {
+    const db = createDb(':memory:');
+    const { programsService } = await seedProgram(db, []);
+    const svc = buildScanner(db, programsService);
+
+    await expect(svc.startScan([], { programId: 404 })).rejects.toThrow(ScanValidationError);
+  });
+});
 
 describe('ScannerService active mode', () => {
   it('rejects mode: "active" without confirmAuthorized', async () => {

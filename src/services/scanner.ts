@@ -12,6 +12,7 @@ import {
   type BodyFetchImpl,
 } from './active-scanner.js';
 import { discoverLinks } from './discovery.js';
+import { hostCapFor, ProgramsService, type EnumeratedHost } from './programs.js';
 import { findDisallowedAddress, isDisallowedAddress } from './ssrf-guard.js';
 import {
   detectHeaderFindings,
@@ -52,6 +53,9 @@ export type ScanWithTargets = Scan & {
 };
 
 export type StartScanOptions = {
+  // Draws this scan's targets from the program's host inventory in addition to
+  // any submitted URLs. Omitted, the scan is a legacy URL-only one.
+  programId?: number;
   name?: string;
   userAgent?: string;
   mode?: 'passive' | 'active';
@@ -415,6 +419,9 @@ export class ScannerService {
   // that serve a fixture on 127.0.0.1 — deliberately a constructor option, not an
   // env var, so nothing in production can accidentally disable the guard.
   readonly #allowedHosts: Set<string>;
+  // Present only where scans can be run against a program. Null keeps a
+  // URL-only deployment from having to construct one.
+  readonly #programsService: ProgramsService | null;
 
   constructor(
     db: Db,
@@ -431,6 +438,7 @@ export class ScannerService {
       bodyFetchImpl?: BodyFetchImpl;
       browserConcurrency?: number;
       allowedHosts?: string[];
+      programsService?: ProgramsService;
     } = {},
   ) {
     this.#db = db;
@@ -450,6 +458,7 @@ export class ScannerService {
     this.#browserSemaphore = new Semaphore(options.browserConcurrency ?? 2);
     this.#fetchSemaphore = new Semaphore(this.#concurrency);
     this.#allowedHosts = new Set(options.allowedHosts ?? []);
+    this.#programsService = options.programsService ?? null;
     this.#tlsCheckImpl =
       options.tlsCheckImpl ?? ((hostname, port) => defaultTlsCheck(hostname, port, this.#timeoutMs));
     this.#osvCheckImpl = options.osvCheckImpl ?? defaultOsvCheck;
@@ -457,7 +466,10 @@ export class ScannerService {
   }
 
   async startScan(urls: string[], options: StartScanOptions = {}): Promise<Scan> {
-    if (urls.length === 0) throw new ScanValidationError('urls must not be empty');
+    const programId = options.programId ?? null;
+    // A program scan may submit no URLs at all — the inventory is the target
+    // list. Without one, an empty list is still the caller asking for nothing.
+    if (urls.length === 0 && programId === null) throw new ScanValidationError('urls must not be empty');
     if (urls.length > MAX_URLS) throw new ScanValidationError(`urls must not exceed ${MAX_URLS}`);
     if (options.mode === 'active' && options.confirmAuthorized !== true) {
       throw new ScanValidationError('mode: "active" requires confirmAuthorized: true');
@@ -471,7 +483,11 @@ export class ScannerService {
     const invalid = deduped.filter((u) => !isAllowedUrl(u));
 
     const now = new Date();
-    const hasValid = valid.length > 0;
+    const mode: ScanMode = options.mode ?? 'passive';
+    // Drawn before the scan row is written: on a program scan the inventory is
+    // what decides whether this run has anything to do at all.
+    const inventoryHosts = programId === null ? [] : await this.#selectInventoryHosts(programId, mode);
+    const hasValid = valid.length > 0 || inventoryHosts.length > 0;
 
     const [scan] = this.#db
       .insert(scans)
@@ -480,10 +496,11 @@ export class ScannerService {
         status: hasValid ? 'pending' : 'failed',
         urls: deduped,
         userAgent: options.userAgent ?? null,
-        mode: options.mode ?? 'passive',
+        mode,
+        programId,
         confirmAuthorized: options.confirmAuthorized ?? null,
         authorizationNote: options.authorizationNote ?? null,
-        error: hasValid ? null : 'no valid URLs to scan',
+        error: hasValid ? null : programId === null ? 'no valid URLs to scan' : 'no targets to scan',
         createdAt: now,
         completedAt: hasValid ? null : now,
       })
@@ -502,7 +519,7 @@ export class ScannerService {
 
     if (!hasValid) return scan;
 
-    const targetRows = valid.map((url) =>
+    const submittedRows = valid.map((url) =>
       this.#db
         .insert(scanTargets)
         .values({ scanId: scan.id, url, status: 'pending' })
@@ -510,9 +527,35 @@ export class ScannerService {
         .get(),
     );
 
+    // Inventory targets carry the host they came from, so results can tell an
+    // operator which targets they never submitted.
+    const inventoryRows = inventoryHosts.map((host) =>
+      this.#db
+        .insert(scanTargets)
+        .values({ scanId: scan.id, url: host.endpointUrl ?? '', status: 'pending', enumeratedHostId: host.id })
+        .returning()
+        .get(),
+    );
+    // Stamped at selection, not at completion: a run that crashes partway must
+    // not leave its hosts at the front of the queue forever.
+    await this.#programsService?.markHostsScanned(inventoryHosts.map((host) => host.id));
+
+    const targetRows = [...submittedRows, ...inventoryRows];
+
     void this.#runScan(scan.id, targetRows, scan.userAgent ?? this.#defaultUserAgent, scan.mode);
 
     return scan;
+  }
+
+  // The inventory hosts this run may reach, capped by mode and ordered so hosts
+  // that appeared since the last run are scanned first.
+  async #selectInventoryHosts(programId: number, mode: ScanMode): Promise<EnumeratedHost[]> {
+    if (this.#programsService === null) {
+      throw new ScanValidationError('this scanner was built without a programs service');
+    }
+    const program = await this.#programsService.getProgram(programId);
+    if (program === null) throw new ScanValidationError(`program ${programId} not found`);
+    return this.#programsService.selectHostsToScan(programId, hostCapFor(program, mode));
   }
 
   async getScan(id: number): Promise<ScanWithTargets | null> {

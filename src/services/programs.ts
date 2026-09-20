@@ -1,7 +1,7 @@
-import { and, asc, eq, sql } from 'drizzle-orm';
+import { and, asc, eq, inArray, sql } from 'drizzle-orm';
 import psl from 'psl';
 import type { Db } from '../db/client.js';
-import { enumeratedHosts, programs, scopeEntries, type HostSource, type ScopeList, type ScopeStatus } from '../db/schema.js';
+import { enumeratedHosts, programs, scopeEntries, type HostSource, type ScanMode, type ScopeList, type ScopeStatus } from '../db/schema.js';
 import { EnumerationError, type ObservedHost } from './enumeration.js';
 
 export class ProgramValidationError extends Error {}
@@ -48,6 +48,17 @@ const UPSERT_BATCH_SIZE = 100;
 // consecutive ones is a host that has gone dark, and scanning it would spend the
 // run's budget on nothing. The row is kept either way.
 const DORMANT_AFTER_FAILED_RESOLUTIONS = 3;
+
+// How many inventory hosts one scan may reach, per mode. Active is an order of
+// magnitude lower than passive because an active target additionally drives a
+// headless browser and injects payloads: one flat cap would either throttle
+// passive pointlessly or let active run wild. A program may override either.
+const MODE_HOST_CAPS: Record<ScanMode, number> = { passive: 250, active: 50 };
+
+export function hostCapFor(program: Program, mode: ScanMode): number {
+  const override = mode === 'active' ? program.activeHostCap : program.passiveHostCap;
+  return override ?? MODE_HOST_CAPS[mode];
+}
 
 // A host nothing has answered for in three consecutive probes. Exported because
 // the inventory shows it to the operator as well as withholding it from scans.
@@ -313,6 +324,31 @@ export class ProgramsService {
     return (await this.listHosts(programId)).filter(
       (host) => host.scopeStatus === 'in_scope' && !host.isWildcard && !isDormant(host),
     );
+  }
+
+  // The hosts one scan run reaches, in the order it should reach them: a host no
+  // scan has touched since it first appeared comes ahead of one an earlier run
+  // already covered, and among those, the longest-unscanned goes first. A cap
+  // that bites is therefore a rotation rather than a permanently ignored tail.
+  async selectHostsToScan(programId: number, limit: number): Promise<EnumeratedHost[]> {
+    // A host with no known endpoint has nothing to send a request to: it was
+    // never probed, or every probe found nothing. It stays in the inventory and
+    // stays eligible for takeover checks; only scanning has no target for it.
+    const scannable = (await this.listScannableHosts(programId)).filter((host) => host.endpointUrl !== null);
+    // Already in hostname order, which a stable sort keeps as the tie-break
+    // between two hosts last scanned at the same moment.
+    return scannable
+      .slice()
+      .sort((a, b) => (a.lastScannedAt?.getTime() ?? -Infinity) - (b.lastScannedAt?.getTime() ?? -Infinity))
+      .slice(0, limit);
+  }
+
+  // Stamps the hosts a scan just drew targets from, which is what moves them to
+  // the back of the queue for the next run.
+  async markHostsScanned(hostIds: number[]): Promise<void> {
+    if (hostIds.length === 0) return;
+    const scannedAt = new Date();
+    this.#db.update(enumeratedHosts).set({ lastScannedAt: scannedAt }).where(inArray(enumeratedHosts.id, hostIds)).run();
   }
 
   // Enumerates every apex on the in-scope list and records what comes back.

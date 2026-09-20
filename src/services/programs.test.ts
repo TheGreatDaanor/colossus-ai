@@ -6,6 +6,7 @@ import {
   classifyHost,
   ProgramValidationError,
   ProgramsService,
+  hostCapFor,
   type ProgramsServiceOptions,
   type Scope,
 } from './programs.js';
@@ -792,5 +793,73 @@ describe('ProgramsService.confirmScopeEntry', () => {
     const service = buildService();
 
     await expect(service.confirmScopeEntry(404, 1)).rejects.toThrow(ProgramValidationError);
+  });
+});
+
+describe('ProgramsService.selectHostsToScan', () => {
+  function buildEnumeratedService(hosts: string[], endpoints?: (hostname: string) => string | null) {
+    const resolve = endpoints ?? ((hostname: string) => `https://${hostname}`);
+    return buildService({
+      enumerationImpl: {
+        enumerate: async () => hosts.map((hostname) => ({ hostname, source: 'ct-log' as const })),
+        resolveEndpoint: async (hostname: string) => resolve(hostname),
+      },
+    });
+  }
+
+  async function programWithInventory(service: ProgramsService) {
+    const program = await service.createProgram({ url: 'https://example.com' });
+    for (const entry of program.scopeEntries) await service.confirmScopeEntry(program.id, entry.id);
+    await service.enumerateProgram(program.id);
+    return program;
+  }
+
+  it('caps the hosts one scan reaches at the limit it is given', async () => {
+    const service = buildEnumeratedService(['a.example.com', 'b.example.com', 'c.example.com', 'd.example.com']);
+    const program = await programWithInventory(service);
+
+    const selected = await service.selectHostsToScan(program.id, 2);
+
+    expect(selected).toHaveLength(2);
+  });
+
+  it('offers hosts no scan has reached ahead of hosts an earlier run covered', async () => {
+    const service = buildEnumeratedService(['a.example.com', 'b.example.com', 'c.example.com']);
+    const program = await programWithInventory(service);
+    const first = await service.selectHostsToScan(program.id, 2);
+    await service.markHostsScanned(first.map((host) => host.id));
+
+    const second = await service.selectHostsToScan(program.id, 2);
+
+    expect(second.map((host) => host.hostname)).toEqual(['c.example.com', 'a.example.com']);
+  });
+
+  it('skips a host that has never answered, since there is no endpoint to scan', async () => {
+    const service = buildEnumeratedService(['a.example.com', 'b.example.com'], (hostname) =>
+      hostname === 'a.example.com' ? null : `https://${hostname}`,
+    );
+    const program = await programWithInventory(service);
+
+    const selected = await service.selectHostsToScan(program.id, 10);
+
+    expect(selected.map((host) => host.hostname)).toEqual(['b.example.com']);
+  });
+});
+
+describe('hostCapFor', () => {
+  it('caps active scans far below passive ones, since each active target also drives a browser', async () => {
+    const service = buildService();
+    const program = await service.createProgram({ name: 'acme' });
+
+    expect(hostCapFor(program, 'passive')).toBe(250);
+    expect(hostCapFor(program, 'active')).toBe(50);
+  });
+
+  it('lets a program override either mode default', async () => {
+    const service = buildService();
+    const program = await service.createProgram({ name: 'acme', passiveHostCap: 10, activeHostCap: 3 });
+
+    expect(hostCapFor(program, 'passive')).toBe(10);
+    expect(hostCapFor(program, 'active')).toBe(3);
   });
 });
