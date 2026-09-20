@@ -277,10 +277,15 @@ export class ProgramsService {
   // The program's passive/active host caps are deliberately not applied here:
   // they bound what a *scan* reaches (issue 037), not what the inventory may
   // know about. Capping the inventory would hide hosts from the operator.
-  async recordHosts(programId: number, hosts: ObservedHost[]): Promise<EnumeratedHost[]> {
+  // `observedAt` is the time the *run* saw these hosts, not the time this call
+  // was made. A crawl calls this once per page, and `listInventory` reads each
+  // distinct `firstSeenAt` as a separate run: left to its own clock, one scan
+  // would manufacture a run per page and displace its own earlier pages, so the
+  // caller passes the one time that stands for the whole run.
+  async recordHosts(programId: number, hosts: ObservedHost[], observedAt?: Date): Promise<EnumeratedHost[]> {
     this.#requireProgram(programId);
     const scope = toScope(this.#scopeEntriesOf(programId));
-    const firstSeenAt = this.#now();
+    const firstSeenAt = observedAt ?? this.#now();
 
     // One CT answer for a busy apex names thousands of hosts, so the rows go in
     // as batched upserts rather than a select-then-write per host. The whole
@@ -365,9 +370,15 @@ export class ProgramsService {
     };
   }
 
-  // One pass of the scheduler: enumerates every program whose inventory is older
-  // than `cadenceMs`, and returns the ids of the ones it enumerated. A program
-  // never enumerated is always due.
+  // One pass of the scheduler: enumerates every program whose last *attempt* is
+  // older than `cadenceMs`, and returns the ids of the ones it enumerated. A
+  // program never attempted is always due.
+  //
+  // Dueness is paced on the attempt, not on `lastEnumeratedAt`, because a
+  // program whose sources are all down never advances the latter. Pacing on
+  // success would leave such a program permanently due — re-enumerated on every
+  // pass, at whatever frequency the scheduler happens to tick, which is exactly
+  // the program whose source least wants the traffic.
   //
   // Each program is enumerated independently. A source outage is already
   // non-fatal inside `enumerateProgram` — it is recorded on the program and the
@@ -380,12 +391,22 @@ export class ProgramsService {
       .from(programs)
       .all()
       .filter((program) => {
-        const last = program.lastEnumeratedAt;
+        // `lastAttemptedAt` is null on every program that predates it; falling
+        // back to the last success keeps those on their existing schedule
+        // rather than making the whole inventory due at once on deploy.
+        const last = program.lastAttemptedAt ?? program.lastEnumeratedAt;
         return last === null || now - last.getTime() >= options.cadenceMs;
       });
 
     const enumerated: number[] = [];
     for (const program of due) {
+      // Stamped before the attempt, so a pass that crashes partway still paces
+      // the programs it had already reached.
+      this.#db
+        .update(programs)
+        .set({ lastAttemptedAt: this.#now() })
+        .where(eq(programs.id, program.id))
+        .run();
       try {
         await this.enumerateProgram(program.id);
         enumerated.push(program.id);

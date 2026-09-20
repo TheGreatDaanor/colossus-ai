@@ -81,6 +81,19 @@ function dedupe(urls: string[]): string[] {
   return Array.from(new Set(urls));
 }
 
+// The form of a URL used only to decide whether two strings name the same
+// target. `https://example.com` and `https://example.com/` are one address, and
+// the inventory stores the first form while an operator's address bar yields
+// the second; comparing them raw books the host twice. Parsing failures fall
+// back to the original string — those URLs are rejected as invalid anyway.
+function sameTargetKey(raw: string): string {
+  try {
+    return new URL(raw).href;
+  } catch {
+    return raw;
+  }
+}
+
 function lowercaseHeaders(headers: Headers): Record<string, string> {
   const out: Record<string, string> = {};
   headers.forEach((value, key) => {
@@ -381,6 +394,10 @@ type DiscoveryContext = {
   // the inventory; without them it stays on the submitted origin.
   programId: number | null;
   scope: Scope | null;
+  // One time for the whole run, stamped on every host the crawl records. Fixed
+  // here rather than read per page so that one scan reads as one run in the
+  // inventory, however many pages it happened to walk.
+  discoveredAt: Date;
   seenUrls: Set<string>;
   depthOf: Map<number, number>;
   rootOf: Map<number, number>;
@@ -498,8 +515,13 @@ export class ScannerService {
     // one host: the same request twice, and every finding counted twice in the
     // severity summary. The inventory row is the one kept — it carries the host
     // link that says which host the result belongs to.
-    const inventoryUrls = new Set(inventoryHosts.map((host) => host.endpointUrl).filter((url) => url !== null));
-    const submitted = valid.filter((url) => !inventoryUrls.has(url));
+    const inventoryUrls = new Set(
+      inventoryHosts
+        .map((host) => host.endpointUrl)
+        .filter((url) => url !== null)
+        .map(sameTargetKey),
+    );
+    const submitted = valid.filter((url) => !inventoryUrls.has(sameTargetKey(url)));
     const hasValid = valid.length > 0 || inventoryHosts.length > 0;
 
     const [scan] = this.#db
@@ -619,6 +641,7 @@ export class ScannerService {
     const discovery: DiscoveryContext = {
       programId,
       scope,
+      discoveredAt: new Date(),
       seenUrls: new Set(targetRows.map((t) => t.url)),
       depthOf: new Map(targetRows.map((t) => [t.id, 0])),
       rootOf: new Map(targetRows.map((t) => [t.id, t.id])),
@@ -824,6 +847,7 @@ export class ScannerService {
       await this.#programsService?.recordHosts(
         discovery.programId,
         hostnames.map((hostname) => ({ hostname, source: 'crawl' as const })),
+        discovery.discoveredAt,
       );
     }
 

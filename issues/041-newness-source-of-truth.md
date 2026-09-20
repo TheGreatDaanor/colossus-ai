@@ -36,6 +36,11 @@ Two consequences:
 - The set is all-or-nothing per timestamp. A crawl discovery displaces whatever
   the previous enumeration marked, rather than adding to it.
 
+A crawl now stamps every host it finds with one time for the whole run, so a
+scan counts as at most one "run" rather than one per page walked. That bounds
+the problem but does not settle it: one scan still displaces the enumeration
+before it.
+
 ## The decision
 
 Not which is easier — which is true to "hosts that appeared since last time":

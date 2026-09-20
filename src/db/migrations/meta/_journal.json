@@ -92,6 +92,13 @@
       "when": 1789913358286,
       "tag": "0012_melted_black_bolt",
       "breakpoints": true
+    },
+    {
+      "idx": 13,
+      "version": "6",
+      "when": 1789919711963,
+      "tag": "0013_powerful_cobalt_man",
+      "breakpoints": true
     }
   ]
 }

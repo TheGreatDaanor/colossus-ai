@@ -1024,4 +1024,57 @@ describe('ProgramsService.enumerateDuePrograms', () => {
     expect((await service.getProgram(broken.id))?.enumerationError).toContain('resolver exploded');
     expect((await service.listHosts(healthy.id)).map((host) => host.hostname)).toEqual(['a.example.com']);
   });
+
+  it('waits out the cadence before retrying a program whose sources were all down', async () => {
+    let clock = 1_700_000_000_000;
+    const counter = { calls: 0 };
+    const service = buildService({
+      now: () => new Date(clock),
+      enumerationImpl: {
+        enumerate: async () => {
+          counter.calls += 1;
+          throw new EnumerationError('crt.sh: 503 Service Unavailable');
+        },
+      },
+    });
+    await confirmedProgram(service, 'https://example.com');
+
+    await service.enumerateDuePrograms({ cadenceMs: 60_000 });
+    expect(counter.calls).toBe(1);
+
+    // A pass a second later must not try again: a program whose source is down
+    // is not thereby owed enumeration at the scheduler's frequency rather than
+    // its own cadence.
+    clock += 1_000;
+    await service.enumerateDuePrograms({ cadenceMs: 60_000 });
+    expect(counter.calls).toBe(1);
+
+    clock += 60_000;
+    await service.enumerateDuePrograms({ cadenceMs: 60_000 });
+    expect(counter.calls).toBe(2);
+  });
+
+  it('waits out the cadence before retrying a program whose enumeration threw outright', async () => {
+    let clock = 1_700_000_000_000;
+    const counter = { calls: 0 };
+    const service = buildService({
+      now: () => new Date(clock),
+      enumerationImpl: {
+        enumerate: async () => {
+          counter.calls += 1;
+          throw new Error('resolver exploded');
+        },
+      },
+    });
+    await confirmedProgram(service, 'https://example.com');
+
+    await service.enumerateDuePrograms({ cadenceMs: 60_000 });
+    clock += 1_000;
+    await service.enumerateDuePrograms({ cadenceMs: 60_000 });
+    expect(counter.calls).toBe(1);
+
+    clock += 60_000;
+    await service.enumerateDuePrograms({ cadenceMs: 60_000 });
+    expect(counter.calls).toBe(2);
+  });
 });

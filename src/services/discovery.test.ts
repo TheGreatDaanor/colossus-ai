@@ -82,6 +82,15 @@ describe('discoverLinks program scope', () => {
     expect(hostnames.sort()).toEqual(['blog.example.com', 'evil.example']);
   });
 
+  it('follows an in-scope host on another port, the same as any other in-scope host', () => {
+    // Scope is attested per host, not per port: an operator who put
+    // `example.com` in scope authorized the host, and the origin's own port is
+    // not a narrower boundary than a sibling host's.
+    const html = '<a href="https://example.com:8443/admin">Same host, other port</a>';
+    const { links } = discoverLinks({ url: new URL('https://example.com/'), html }, null, scope);
+    expect(links).toEqual(['https://example.com:8443/admin']);
+  });
+
   it('keeps the same-origin rule when no scope is given', () => {
     const html = '<a href="https://blog.example.com/post">Blog</a>';
     const { links } = discoverLinks({ url: new URL('https://example.com/'), html }, null);

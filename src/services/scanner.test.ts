@@ -123,6 +123,20 @@ describe('ScannerService program scans', () => {
     expect(stored?.targets.map((t) => t.url).sort()).toEqual(['https://a.example.com', 'https://b.example.com']);
   });
 
+  it('scans a host once when the submitted URL differs from the inventory endpoint only by a trailing slash', async () => {
+    const db = createDb(':memory:');
+    const { programsService, program } = await seedProgram(db, ['a.example.com', 'b.example.com']);
+    const svc = buildScanner(db, programsService);
+
+    // `https://a.example.com/` is what a browser's address bar yields, while the
+    // inventory endpoint has no trailing slash. They are the same target, and a
+    // string comparison that misses it double-counts every finding on the host.
+    const scan = await svc.startScan(['https://a.example.com/'], { programId: program.id });
+
+    const stored = await svc.getScan(scan.id);
+    expect(stored?.targets.map((t) => t.url).sort()).toEqual(['https://a.example.com', 'https://b.example.com']);
+  });
+
   it('keeps the inventory link when a submitted URL duplicates an inventory host', async () => {
     const db = createDb(':memory:');
     const { programsService, program } = await seedProgram(db, ['a.example.com']);
@@ -255,6 +269,43 @@ describe('ScannerService scope-aware crawl discovery', () => {
       ['evil.example', 'crawl', 'unscoped'],
       ['secret.example.com', 'crawl', 'out_of_scope'],
     ]);
+  });
+
+  it('stamps every host one crawl discovers with a single time, however many pages named them', async () => {
+    const db = createDb(':memory:');
+    // A clock that moves on every read, so two `recordHosts` calls in the same
+    // run would be visibly distinct times rather than colliding in one tick.
+    let tick = 0;
+    const programsService = new ProgramsService(db, {
+      now: () => new Date(1_700_000_000_000 + tick++ * 1000),
+      enumerationImpl: {
+        enumerate: async () => [],
+        resolveEndpoint: async (hostname: string) => `https://${hostname}`,
+      },
+    });
+    const program = await programsService.createProgram({ url: 'https://example.com' });
+    for (const entry of program.scopeEntries) await programsService.confirmScopeEntry(program.id, entry.id);
+
+    // Two pages, each naming a host the other does not: one crawl, two calls.
+    const fetchImpl: FetchImpl = vi.fn(async (url) => {
+      const body =
+        String(url) === 'https://example.com/'
+          ? '<a href="https://blog.example.com/post">one</a>'
+          : String(url) === 'https://blog.example.com/post'
+            ? '<a href="https://shop.example.com/buy">two</a>'
+            : '';
+      return new Response(body, { status: 200, headers: HTML_HEADERS });
+    });
+    const svc = new ScannerService(db, { fetchImpl, tlsCheckImpl: okTlsCheckImpl(), programsService });
+    const scan = await svc.startScan(['https://example.com/'], { programId: program.id });
+    await completedScan(svc, scan.id);
+
+    // `listInventory` reads each distinct `firstSeenAt` as a separate run, so a
+    // crawl that stamped its pages separately would displace its own hosts and
+    // leave only the last page's marked as new.
+    const inventory = await programsService.listHosts(program.id);
+    expect(inventory.map((h) => h.hostname).sort()).toEqual(['blog.example.com', 'shop.example.com']);
+    expect(new Set(inventory.map((h) => h.firstSeenAt.getTime())).size).toBe(1);
   });
 
   it('keeps the same-origin rule for a scan submitted without a program', async () => {

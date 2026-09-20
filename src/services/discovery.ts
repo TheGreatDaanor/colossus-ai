@@ -11,10 +11,14 @@ function isSameOrigin(candidate: URL, origin: URL): boolean {
 // page's origin: an operator who put `example.com` in scope authorized every
 // host under it, including ones no certificate ever named. Without a program
 // there is no such attestation, so the same-origin rule still holds.
+//
+// Scope is attested per host, so the port is not part of the test — including
+// for the origin's own host. Singling that one host out for a same-origin check
+// would make the page's own admin port the one in-scope address the crawl
+// refused to follow, which is not a boundary anyone drew.
 function mayFollow(candidate: URL, origin: URL, scope: Scope | null): boolean {
   if (scope === null) return isSameOrigin(candidate, origin);
   if (candidate.protocol !== 'https:' && candidate.protocol !== 'http:') return false;
-  if (candidate.hostname === origin.hostname) return isSameOrigin(candidate, origin);
   return classifyHost(candidate.hostname, scope) === 'in_scope';
 }
 

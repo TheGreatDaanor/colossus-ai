@@ -95,6 +95,11 @@ export const programs = sqliteTable('programs', {
   activeHostCap: integer('active_host_cap'),
   enumerationError: text('enumeration_error'),
   lastEnumeratedAt: integer('last_enumerated_at', { mode: 'timestamp' }),
+  // When enumeration was last *tried*, as distinct from last succeeded. The
+  // scheduler paces itself on this: a program whose source is down never
+  // advances `lastEnumeratedAt`, and pacing on that would make every failing
+  // program due on every pass rather than once per cadence.
+  lastAttemptedAt: integer('last_attempted_at', { mode: 'timestamp' }),
   createdAt: integer('created_at', { mode: 'timestamp' }).notNull(),
 });
 
