@@ -1,5 +1,8 @@
 import { Resolver } from 'node:dns/promises';
-import type { FindingConfidence } from '../db/schema.js';
+import { and, asc, eq } from 'drizzle-orm';
+import type { Db } from '../db/client.js';
+import { enumeratedHosts, programs, takeoverFindings, type FindingConfidence, type FindingSeverity } from '../db/schema.js';
+import { ProgramValidationError } from './programs.js';
 
 // The DNS surface this check needs, narrowed to two questions: what does this
 // name CNAME to, and does this name resolve to an address? Injected as an option
@@ -266,4 +269,115 @@ export async function checkTakeover(hostname: string, options: CheckTakeoverOpti
     confidence,
     remediation: remediationFor(normalised, cnameTarget, provider),
   };
+}
+
+
+// A persisted takeover finding joined to the host it was found on. `hostname`
+// comes from `enumerated_hosts` rather than being stored twice: the finding is
+// keyed to the host row, which already holds the authoritative name.
+export type TakeoverFinding = typeof takeoverFindings.$inferSelect & { hostname: string };
+
+export type TakeoverServiceOptions = { resolverImpl?: DnsResolverImpl; fetchImpl?: TakeoverFetchImpl };
+
+// A dangling reference is a real exposure whether or not the provider's own
+// words confirm it, so both confidences are actionable; the provider-confirmed
+// case is rated higher because the resource is demonstrably there to be claimed.
+function severityFor(confidence: FindingConfidence): FindingSeverity {
+  return confidence === 'definitive' ? 'high' : 'medium';
+}
+
+// Runs the takeover check across a program's inventory and persists what it
+// finds. Deepens this module rather than living apart from `checkTakeover`: the
+// pure per-host check and the program-wide sweep are one domain, and only the
+// sweep needs the database.
+export class TakeoverService {
+  #db: Db;
+  #resolverImpl: DnsResolverImpl | undefined;
+  #fetchImpl: TakeoverFetchImpl | undefined;
+
+  constructor(db: Db, options: TakeoverServiceOptions = {}) {
+    this.#db = db;
+    this.#resolverImpl = options.resolverImpl;
+    this.#fetchImpl = options.fetchImpl;
+  }
+
+  // Checks every in-scope host in the program's inventory and returns the
+  // findings. Only `in_scope`, non-wildcard hosts are checked: an out-of-scope
+  // or unscoped host was never authorized, and a wildcard row stands for a
+  // subtree rather than a name that answers. A host that has healed since a
+  // prior run has its stale finding removed, so the list never overstates risk.
+  async checkProgram(programId: number): Promise<TakeoverFinding[]> {
+    this.#requireProgram(programId);
+
+    const hosts = this.#db
+      .select()
+      .from(enumeratedHosts)
+      .where(
+        and(
+          eq(enumeratedHosts.programId, programId),
+          eq(enumeratedHosts.scopeStatus, 'in_scope'),
+          eq(enumeratedHosts.isWildcard, false),
+        ),
+      )
+      .orderBy(asc(enumeratedHosts.hostname))
+      .all();
+
+    // Built by spread so an unset impl stays absent rather than present-and-
+    // undefined, which `exactOptionalPropertyTypes` distinguishes; checkTakeover
+    // then falls back to its live defaults.
+    const checkOptions: CheckTakeoverOptions = {
+      ...(this.#resolverImpl ? { resolverImpl: this.#resolverImpl } : {}),
+      ...(this.#fetchImpl ? { fetchImpl: this.#fetchImpl } : {}),
+    };
+
+    for (const host of hosts) {
+      const evidence = await checkTakeover(host.hostname, checkOptions);
+
+      if (evidence === null) {
+        this.#db.delete(takeoverFindings).where(eq(takeoverFindings.enumeratedHostId, host.id)).run();
+        continue;
+      }
+
+      const values = {
+        cnameTarget: evidence.cnameTarget,
+        provider: evidence.provider,
+        severity: severityFor(evidence.confidence),
+        confidence: evidence.confidence,
+        remediation: evidence.remediation,
+        createdAt: new Date(),
+      };
+
+      this.#db
+        .insert(takeoverFindings)
+        .values({ enumeratedHostId: host.id, ...values })
+        // One finding per host: a re-check refreshes the evidence in place rather
+        // than stacking a second row for the same dangling reference.
+        .onConflictDoUpdate({ target: takeoverFindings.enumeratedHostId, set: values })
+        .run();
+    }
+
+    return this.listFindings(programId);
+  }
+
+  // The program's persisted takeover findings, ordered by hostname so the list
+  // reads the same way twice. Joined to the inventory to carry the hostname and
+  // to scope the query to this program's hosts.
+  async listFindings(programId: number): Promise<TakeoverFinding[]> {
+    this.#requireProgram(programId);
+
+    const rows = this.#db
+      .select({ finding: takeoverFindings, hostname: enumeratedHosts.hostname })
+      .from(takeoverFindings)
+      .innerJoin(enumeratedHosts, eq(takeoverFindings.enumeratedHostId, enumeratedHosts.id))
+      .where(eq(enumeratedHosts.programId, programId))
+      .orderBy(asc(enumeratedHosts.hostname))
+      .all();
+
+    return rows.map((row) => ({ ...row.finding, hostname: row.hostname }));
+  }
+
+  #requireProgram(id: number): void {
+    const row = this.#db.select({ id: programs.id }).from(programs).where(eq(programs.id, id)).get();
+    if (!row) throw new ProgramValidationError(`program ${id} not found`);
+  }
 }

@@ -131,3 +131,30 @@ export const enumeratedHosts = sqliteTable(
   },
   (table) => [uniqueIndex('enumerated_hosts_program_hostname').on(table.programId, table.hostname)],
 );
+
+// A subdomain-takeover finding, keyed to `enumerated_hosts` rather than
+// `scan_targets`: a takeover host frequently does not resolve at all, so it has
+// no target row and never runs through the passive/active pipeline. One row per
+// host at a time — re-checking a host refreshes its finding in place, and a host
+// that has healed has its stale finding removed, so the list stays truthful.
+export const takeoverFindings = sqliteTable(
+  'takeover_findings',
+  {
+    id: integer('id').primaryKey({ autoIncrement: true }),
+    enumeratedHostId: integer('enumerated_host_id')
+      .notNull()
+      .references(() => enumeratedHosts.id),
+    // The dangling CNAME target and, when a fingerprint matched it, the provider
+    // the operator should reclaim from. `provider` is null for a dangling
+    // reference whose target belongs to no known provider.
+    cnameTarget: text('cname_target').notNull(),
+    provider: text('provider'),
+    severity: text('severity').$type<FindingSeverity>().notNull(),
+    confidence: text('confidence').$type<FindingConfidence>().notNull(),
+    // The operator-facing next step. Names the provider and resource so they can
+    // reclaim or remove it themselves — Colossus never claims the resource.
+    remediation: text('remediation').notNull(),
+    createdAt: integer('created_at', { mode: 'timestamp' }).notNull(),
+  },
+  (table) => [uniqueIndex('takeover_findings_host').on(table.enumeratedHostId)],
+);

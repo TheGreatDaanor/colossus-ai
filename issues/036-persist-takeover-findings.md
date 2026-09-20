@@ -1,7 +1,7 @@
 ---
 id: 036
 title: Run takeover checks across a program's hosts and persist the findings
-status: open
+status: done
 type: afk
 blocked-by: [030, 032]
 ---
