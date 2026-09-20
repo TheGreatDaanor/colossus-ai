@@ -1,7 +1,15 @@
 import { createServer, type ServerResponse } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { describe, expect, it } from 'vitest';
-import { checkTakeover, createTakeoverFetch, type DnsResolverImpl, type TakeoverFetchImpl } from './takeover.js';
+import { createDb } from '../db/client.js';
+import { ProgramsService, ProgramValidationError } from './programs.js';
+import {
+  checkTakeover,
+  createTakeoverFetch,
+  TakeoverService,
+  type DnsResolverImpl,
+  type TakeoverFetchImpl,
+} from './takeover.js';
 
 class DnsError extends Error {
   code: string;
@@ -352,5 +360,158 @@ describe('createTakeoverFetch', () => {
     } finally {
       await close();
     }
+  });
+});
+
+describe('TakeoverService', () => {
+  // A resolver stub for a whole program: `cnames` is the CNAME by host, and
+  // `addresses` is the set of names that resolve to an address. A CNAME target
+  // absent from `addresses` is dangling — the takeover case.
+  function stubResolver(records: { cnames?: Record<string, string>; addresses?: string[] }): DnsResolverImpl {
+    const cnames = records.cnames ?? {};
+    const addresses = new Set(records.addresses ?? []);
+    return {
+      resolveCname: async (hostname) => {
+        const target = cnames[hostname];
+        if (target === undefined) throw new DnsError('ENODATA');
+        return [target];
+      },
+      resolveAddresses: async (hostname) => {
+        if (!addresses.has(hostname)) throw new DnsError('ENOTFOUND');
+        return ['203.0.113.10'];
+      },
+    };
+  }
+
+  const unreachableFetch: TakeoverFetchImpl = async () => {
+    throw new Error('connection refused');
+  };
+
+  // Seeds a program scoped to example.com with the given hosts already in its
+  // inventory, and returns both services sharing one database.
+  async function buildProgram(hosts: { hostname: string; isWildcard?: boolean }[]) {
+    const db = createDb(':memory:');
+    const programs = new ProgramsService(db);
+    const program = await programs.createProgram({ name: 'Acme', url: 'https://example.com' });
+    await programs.recordHosts(
+      program.id,
+      hosts.map((h) => ({ hostname: h.hostname, source: 'ct-log' as const, ...(h.isWildcard ? { isWildcard: true } : {}) })),
+    );
+    return { db, programId: program.id, programs };
+  }
+
+  it('persists a takeover finding for a dangling in-scope host', async () => {
+    const { db, programId } = await buildProgram([{ hostname: 'blog.example.com' }]);
+    const service = new TakeoverService(db, {
+      resolverImpl: stubResolver({ cnames: { 'blog.example.com': 'abandoned.s3.amazonaws.com' } }),
+      fetchImpl: unreachableFetch,
+    });
+
+    const found = await service.checkProgram(programId);
+
+    expect(found).toEqual([
+      expect.objectContaining({
+        hostname: 'blog.example.com',
+        cnameTarget: 'abandoned.s3.amazonaws.com',
+        provider: 'Amazon S3',
+        confidence: 'possible',
+        severity: 'medium',
+        remediation: expect.stringContaining('Colossus has not claimed'),
+      }),
+    ]);
+    expect(await service.listFindings(programId)).toEqual(found);
+  });
+
+  it('records a finding for a host that does not resolve to an address at all', async () => {
+    // The host has a dangling CNAME but no A record of its own — the common
+    // shape of a takeover, and the case a scan_targets-keyed table could not hold.
+    const { db, programId } = await buildProgram([{ hostname: 'gone.example.com' }]);
+    const service = new TakeoverService(db, {
+      resolverImpl: stubResolver({ cnames: { 'gone.example.com': 'orphan.unknown-host.example' } }),
+      fetchImpl: unreachableFetch,
+    });
+
+    const found = await service.checkProgram(programId);
+
+    expect(found).toHaveLength(1);
+    expect(found[0]).toMatchObject({ hostname: 'gone.example.com', provider: null, confidence: 'possible' });
+  });
+
+  it('rates a provider-confirmed takeover high severity at definitive confidence', async () => {
+    const { db, programId } = await buildProgram([{ hostname: 'shop.example.com' }]);
+    const service = new TakeoverService(db, {
+      resolverImpl: stubResolver({ cnames: { 'shop.example.com': 'abandoned.s3.amazonaws.com' } }),
+      fetchImpl: async () => 'NoSuchBucket',
+    });
+
+    const [finding] = await service.checkProgram(programId);
+
+    expect(finding).toMatchObject({ confidence: 'definitive', severity: 'high' });
+  });
+
+  it('never checks out-of-scope, unscoped, or wildcard hosts', async () => {
+    const { db, programId, programs } = await buildProgram([
+      { hostname: 'in.example.com' },
+      { hostname: 'wild.example.com', isWildcard: true },
+      { hostname: 'other.example.org' }, // unscoped: not under example.com
+    ]);
+    await programs.addScopeEntry(programId, { list: 'out', pattern: 'excluded.example.com' });
+    await programs.recordHosts(programId, [{ hostname: 'excluded.example.com', source: 'ct-log' }]);
+
+    const service = new TakeoverService(db, {
+      resolverImpl: stubResolver({
+        cnames: {
+          'in.example.com': 'a.s3.amazonaws.com',
+          'wild.example.com': 'b.s3.amazonaws.com',
+          'other.example.org': 'c.s3.amazonaws.com',
+          'excluded.example.com': 'd.s3.amazonaws.com',
+        },
+      }),
+      fetchImpl: unreachableFetch,
+    });
+
+    const found = await service.checkProgram(programId);
+
+    expect(found.map((f) => f.hostname)).toEqual(['in.example.com']);
+  });
+
+  it('refreshes a host in place on re-check rather than duplicating it', async () => {
+    const { db, programId } = await buildProgram([{ hostname: 'blog.example.com' }]);
+    const service = new TakeoverService(db, {
+      resolverImpl: stubResolver({ cnames: { 'blog.example.com': 'abandoned.s3.amazonaws.com' } }),
+      fetchImpl: unreachableFetch,
+    });
+
+    await service.checkProgram(programId);
+    const second = await service.checkProgram(programId);
+
+    expect(second).toHaveLength(1);
+  });
+
+  it('clears a finding for a host that has since been reclaimed', async () => {
+    const { db, programId } = await buildProgram([{ hostname: 'blog.example.com' }]);
+    const dangling = new TakeoverService(db, {
+      resolverImpl: stubResolver({ cnames: { 'blog.example.com': 'abandoned.s3.amazonaws.com' } }),
+      fetchImpl: unreachableFetch,
+    });
+    await dangling.checkProgram(programId);
+
+    // The CNAME target now resolves: the resource was reclaimed, so no takeover.
+    const healed = new TakeoverService(db, {
+      resolverImpl: stubResolver({
+        cnames: { 'blog.example.com': 'abandoned.s3.amazonaws.com' },
+        addresses: ['abandoned.s3.amazonaws.com'],
+      }),
+      fetchImpl: unreachableFetch,
+    });
+
+    expect(await healed.checkProgram(programId)).toEqual([]);
+    expect(await healed.listFindings(programId)).toEqual([]);
+  });
+
+  it('rejects an unknown program', async () => {
+    const db = createDb(':memory:');
+    const service = new TakeoverService(db, { fetchImpl: unreachableFetch });
+    await expect(service.checkProgram(999)).rejects.toThrow(ProgramValidationError);
   });
 });
