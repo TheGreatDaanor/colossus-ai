@@ -33,7 +33,22 @@ export type EnumerationImpl = {
   resolveEndpoint?(hostname: string): Promise<string | null>;
 };
 
-export type ProgramsServiceOptions = { enumerationImpl?: EnumerationImpl };
+// `now` is injected because the inventory's "what appeared since last time" is
+// read off the times rows were written, and a test needs those to be distinct.
+export type ProgramsServiceOptions = { enumerationImpl?: EnumerationImpl; now?: () => Date };
+
+// An inventory host together with whether it appeared in the most recent
+// enumeration. `isNew` is deliberately not a finding and carries no severity: a
+// host that has just appeared is something to look at, not a defect.
+export type InventoryHost = EnumeratedHost & { isNew: boolean };
+
+// The program's inventory, with the newly appeared hosts marked. `newSince` is
+// when the previous enumeration ran — the point the new hosts appeared after —
+// and is null on a program that has only ever been enumerated once, where there
+// is no earlier inventory for anything to have appeared since.
+export type Inventory = { hosts: InventoryHost[]; newSince: Date | null };
+
+export type EnumerateDueOptions = { cadenceMs: number };
 
 export type { ScopeList, ScopeStatus };
 
@@ -165,10 +180,12 @@ function validatePattern(list: ScopeList, raw: string): string {
 export class ProgramsService {
   #db: Db;
   #enumerationImpl: EnumerationImpl | null;
+  #now: () => Date;
 
   constructor(db: Db, options: ProgramsServiceOptions = {}) {
     this.#db = db;
     this.#enumerationImpl = options.enumerationImpl ?? null;
+    this.#now = options.now ?? (() => new Date());
   }
 
   async createProgram(options: CreateProgramOptions): Promise<ProgramWithScope> {
@@ -184,7 +201,7 @@ export class ProgramsService {
         name: name ?? apex ?? '',
         passiveHostCap: passiveHostCap ?? null,
         activeHostCap: activeHostCap ?? null,
-        createdAt: new Date(),
+        createdAt: this.#now(),
       })
       .returning()
       .get();
@@ -222,7 +239,7 @@ export class ProgramsService {
     // separate confirmation step.
     const row = this.#db
       .insert(scopeEntries)
-      .values({ programId, list, pattern, confirmedAt: new Date() })
+      .values({ programId, list, pattern, confirmedAt: this.#now() })
       .returning()
       .get();
     if (!row) throw new Error('failed to insert scope entry');
@@ -263,7 +280,7 @@ export class ProgramsService {
   async recordHosts(programId: number, hosts: ObservedHost[]): Promise<EnumeratedHost[]> {
     this.#requireProgram(programId);
     const scope = toScope(this.#scopeEntriesOf(programId));
-    const firstSeenAt = new Date();
+    const firstSeenAt = this.#now();
 
     // One CT answer for a busy apex names thousands of hosts, so the rows go in
     // as batched upserts rather than a select-then-write per host. The whole
@@ -325,6 +342,64 @@ export class ProgramsService {
       .all();
   }
 
+  // The inventory as an operator reads it: every host, with the ones that
+  // appeared in the most recent enumeration marked.
+  //
+  // Newness is derived from `firstSeenAt` rather than stored: one enumeration
+  // stamps every host it records with the same time, so the distinct
+  // `firstSeenAt` values *are* the runs that found something, and the hosts
+  // carrying the latest one are the hosts that run added.
+  //
+  // A program enumerated only once has a single such value, and nothing is
+  // marked: on a first run every host is new in the trivial sense, and saying so
+  // would bury the signal the view exists to show.
+  async listInventory(programId: number): Promise<Inventory> {
+    const hosts = await this.listHosts(programId);
+    const runs = [...new Set(hosts.map((host) => host.firstSeenAt.getTime()))].sort((a, b) => a - b);
+    if (runs.length < 2) return { hosts: hosts.map((host) => ({ ...host, isNew: false })), newSince: null };
+
+    const latest = runs[runs.length - 1]!;
+    return {
+      hosts: hosts.map((host) => ({ ...host, isNew: host.firstSeenAt.getTime() === latest })),
+      newSince: new Date(runs[runs.length - 2]!),
+    };
+  }
+
+  // One pass of the scheduler: enumerates every program whose inventory is older
+  // than `cadenceMs`, and returns the ids of the ones it enumerated. A program
+  // never enumerated is always due.
+  //
+  // Each program is enumerated independently. A source outage is already
+  // non-fatal inside `enumerateProgram` — it is recorded on the program and the
+  // existing inventory is left alone — and an unexpected failure is recorded the
+  // same way here rather than being allowed to abandon the rest of the pass.
+  async enumerateDuePrograms(options: EnumerateDueOptions): Promise<number[]> {
+    const now = this.#now().getTime();
+    const due = this.#db
+      .select()
+      .from(programs)
+      .all()
+      .filter((program) => {
+        const last = program.lastEnumeratedAt;
+        return last === null || now - last.getTime() >= options.cadenceMs;
+      });
+
+    const enumerated: number[] = [];
+    for (const program of due) {
+      try {
+        await this.enumerateProgram(program.id);
+        enumerated.push(program.id);
+      } catch (err) {
+        this.#db
+          .update(programs)
+          .set({ enumerationError: `scheduled enumeration failed: ${String(err)}` })
+          .where(eq(programs.id, program.id))
+          .run();
+      }
+    }
+    return enumerated;
+  }
+
   // The hosts a scan may reach: in scope, not a wildcard, and not dormant. A
   // dormant host stays in the inventory and stays eligible for takeover checks —
   // it is only scanning that has nothing left to talk to.
@@ -355,7 +430,7 @@ export class ProgramsService {
   // the back of the queue for the next run.
   async markHostsScanned(hostIds: number[]): Promise<void> {
     if (hostIds.length === 0) return;
-    const scannedAt = new Date();
+    const scannedAt = this.#now();
     this.#db.update(enumeratedHosts).set({ lastScannedAt: scannedAt }).where(inArray(enumeratedHosts.id, hostIds)).run();
   }
 
@@ -388,7 +463,7 @@ export class ProgramsService {
     this.#db
       .update(programs)
       .set({
-        ...(readAnySource ? { lastEnumeratedAt: new Date() } : {}),
+        ...(readAnySource ? { lastEnumeratedAt: this.#now() } : {}),
         enumerationError: errors.length === 0 ? null : errors.join('; '),
       })
       .where(eq(programs.id, programId))
@@ -409,7 +484,7 @@ export class ProgramsService {
   // Wildcard hosts are skipped too: under a wildcard every name answers, so a
   // probe would record an endpoint for a host nobody has seen.
   async #probeEndpoints(programId: number): Promise<void> {
-    const probedAt = new Date();
+    const probedAt = this.#now();
     for (const host of await this.listHosts(programId)) {
       if (host.isWildcard || host.scopeStatus !== 'in_scope') continue;
       const endpointUrl = await this.#enumerationImpl?.resolveEndpoint?.(host.hostname);
@@ -443,7 +518,7 @@ export class ProgramsService {
 
     const updated = this.#db
       .update(scopeEntries)
-      .set({ confirmedAt: new Date() })
+      .set({ confirmedAt: this.#now() })
       .where(eq(scopeEntries.id, entryId))
       .returning()
       .get();

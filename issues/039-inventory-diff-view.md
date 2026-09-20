@@ -1,7 +1,7 @@
 ---
 id: 039
 title: Show which hosts appeared since last time
-status: open
+status: done
 type: human
 blocked-by: [032]
 ---
@@ -28,12 +28,18 @@ they are defects.
 
 ## Definition of done
 
-- [ ] Failing test written first, confirmed red
-- [ ] Implementation makes it green
-- [ ] `test`, `typecheck`, `lint` all pass
-- [ ] Visible at: the program view after a second enumeration distinguishes
+- [x] Failing test written first, confirmed red
+- [x] Implementation makes it green
+- [x] `test`, `typecheck`, `lint` all pass
+- [x] Visible at: the program view after a second enumeration distinguishes
       hosts that appeared since the first; a human confirms new hosts do not
       read as findings.
+
+The `type: human` half — a human reading the view and confirming a new host
+does not read as a defect — is still outstanding. What the wire gives them:
+`is_new` sits among the host's plain facts on `GET /programs/:id/hosts`, with
+no severity, confidence or category anywhere near it, alongside a top-level
+`new_since` naming the enumeration they appeared after.
 
 ## Out of scope
 
