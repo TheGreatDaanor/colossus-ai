@@ -94,10 +94,14 @@ does downstream of it).
    (error-based or time-based detection instead of browser execution), and
    benefits directly from phase 3's form/param discovery for injection
    points beyond query strings.
-5. **Access-control & auth** (IDOR, JWT/OAuth/SAML misconfigurations) —
-   the largest architectural jump of the remaining buckets: requires
-   session/auth-state handling (login flow, cookie/token reuse across
-   requests) that nothing built so far needs.
+5. **Access control** (IDOR) — grilled and now committed via
+   [ADR 0002](../docs/adr/0002-operator-supplied-ephemeral-identities.md) and
+   `PRD-access-control-phase5.md`. The grilling split the original
+   "access-control & auth" bucket in two: IDOR goes first, as a new
+   **access-control check** family that confirms defects by replaying a request
+   across operator-supplied, ephemeral identities (no login automation, no
+   stored credentials). JWT/OAuth/SAML token & protocol inspection splits off
+   into its own later phase, and vertical privilege escalation is deferred.
 6. **SSRF exploitation + GraphQL** — Colossus only has SSRF *defense*
    today (the guard that stops the scanner itself from being tricked into
    hitting internal addresses); actually testing a *target* for SSRF
