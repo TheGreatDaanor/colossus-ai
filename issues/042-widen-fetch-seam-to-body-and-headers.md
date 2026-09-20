@@ -1,7 +1,7 @@
 ---
 id: 042
 title: Widen the shared BodyFetchImpl seam to return body and headers
-status: open
+status: done
 type: afk
 blocked-by: []
 ---

@@ -1705,7 +1705,7 @@ describe('ScannerService active-mode injection classes', () => {
   it('confirms xss, ssti, sqli and lfi together on a multi-vuln target', async () => {
     const fetchImpl: FetchImpl = vi.fn(async () => okResponse(FULLY_HARDENED_HEADERS));
     const xssConfirmImpl = vi.fn(async () => ({ outcome: 'confirmed' as const }));
-    const bodyFetchImpl = vi.fn(async (url: string) => oracleBody(url));
+    const bodyFetchImpl = vi.fn(async (url: string) => ({ body: oracleBody(url), headers: new Headers() }));
     const svc = new ScannerService(createDb(':memory:'), {
       fetchImpl,
       tlsCheckImpl: okTlsCheckImpl(),
@@ -1740,7 +1740,7 @@ describe('ScannerService active-mode injection classes', () => {
       peak = Math.max(peak, inFlight);
       await new Promise((r) => setTimeout(r, 20));
       inFlight -= 1;
-      return '<p>ok</p>';
+      return { body: '<p>ok</p>', headers: new Headers() };
     });
     const svc = new ScannerService(createDb(':memory:'), {
       fetchImpl,

@@ -135,7 +135,10 @@ describe('xssInjectionClass', () => {
 describe('sstiInjectionClass', () => {
   // A plain (unguarded) fetch: the SSTI class fetches through an injected fetch so
   // loopback fixtures aren't rejected by the SSRF guard the real default enforces.
-  const fetchText = async (url: string): Promise<string> => (await fetch(url)).text();
+  const fetchText = async (url: string): Promise<{ body: string; headers: Headers }> => {
+    const response = await fetch(url);
+    return { body: await response.text(), headers: response.headers };
+  };
 
   it('reports the ssti finding category', () => {
     expect(makeSstiInjectionClass(fetchText).category).toBe('ssti');
@@ -182,7 +185,10 @@ describe('sstiInjectionClass', () => {
 });
 
 describe('sqliInjectionClass', () => {
-  const fetchText = async (url: string): Promise<string> => (await fetch(url)).text();
+  const fetchText = async (url: string): Promise<{ body: string; headers: Headers }> => {
+    const response = await fetch(url);
+    return { body: await response.text(), headers: response.headers };
+  };
 
   it('reports the sqli finding category', () => {
     expect(makeSqliInjectionClass(fetchText).category).toBe('sqli');
@@ -239,7 +245,10 @@ describe('sqliInjectionClass', () => {
 });
 
 describe('lfiInjectionClass', () => {
-  const fetchText = async (url: string): Promise<string> => (await fetch(url)).text();
+  const fetchText = async (url: string): Promise<{ body: string; headers: Headers }> => {
+    const response = await fetch(url);
+    return { body: await response.text(), headers: response.headers };
+  };
   const PASSWD = 'root:x:0:0:root:/root:/bin/bash\ndaemon:x:1:1:daemon:/usr/sbin:/usr/sbin/nologin';
 
   it('reports the lfi finding category', () => {

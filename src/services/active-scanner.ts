@@ -228,10 +228,13 @@ export function makeXssInjectionClass(confirmImpl: XssConfirmImpl = confirmXss):
 // The default XSS class, backed by the real browser confirmer.
 export const xssInjectionClass: InjectionClass = makeXssInjectionClass();
 
-// Fetches a URL's body text. The SSTI class confirms by content, not by browser,
-// so it fetches through this seam — the scanner injects its SSRF-guarded fetch, and
-// `guardedFetchText` is the default for standalone use.
-export type BodyFetchImpl = (url: string) => Promise<string>;
+// Fetches a URL's response body and headers. The content-based classes confirm by
+// body, not by browser, so they fetch through this seam — the scanner injects its
+// SSRF-guarded fetch, and `guardedFetchText` is the default for standalone use.
+// Headers ride along so a class that needs them (CRLF injection) can inspect the
+// response without a second fetch; the body-based classes read `.body` and ignore
+// `.headers`.
+export type BodyFetchImpl = (url: string) => Promise<{ body: string; headers: Headers }>;
 
 // Produces a fresh arithmetic-oracle payload: two random factors wrapped in the two
 // most common template delimiters (`${...}` for JSP/EL/Freemarker, `{{...}}` for
@@ -276,11 +279,11 @@ function baselineUrlFor(point: InjectionPoint): string {
 // address before fetching, so the SSTI confirmer can't be pointed at internal
 // infrastructure. The scanner injects its own already-guarded fetch instead; this is
 // the default for standalone use.
-async function guardedFetchText(url: string): Promise<string> {
+async function guardedFetchText(url: string): Promise<{ body: string; headers: Headers }> {
   const disallowed = await findDisallowedAddress(new URL(url).hostname);
   if (disallowed !== null) throw new Error(`fetch to a disallowed address (${disallowed}) was blocked`);
   const response = await fetch(url, { redirect: 'manual' });
-  return await response.text();
+  return { body: await response.text(), headers: response.headers };
 }
 
 // Server-side template injection as an InjectionClass: enumeration mutates each query
@@ -299,7 +302,7 @@ export function makeSstiInjectionClass(fetchImpl: BodyFetchImpl = guardedFetchTe
 
       let injectedBody: string;
       try {
-        injectedBody = await fetchImpl(point.url);
+        injectedBody = (await fetchImpl(point.url)).body;
       } catch (err) {
         return { outcome: 'unavailable', error: `injection fetch failed: ${errorMessage(err)}` };
       }
@@ -314,7 +317,7 @@ export function makeSstiInjectionClass(fetchImpl: BodyFetchImpl = guardedFetchTe
       // fetch can't clear that doubt, so we can't confirm.
       let baselineBody: string;
       try {
-        baselineBody = await fetchImpl(baselineUrlFor(point));
+        baselineBody = (await fetchImpl(baselineUrlFor(point))).body;
       } catch (err) {
         return { outcome: 'unavailable', error: `baseline fetch failed: ${errorMessage(err)}` };
       }
@@ -379,7 +382,7 @@ export function makeSqliInjectionClass(fetchImpl: BodyFetchImpl = guardedFetchTe
     confirm: async (point) => {
       let injectedBody: string;
       try {
-        injectedBody = await fetchImpl(point.url);
+        injectedBody = (await fetchImpl(point.url)).body;
       } catch (err) {
         return { outcome: 'unavailable', error: `injection fetch failed: ${errorMessage(err)}` };
       }
@@ -392,7 +395,7 @@ export function makeSqliInjectionClass(fetchImpl: BodyFetchImpl = guardedFetchTe
       // clear that doubt, so we can't confirm.
       let baselineBody: string;
       try {
-        baselineBody = await fetchImpl(sqliBaselineUrlFor(point));
+        baselineBody = (await fetchImpl(sqliBaselineUrlFor(point))).body;
       } catch (err) {
         return { outcome: 'unavailable', error: `baseline fetch failed: ${errorMessage(err)}` };
       }
@@ -448,7 +451,7 @@ export function makeLfiInjectionClass(fetchImpl: BodyFetchImpl = guardedFetchTex
     confirm: async (point) => {
       let injectedBody: string;
       try {
-        injectedBody = await fetchImpl(point.url);
+        injectedBody = (await fetchImpl(point.url)).body;
       } catch (err) {
         return { outcome: 'unavailable', error: `injection fetch failed: ${errorMessage(err)}` };
       }
@@ -461,7 +464,7 @@ export function makeLfiInjectionClass(fetchImpl: BodyFetchImpl = guardedFetchTex
       // that doubt, so we can't confirm.
       let baselineBody: string;
       try {
-        baselineBody = await fetchImpl(lfiBaselineUrlFor(point));
+        baselineBody = (await fetchImpl(lfiBaselineUrlFor(point))).body;
       } catch (err) {
         return { outcome: 'unavailable', error: `baseline fetch failed: ${errorMessage(err)}` };
       }
