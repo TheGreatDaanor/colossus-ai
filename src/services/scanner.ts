@@ -492,6 +492,14 @@ export class ScannerService {
     // Drawn before the scan row is written: on a program scan the inventory is
     // what decides whether this run has anything to do at all.
     const inventoryHosts = programId === null ? [] : await this.#selectInventoryHosts(programId, mode);
+    // `dedupe` only collapses repeats within the submitted list. A program scan
+    // draws a second list from the inventory, and an operator who submits a URL
+    // the inventory already covers would otherwise get two target rows for the
+    // one host: the same request twice, and every finding counted twice in the
+    // severity summary. The inventory row is the one kept — it carries the host
+    // link that says which host the result belongs to.
+    const inventoryUrls = new Set(inventoryHosts.map((host) => host.endpointUrl).filter((url) => url !== null));
+    const submitted = valid.filter((url) => !inventoryUrls.has(url));
     const hasValid = valid.length > 0 || inventoryHosts.length > 0;
 
     const [scan] = this.#db
@@ -524,7 +532,7 @@ export class ScannerService {
 
     if (!hasValid) return scan;
 
-    const submittedRows = valid.map((url) =>
+    const submittedRows = submitted.map((url) =>
       this.#db
         .insert(scanTargets)
         .values({ scanId: scan.id, url, status: 'pending' })

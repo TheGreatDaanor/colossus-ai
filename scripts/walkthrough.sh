@@ -37,6 +37,8 @@ while [[ $# -gt 0 ]]; do
     --url) URL="$2"; shift 2 ;;
     --keep) KEEP=1; shift ;;
     --simulate-new) SIMULATE_NEW="$2"; shift 2 ;;
+    --host) # a likely mix-up: --simulate-new is not how you choose the target
+      printf 'unknown argument: --host. To choose what gets scanned, use --url.\n' >&2; exit 1 ;;
     -h|--help) sed -n '2,23p' "$0" | sed 's/^#//'; exit 0 ;;
     *) printf 'unknown argument: %s\n' "$1" >&2; exit 1 ;;
   esac
@@ -45,6 +47,16 @@ done
 for cmd in curl python3; do
   command -v "$cmd" >/dev/null || { printf 'error: %s is required\n' "$cmd" >&2; exit 1; }
 done
+
+# --simulate-new names a host to plant in the inventory; --url names what gets
+# scanned. Passing a URL to the former is the easy mix-up, and it is silent —
+# the run scans the default target and plants a host nothing will ever match.
+if [[ "$SIMULATE_NEW" == *://* ]]; then
+  printf 'error: --simulate-new takes a hostname, not a URL (got %s).\n' "$SIMULATE_NEW" >&2
+  printf '       To choose what gets scanned:  --url %s\n' "$SIMULATE_NEW" >&2
+  printf '       To plant a host in the inventory:  --simulate-new %s\n' "${SIMULATE_NEW#*://}" >&2
+  exit 1
+fi
 
 # Pull one field out of a JSON response. python3 rather than jq: jq is not a
 # dependency of this repo and python3 already is, via the tooling scripts.
@@ -136,6 +148,15 @@ for run in 1 2; do
   COUNT="$(printf '%s' "$ENUM" | python3 -c 'import json,sys; print(len(json.load(sys.stdin).get("hosts") or []))')"
   ERR="$(printf '%s' "$ENUM" | json_field enumeration_error)"
   printf '      run %s: %s host(s), enumeration_error=%s\n' "$run" "$COUNT" "$ERR"
+
+  # A CT-log outage is recorded on the program rather than thrown, so the run
+  # keeps going with whatever inventory already existed. That is correct, and it
+  # is also easy to read straight past when the answer is an empty inventory.
+  if [[ "$ERR" != "null" ]]; then
+    printf '      ^ the CT source failed. The inventory is whatever was already\n'
+    printf '        there, so this run shows nothing new. Usually transient —\n'
+    printf '        crt.sh 502s under load. Re-run in a minute.\n'
+  fi
 
   # Enumeration reads a real CT log, which answers the same set twice in a row.
   # With nothing new, every host is is_new=false and new_since is null — correct,

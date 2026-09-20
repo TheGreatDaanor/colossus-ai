@@ -110,6 +110,33 @@ describe('ScannerService program scans', () => {
     expect(byUrl.get('https://a.example.com')).toEqual(expect.any(Number));
   });
 
+  it('scans a host once when it is both submitted and in the inventory', async () => {
+    const db = createDb(':memory:');
+    const { programsService, program } = await seedProgram(db, ['a.example.com', 'b.example.com']);
+    const svc = buildScanner(db, programsService);
+
+    // The operator submits a URL the inventory already covers. Two target rows
+    // for one host means the same request twice and every finding counted twice.
+    const scan = await svc.startScan(['https://a.example.com'], { programId: program.id });
+
+    const stored = await svc.getScan(scan.id);
+    expect(stored?.targets.map((t) => t.url).sort()).toEqual(['https://a.example.com', 'https://b.example.com']);
+  });
+
+  it('keeps the inventory link when a submitted URL duplicates an inventory host', async () => {
+    const db = createDb(':memory:');
+    const { programsService, program } = await seedProgram(db, ['a.example.com']);
+    const svc = buildScanner(db, programsService);
+
+    const scan = await svc.startScan(['https://a.example.com'], { programId: program.id });
+
+    // The surviving row is the inventory one: dropping the link would lose which
+    // host the result belongs to, and the host would never be marked scanned.
+    const stored = await svc.getScan(scan.id);
+    expect(stored?.targets).toHaveLength(1);
+    expect(stored?.targets[0]?.enumeratedHostId).toEqual(expect.any(Number));
+  });
+
   it('caps a run at the program override rather than the mode default', async () => {
     const db = createDb(':memory:');
     const hosts = ['a.example.com', 'b.example.com', 'c.example.com', 'd.example.com'];
