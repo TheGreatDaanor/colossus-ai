@@ -1,7 +1,7 @@
 ---
 id: 039
 title: Show which hosts appeared since last time
-status: open
+status: done
 type: human
 blocked-by: [032]
 ---
@@ -28,12 +28,25 @@ they are defects.
 
 ## Definition of done
 
-- [ ] Failing test written first, confirmed red
-- [ ] Implementation makes it green
-- [ ] `test`, `typecheck`, `lint` all pass
-- [ ] Visible at: the program view after a second enumeration distinguishes
+- [x] Failing test written first, confirmed red
+- [x] Implementation makes it green
+- [x] `test`, `typecheck`, `lint` all pass
+- [x] Visible at: the program view after a second enumeration distinguishes
       hosts that appeared since the first; a human confirms new hosts do not
       read as findings.
+
+The `type: human` half is done. An operator read the inventory view against a
+real run and accepted it: `is_new` sits among the host's plain facts on
+`GET /programs/:id/hosts`, with no severity, confidence or category anywhere
+near it, alongside a top-level `new_since` naming the enumeration they appeared
+after. `scripts/walkthrough.sh` reproduces the view the review was made against
+— it creates a program, enumerates twice and scans, and `--simulate-new HOST`
+plants a host between the enumerations so the second has one to mark.
+
+The review also turned up a question the implementation does not settle, filed
+as [041]: newness is read off the most recent distinct `first_seen_at`, and a
+mid-scan crawl discovery writes one of those just as an enumeration does, so a
+scan can change what reads as new without any enumeration having run.
 
 ## Out of scope
 

@@ -11,7 +11,8 @@ import {
   type XssConfirmImpl,
   type BodyFetchImpl,
 } from './active-scanner.js';
-import { discoverLinks } from './discovery.js';
+import { disallowedPrefixes, discoverLinks } from './discovery.js';
+import { hostCapFor, ProgramsService, type EnumeratedHost, type Scope } from './programs.js';
 import { findDisallowedAddress, isDisallowedAddress } from './ssrf-guard.js';
 import {
   detectHeaderFindings,
@@ -52,6 +53,9 @@ export type ScanWithTargets = Scan & {
 };
 
 export type StartScanOptions = {
+  // Draws this scan's targets from the program's host inventory in addition to
+  // any submitted URLs. Omitted, the scan is a legacy URL-only one.
+  programId?: number;
   name?: string;
   userAgent?: string;
   mode?: 'passive' | 'active';
@@ -75,6 +79,19 @@ function isAllowedUrl(raw: string): boolean {
 
 function dedupe(urls: string[]): string[] {
   return Array.from(new Set(urls));
+}
+
+// The form of a URL used only to decide whether two strings name the same
+// target. `https://example.com` and `https://example.com/` are one address, and
+// the inventory stores the first form while an operator's address bar yields
+// the second; comparing them raw books the host twice. Parsing failures fall
+// back to the original string — those URLs are rejected as invalid anyway.
+function sameTargetKey(raw: string): string {
+  try {
+    return new URL(raw).href;
+  } catch {
+    return raw;
+  }
 }
 
 function lowercaseHeaders(headers: Headers): Record<string, string> {
@@ -372,6 +389,26 @@ async function readHtmlBody(response: Response): Promise<string> {
 // root, per-root count, and which URLs are already a target) only makes sense for the
 // scan currently running, mirroring how cveCache/llmCache are scan-scoped.
 type DiscoveryContext = {
+  // The program this scan belongs to, if any, and its scope lists. With them,
+  // the crawl may cross to any in-scope host and every host it sees lands in
+  // the inventory; without them it stays on the submitted origin.
+  programId: number | null;
+  scope: Scope | null;
+  // One time for the whole run, stamped on every host the crawl records. Fixed
+  // here rather than read per page so that one scan reads as one run in the
+  // inventory, however many pages it happened to walk.
+  discoveredAt: Date;
+  // Disallow prefixes per origin, fetched once per run and shared by every page
+  // that links there. A scoped crawl crosses hosts, and a robots.txt speaks only
+  // for the origin it came from, so the linking page's copy cannot answer for
+  // them. Null means the host must not be crawled at all — its address is one
+  // the SSRF guard refuses.
+  robotsByOrigin: Map<string, Promise<string[] | null>>;
+  // Keyed by `sameTargetKey`, not by the raw string. A target's URL is whatever
+  // the operator submitted or the inventory resolved (`https://example.com`),
+  // while a discovered link has been through `new URL()` and comes back
+  // normalised (`https://example.com/`). Comparing them raw let a root page
+  // linking to `/` book itself a second time.
   seenUrls: Set<string>;
   depthOf: Map<number, number>;
   rootOf: Map<number, number>;
@@ -415,6 +452,9 @@ export class ScannerService {
   // that serve a fixture on 127.0.0.1 — deliberately a constructor option, not an
   // env var, so nothing in production can accidentally disable the guard.
   readonly #allowedHosts: Set<string>;
+  // Present only where scans can be run against a program. Null keeps a
+  // URL-only deployment from having to construct one.
+  readonly #programsService: ProgramsService | null;
 
   constructor(
     db: Db,
@@ -431,6 +471,7 @@ export class ScannerService {
       bodyFetchImpl?: BodyFetchImpl;
       browserConcurrency?: number;
       allowedHosts?: string[];
+      programsService?: ProgramsService;
     } = {},
   ) {
     this.#db = db;
@@ -450,6 +491,7 @@ export class ScannerService {
     this.#browserSemaphore = new Semaphore(options.browserConcurrency ?? 2);
     this.#fetchSemaphore = new Semaphore(this.#concurrency);
     this.#allowedHosts = new Set(options.allowedHosts ?? []);
+    this.#programsService = options.programsService ?? null;
     this.#tlsCheckImpl =
       options.tlsCheckImpl ?? ((hostname, port) => defaultTlsCheck(hostname, port, this.#timeoutMs));
     this.#osvCheckImpl = options.osvCheckImpl ?? defaultOsvCheck;
@@ -457,7 +499,10 @@ export class ScannerService {
   }
 
   async startScan(urls: string[], options: StartScanOptions = {}): Promise<Scan> {
-    if (urls.length === 0) throw new ScanValidationError('urls must not be empty');
+    const programId = options.programId ?? null;
+    // A program scan may submit no URLs at all — the inventory is the target
+    // list. Without one, an empty list is still the caller asking for nothing.
+    if (urls.length === 0 && programId === null) throw new ScanValidationError('urls must not be empty');
     if (urls.length > MAX_URLS) throw new ScanValidationError(`urls must not exceed ${MAX_URLS}`);
     if (options.mode === 'active' && options.confirmAuthorized !== true) {
       throw new ScanValidationError('mode: "active" requires confirmAuthorized: true');
@@ -471,7 +516,24 @@ export class ScannerService {
     const invalid = deduped.filter((u) => !isAllowedUrl(u));
 
     const now = new Date();
-    const hasValid = valid.length > 0;
+    const mode: ScanMode = options.mode ?? 'passive';
+    // Drawn before the scan row is written: on a program scan the inventory is
+    // what decides whether this run has anything to do at all.
+    const inventoryHosts = programId === null ? [] : await this.#selectInventoryHosts(programId, mode);
+    // `dedupe` only collapses repeats within the submitted list. A program scan
+    // draws a second list from the inventory, and an operator who submits a URL
+    // the inventory already covers would otherwise get two target rows for the
+    // one host: the same request twice, and every finding counted twice in the
+    // severity summary. The inventory row is the one kept — it carries the host
+    // link that says which host the result belongs to.
+    const inventoryUrls = new Set(
+      inventoryHosts
+        .map((host) => host.endpointUrl)
+        .filter((url) => url !== null)
+        .map(sameTargetKey),
+    );
+    const submitted = valid.filter((url) => !inventoryUrls.has(sameTargetKey(url)));
+    const hasValid = valid.length > 0 || inventoryHosts.length > 0;
 
     const [scan] = this.#db
       .insert(scans)
@@ -480,10 +542,11 @@ export class ScannerService {
         status: hasValid ? 'pending' : 'failed',
         urls: deduped,
         userAgent: options.userAgent ?? null,
-        mode: options.mode ?? 'passive',
+        mode,
+        programId,
         confirmAuthorized: options.confirmAuthorized ?? null,
         authorizationNote: options.authorizationNote ?? null,
-        error: hasValid ? null : 'no valid URLs to scan',
+        error: hasValid ? null : programId === null ? 'no valid URLs to scan' : 'no targets to scan',
         createdAt: now,
         completedAt: hasValid ? null : now,
       })
@@ -502,7 +565,7 @@ export class ScannerService {
 
     if (!hasValid) return scan;
 
-    const targetRows = valid.map((url) =>
+    const submittedRows = submitted.map((url) =>
       this.#db
         .insert(scanTargets)
         .values({ scanId: scan.id, url, status: 'pending' })
@@ -510,9 +573,35 @@ export class ScannerService {
         .get(),
     );
 
-    void this.#runScan(scan.id, targetRows, scan.userAgent ?? this.#defaultUserAgent, scan.mode);
+    // Inventory targets carry the host they came from, so results can tell an
+    // operator which targets they never submitted.
+    const inventoryRows = inventoryHosts.map((host) =>
+      this.#db
+        .insert(scanTargets)
+        .values({ scanId: scan.id, url: host.endpointUrl ?? '', status: 'pending', enumeratedHostId: host.id })
+        .returning()
+        .get(),
+    );
+    // Stamped at selection, not at completion: a run that crashes partway must
+    // not leave its hosts at the front of the queue forever.
+    await this.#programsService?.markHostsScanned(inventoryHosts.map((host) => host.id));
+
+    const targetRows = [...submittedRows, ...inventoryRows];
+
+    void this.#runScan(scan.id, targetRows, scan.userAgent ?? this.#defaultUserAgent, scan.mode, programId);
 
     return scan;
+  }
+
+  // The inventory hosts this run may reach, capped by mode and ordered so hosts
+  // that appeared since the last run are scanned first.
+  async #selectInventoryHosts(programId: number, mode: ScanMode): Promise<EnumeratedHost[]> {
+    if (this.#programsService === null) {
+      throw new ScanValidationError('this scanner was built without a programs service');
+    }
+    const program = await this.#programsService.getProgram(programId);
+    if (program === null) throw new ScanValidationError(`program ${programId} not found`);
+    return this.#programsService.selectHostsToScan(programId, hostCapFor(program, mode));
   }
 
   async getScan(id: number): Promise<ScanWithTargets | null> {
@@ -534,7 +623,13 @@ export class ScannerService {
     return this.#db.select().from(scans).orderBy(scans.createdAt).all().reverse();
   }
 
-  async #runScan(scanId: number, targetRows: ScanTarget[], userAgent: string, mode: ScanMode): Promise<void> {
+  async #runScan(
+    scanId: number,
+    targetRows: ScanTarget[],
+    userAgent: string,
+    mode: ScanMode,
+    programId: number | null,
+  ): Promise<void> {
     this.#db.update(scans).set({ status: 'running' }).where(eq(scans.id, scanId)).run();
 
     // Cached per scan run, not on the instance: the PRD requires CVE lookups to be
@@ -548,8 +643,18 @@ export class ScannerService {
     // Roots are the operator-submitted targets: depth 0, and their own discovery
     // budget. Discovery can add new rows to the queue mid-run, so this loop drains a
     // growing queue rather than iterating the fixed initial batch.
+    // Read once per run, not per page: the operator may edit the lists while a
+    // scan is in flight, and a crawl that changed its mind halfway would be
+    // impossible to reason about afterwards.
+    const scope =
+      programId === null || this.#programsService === null ? null : await this.#programsService.scopeOf(programId);
+
     const discovery: DiscoveryContext = {
-      seenUrls: new Set(targetRows.map((t) => t.url)),
+      programId,
+      scope,
+      discoveredAt: new Date(),
+      robotsByOrigin: new Map(),
+      seenUrls: new Set(targetRows.map((t) => sameTargetKey(t.url))),
       depthOf: new Map(targetRows.map((t) => [t.id, 0])),
       rootOf: new Map(targetRows.map((t) => [t.id, t.id])),
       discoveredCount: new Map(targetRows.map((t) => [t.id, new Budget(MAX_DISCOVERED_PER_ROOT)])),
@@ -707,7 +812,7 @@ export class ScannerService {
 
       // Discovery runs regardless of mode — it's non-intrusive HTML parsing, not a
       // payload-sending check, so it isn't gated behind the active-mode attestation.
-      const discovered = this.#discoverTargets(target, targetUrl, html, robotsBody, discovery);
+      const discovered = await this.#discoverTargets(target, targetUrl, html, robotsBody, userAgent, discovery);
 
       console.warn(`[scan ${target.scanId}] ${target.url} succeeded`);
       return discovered;
@@ -737,29 +842,54 @@ export class ScannerService {
   // operator-submitted root (walking `discoveredFrom` back to the root would also
   // work but requires a DB round-trip per target; the in-memory maps are scoped to
   // one #runScan call and cost nothing extra).
-  #discoverTargets(
+  async #discoverTargets(
     target: ScanTarget,
     targetUrl: URL,
     html: string,
     robotsTxt: string | null,
+    userAgent: string,
     discovery: DiscoveryContext,
-  ): ScanTarget[] {
+  ): Promise<ScanTarget[]> {
+    const { links, hostnames } = discoverLinks({ url: targetUrl, html }, robotsTxt, discovery.scope);
+
+    // Recorded before the depth cap is applied: a host named by a page is a host
+    // the operator should see in the inventory even when the crawl has run out of
+    // depth to visit it. Out-of-scope and unscoped hosts are recorded too —
+    // `recordHosts` classifies them, and neither is ever selected for a scan.
+    if (discovery.programId !== null && hostnames.length > 0) {
+      await this.#programsService?.recordHosts(
+        discovery.programId,
+        hostnames.map((hostname) => ({ hostname, source: 'crawl' as const })),
+        discovery.discoveredAt,
+      );
+    }
+
     const depth = discovery.depthOf.get(target.id) ?? 0;
     if (depth >= MAX_DISCOVERY_DEPTH) return [];
 
     const rootId = discovery.rootOf.get(target.id) ?? target.id;
-    const links = discoverLinks({ url: targetUrl, html }, robotsTxt);
     const rows: (typeof scanTargets.$inferInsert)[] = [];
 
     for (const url of links) {
-      if (discovery.seenUrls.has(url)) continue;
+      if (discovery.seenUrls.has(sameTargetKey(url))) continue;
+
+      // `discoverLinks` applied this page's robots.txt to this page's own host,
+      // which is all it speaks for. A candidate on another host is gated here
+      // instead, against that host's own rules — checked before the budget is
+      // consumed, so a URL we may not fetch does not spend a page of it.
+      const candidate = new URL(url);
+      if (candidate.hostname !== targetUrl.hostname) {
+        const prefixes = await this.#disallowedPrefixesFor(candidate, userAgent, discovery);
+        if (prefixes === null) continue;
+        if (prefixes.some((prefix) => candidate.pathname.startsWith(prefix))) continue;
+      }
 
       // Breaking here leaves the rest of this page's links out of `seenUrls`, so a
       // sibling page under another root can still reach them — intended: the cap is
       // per root, not a global "never visit this URL again".
       if (discovery.discoveredCount.get(rootId)?.tryConsume() !== true) break;
 
-      discovery.seenUrls.add(url);
+      discovery.seenUrls.add(sameTargetKey(url));
       rows.push({ scanId: target.scanId, url, status: 'pending', discoveredFrom: target.id });
     }
 
@@ -858,6 +988,25 @@ export class ScannerService {
         }),
       ),
     );
+  }
+
+  // One robots.txt per origin per run, memoised on the promise so that pages
+  // fetched concurrently share the single request rather than racing it.
+  async #disallowedPrefixesFor(origin: URL, userAgent: string, discovery: DiscoveryContext): Promise<string[] | null> {
+    const cached = discovery.robotsByOrigin.get(origin.origin);
+    if (cached !== undefined) return cached;
+
+    const pending = (async (): Promise<string[] | null> => {
+      // The candidate host has not cleared the SSRF guard yet — `#processTarget`
+      // only does that once a target exists — and fetching its robots.txt is
+      // already a request to it. Refused here means the crawl never goes near it.
+      if (!this.#allowedHosts.has(origin.hostname) && (await findDisallowedAddress(origin.hostname)) !== null) {
+        return null;
+      }
+      return disallowedPrefixes(await this.#fetchRobotsTxt(origin, userAgent, new Budget(1)));
+    })();
+    discovery.robotsByOrigin.set(origin.origin, pending);
+    return pending;
   }
 
   async #fetchRobotsTxt(targetUrl: URL, userAgent: string, budget: Budget): Promise<string | null> {

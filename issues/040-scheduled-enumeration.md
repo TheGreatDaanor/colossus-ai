@@ -1,7 +1,7 @@
 ---
 id: 040
 title: Enumerate each program on a schedule
-status: open
+status: done
 type: afk
 blocked-by: [032]
 ---
@@ -25,10 +25,10 @@ scans rather than only when someone remembers to run one.
 
 ## Definition of done
 
-- [ ] Failing test written first, confirmed red
-- [ ] Implementation makes it green
-- [ ] `test`, `typecheck`, `lint` all pass
-- [ ] Visible at: `GET /programs/:id` shows `last_enumerated_at` advancing
+- [x] Failing test written first, confirmed red
+- [x] Implementation makes it green
+- [x] `test`, `typecheck`, `lint` all pass
+- [x] Visible at: `GET /programs/:id` shows `last_enumerated_at` advancing
       with no scan having run; a failed scheduled run surfaces the error
       without clearing the inventory.
 

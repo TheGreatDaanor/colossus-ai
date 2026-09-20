@@ -6,6 +6,7 @@ import {
   classifyHost,
   ProgramValidationError,
   ProgramsService,
+  hostCapFor,
   type ProgramsServiceOptions,
   type Scope,
 } from './programs.js';
@@ -792,5 +793,288 @@ describe('ProgramsService.confirmScopeEntry', () => {
     const service = buildService();
 
     await expect(service.confirmScopeEntry(404, 1)).rejects.toThrow(ProgramValidationError);
+  });
+});
+
+describe('ProgramsService.selectHostsToScan', () => {
+  function buildEnumeratedService(hosts: string[], endpoints?: (hostname: string) => string | null) {
+    const resolve = endpoints ?? ((hostname: string) => `https://${hostname}`);
+    return buildService({
+      enumerationImpl: {
+        enumerate: async () => hosts.map((hostname) => ({ hostname, source: 'ct-log' as const })),
+        resolveEndpoint: async (hostname: string) => resolve(hostname),
+      },
+    });
+  }
+
+  async function programWithInventory(service: ProgramsService) {
+    const program = await service.createProgram({ url: 'https://example.com' });
+    for (const entry of program.scopeEntries) await service.confirmScopeEntry(program.id, entry.id);
+    await service.enumerateProgram(program.id);
+    return program;
+  }
+
+  it('caps the hosts one scan reaches at the limit it is given', async () => {
+    const service = buildEnumeratedService(['a.example.com', 'b.example.com', 'c.example.com', 'd.example.com']);
+    const program = await programWithInventory(service);
+
+    const selected = await service.selectHostsToScan(program.id, 2);
+
+    expect(selected).toHaveLength(2);
+  });
+
+  it('offers hosts no scan has reached ahead of hosts an earlier run covered', async () => {
+    const service = buildEnumeratedService(['a.example.com', 'b.example.com', 'c.example.com']);
+    const program = await programWithInventory(service);
+    const first = await service.selectHostsToScan(program.id, 2);
+    await service.markHostsScanned(first.map((host) => host.id));
+
+    const second = await service.selectHostsToScan(program.id, 2);
+
+    expect(second.map((host) => host.hostname)).toEqual(['c.example.com', 'a.example.com']);
+  });
+
+  it('skips a host that has never answered, since there is no endpoint to scan', async () => {
+    const service = buildEnumeratedService(['a.example.com', 'b.example.com'], (hostname) =>
+      hostname === 'a.example.com' ? null : `https://${hostname}`,
+    );
+    const program = await programWithInventory(service);
+
+    const selected = await service.selectHostsToScan(program.id, 10);
+
+    expect(selected.map((host) => host.hostname)).toEqual(['b.example.com']);
+  });
+});
+
+describe('hostCapFor', () => {
+  it('caps active scans far below passive ones, since each active target also drives a browser', async () => {
+    const service = buildService();
+    const program = await service.createProgram({ name: 'acme' });
+
+    expect(hostCapFor(program, 'passive')).toBe(250);
+    expect(hostCapFor(program, 'active')).toBe(50);
+  });
+
+  it('lets a program override either mode default', async () => {
+    const service = buildService();
+    const program = await service.createProgram({ name: 'acme', passiveHostCap: 10, activeHostCap: 3 });
+
+    expect(hostCapFor(program, 'passive')).toBe(10);
+    expect(hostCapFor(program, 'active')).toBe(3);
+  });
+});
+
+describe('ProgramsService.listInventory', () => {
+  // Each call answers with the next batch, so a service built with two batches
+  // and enumerated twice is a program whose second run found a host the first
+  // did not — the shadow-IT case this view exists for.
+  function enumerationOf(batches: string[][]) {
+    let call = 0;
+    return {
+      enumerate: async () => {
+        const batch = batches[Math.min(call, batches.length - 1)] ?? [];
+        call += 1;
+        return batch.map((hostname) => ({ hostname, source: 'ct-log' as const }));
+      },
+    };
+  }
+
+  // Enumeration times are stored to the second, so each run is given its own
+  // day: two runs in the same second would be indistinguishable as batches, and
+  // real enumerations are hours or days apart.
+  function clock() {
+    let day = 0;
+    return () => new Date(Date.UTC(2026, 0, (day += 1)));
+  }
+
+  async function enumeratedProgram(service: ProgramsService, runs: number) {
+    const program = await service.createProgram({ url: 'https://example.com' });
+    await service.confirmScopeEntry(program.id, program.scopeEntries[0]!.id);
+    for (let i = 0; i < runs; i += 1) await service.enumerateProgram(program.id);
+    return program;
+  }
+
+  it('marks no host as new on the first enumeration, when there is nothing to have appeared since', async () => {
+    const service = buildService({ now: clock(), enumerationImpl: enumerationOf([['a.example.com', 'b.example.com']]) });
+    const program = await enumeratedProgram(service, 1);
+
+    const inventory = await service.listInventory(program.id);
+    expect(inventory.hosts.map((host) => host.isNew)).toEqual([false, false]);
+    expect(inventory.newSince).toBeNull();
+  });
+
+  it('marks only the hosts that appeared in the latest enumeration as new', async () => {
+    const service = buildService({
+      now: clock(),
+      enumerationImpl: enumerationOf([['a.example.com'], ['a.example.com', 'b.example.com']]),
+    });
+    const program = await enumeratedProgram(service, 2);
+
+    const inventory = await service.listInventory(program.id);
+    expect(inventory.hosts.map((host) => [host.hostname, host.isNew])).toEqual([
+      ['a.example.com', false],
+      ['b.example.com', true],
+    ]);
+    expect(inventory.newSince).toBeInstanceOf(Date);
+  });
+
+  it('stops a host reading as new once a later enumeration has found another', async () => {
+    const service = buildService({
+      now: clock(),
+      enumerationImpl: enumerationOf([
+        ['a.example.com'],
+        ['a.example.com', 'b.example.com'],
+        ['a.example.com', 'b.example.com', 'c.example.com'],
+      ]),
+    });
+    const program = await enumeratedProgram(service, 3);
+
+    const inventory = await service.listInventory(program.id);
+    expect(inventory.hosts.filter((host) => host.isNew).map((host) => host.hostname)).toEqual(['c.example.com']);
+  });
+});
+
+describe('ProgramsService.enumerateDuePrograms', () => {
+  async function confirmedProgram(service: ProgramsService, url: string) {
+    const program = await service.createProgram({ url });
+    await service.confirmScopeEntry(program.id, program.scopeEntries[0]!.id);
+    return program;
+  }
+
+  function enumerationCounter() {
+    const apexes: string[] = [];
+    return {
+      apexes,
+      impl: {
+        enumerate: async (apex: string) => {
+          apexes.push(apex);
+          return [{ hostname: `a.${apex}`, source: 'ct-log' as const }];
+        },
+      },
+    };
+  }
+
+  it('enumerates a program that has never been enumerated', async () => {
+    const counter = enumerationCounter();
+    const service = buildService({ enumerationImpl: counter.impl });
+    const program = await confirmedProgram(service, 'https://example.com');
+
+    expect(await service.enumerateDuePrograms({ cadenceMs: 60_000 })).toEqual([program.id]);
+    expect((await service.getProgram(program.id))?.lastEnumeratedAt).toBeInstanceOf(Date);
+  });
+
+  it('skips a program enumerated more recently than the cadence', async () => {
+    const counter = enumerationCounter();
+    const service = buildService({ enumerationImpl: counter.impl });
+    const program = await confirmedProgram(service, 'https://example.com');
+    await service.enumerateProgram(program.id);
+
+    expect(await service.enumerateDuePrograms({ cadenceMs: 60_000 })).toEqual([]);
+    expect(counter.apexes).toEqual(['example.com']);
+  });
+
+  it('re-enumerates a program once its cadence has elapsed', async () => {
+    const counter = enumerationCounter();
+    const service = buildService({ enumerationImpl: counter.impl });
+    const program = await confirmedProgram(service, 'https://example.com');
+    await service.enumerateProgram(program.id);
+
+    expect(await service.enumerateDuePrograms({ cadenceMs: 0 })).toEqual([program.id]);
+    expect(counter.apexes).toEqual(['example.com', 'example.com']);
+  });
+
+  it('surfaces a source outage on the program without clearing the inventory it already had', async () => {
+    let fail = false;
+    const service = buildService({
+      enumerationImpl: {
+        enumerate: async () => {
+          if (fail) throw new EnumerationError('crt.sh: 503 Service Unavailable');
+          return [{ hostname: 'a.example.com', source: 'ct-log' as const }];
+        },
+      },
+    });
+    const program = await confirmedProgram(service, 'https://example.com');
+    await service.enumerateProgram(program.id);
+    const stamped = (await service.getProgram(program.id))?.lastEnumeratedAt;
+
+    fail = true;
+    expect(await service.enumerateDuePrograms({ cadenceMs: 0 })).toEqual([program.id]);
+
+    const after = await service.getProgram(program.id);
+    expect(after?.enumerationError).toContain('503');
+    // The failed attempt read no source, so it left the inventory exactly as
+    // stale as it was rather than claiming a fresh read.
+    expect(after?.lastEnumeratedAt?.getTime()).toBe(stamped?.getTime());
+    expect((await service.listHosts(program.id)).map((host) => host.hostname)).toEqual(['a.example.com']);
+  });
+
+  it('keeps enumerating the remaining programs when one throws outright', async () => {
+    const service = buildService({
+      enumerationImpl: {
+        enumerate: async (apex: string) => {
+          if (apex === 'broken.com') throw new Error('resolver exploded');
+          return [{ hostname: `a.${apex}`, source: 'ct-log' as const }];
+        },
+      },
+    });
+    const broken = await confirmedProgram(service, 'https://broken.com');
+    const healthy = await confirmedProgram(service, 'https://example.com');
+
+    expect(await service.enumerateDuePrograms({ cadenceMs: 0 })).toEqual([healthy.id]);
+    expect((await service.getProgram(broken.id))?.enumerationError).toContain('resolver exploded');
+    expect((await service.listHosts(healthy.id)).map((host) => host.hostname)).toEqual(['a.example.com']);
+  });
+
+  it('waits out the cadence before retrying a program whose sources were all down', async () => {
+    let clock = 1_700_000_000_000;
+    const counter = { calls: 0 };
+    const service = buildService({
+      now: () => new Date(clock),
+      enumerationImpl: {
+        enumerate: async () => {
+          counter.calls += 1;
+          throw new EnumerationError('crt.sh: 503 Service Unavailable');
+        },
+      },
+    });
+    await confirmedProgram(service, 'https://example.com');
+
+    await service.enumerateDuePrograms({ cadenceMs: 60_000 });
+    expect(counter.calls).toBe(1);
+
+    // A pass a second later must not try again: a program whose source is down
+    // is not thereby owed enumeration at the scheduler's frequency rather than
+    // its own cadence.
+    clock += 1_000;
+    await service.enumerateDuePrograms({ cadenceMs: 60_000 });
+    expect(counter.calls).toBe(1);
+
+    clock += 60_000;
+    await service.enumerateDuePrograms({ cadenceMs: 60_000 });
+    expect(counter.calls).toBe(2);
+  });
+
+  it('waits out the cadence before retrying a program whose enumeration threw outright', async () => {
+    let clock = 1_700_000_000_000;
+    const counter = { calls: 0 };
+    const service = buildService({
+      now: () => new Date(clock),
+      enumerationImpl: {
+        enumerate: async () => {
+          counter.calls += 1;
+          throw new Error('resolver exploded');
+        },
+      },
+    });
+    await confirmedProgram(service, 'https://example.com');
+
+    await service.enumerateDuePrograms({ cadenceMs: 60_000 });
+    clock += 1_000;
+    await service.enumerateDuePrograms({ cadenceMs: 60_000 });
+    expect(counter.calls).toBe(1);
+
+    clock += 60_000;
+    await service.enumerateDuePrograms({ cadenceMs: 60_000 });
+    expect(counter.calls).toBe(2);
   });
 });

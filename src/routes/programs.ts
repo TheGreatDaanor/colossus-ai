@@ -2,7 +2,7 @@ import { Hono } from 'hono';
 import {
   isDormant,
   ProgramValidationError,
-  type EnumeratedHost,
+  type InventoryHost,
   type AddScopeEntryOptions,
   type CreateProgramOptions,
   type ProgramWithScope,
@@ -57,7 +57,7 @@ function serializeScopeEntry(entry: ScopeEntry) {
   return { ...rest, program_id: programId, confirmed_at: confirmedAt, authorization_notice: authorizationNotice(entry) };
 }
 
-function serializeHost(host: EnumeratedHost) {
+function serializeHost(host: InventoryHost) {
   // Listed field by field rather than spread: the row carries the raw failure
   // counter, and a spread would put it on the wire by accident.
   return {
@@ -74,6 +74,10 @@ function serializeHost(host: EnumeratedHost) {
     // the count would only re-derive it and drift from it.
     is_dormant: isDormant(host),
     first_seen_at: host.firstSeenAt,
+    // Whether this host appeared in the most recent enumeration. It sits beside
+    // the rest of the host's facts and carries no severity or category: a host
+    // that has just appeared is something to look at, not a defect.
+    is_new: host.isNew,
   };
 }
 
@@ -191,9 +195,14 @@ export function createProgramsRoutes(service: ProgramsService): Hono {
 
     // The service records a source outage on the program rather than throwing,
     // so this is still a 200: the operator gets the inventory plus the reason.
-    const hosts = await service.enumerateProgram(id);
+    await service.enumerateProgram(id);
+    const inventory = await service.listInventory(id);
     const program = await service.getProgram(id);
-    return c.json({ hosts: hosts.map(serializeHost), enumeration_error: program?.enumerationError ?? null });
+    return c.json({
+      hosts: inventory.hosts.map(serializeHost),
+      new_since: inventory.newSince,
+      enumeration_error: program?.enumerationError ?? null,
+    });
   });
 
   app.get('/programs/:id/hosts', async (c) => {
@@ -203,8 +212,14 @@ export function createProgramsRoutes(service: ProgramsService): Hono {
     const program = await service.getProgram(id);
     if (!program) return c.json({ error: 'program not found' }, 404);
 
-    const hosts = await service.listHosts(id);
-    return c.json({ hosts: hosts.map(serializeHost), enumeration_error: program.enumerationError });
+    const inventory = await service.listInventory(id);
+    return c.json({
+      hosts: inventory.hosts.map(serializeHost),
+      // When the previous enumeration ran — the point the hosts marked `is_new`
+      // appeared after. Null until a program has been enumerated twice.
+      new_since: inventory.newSince,
+      enumeration_error: program.enumerationError,
+    });
   });
 
   return app;

@@ -1,0 +1,1 @@
+ALTER TABLE `programs` ADD `last_attempted_at` integer;

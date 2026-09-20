@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import { createDb } from '../db/client.js';
 import { ScannerService, type FetchImpl, type TlsCheckImpl } from '../services/scanner.js';
+import { ProgramsService } from '../services/programs.js';
 import { createScansRoutes } from './scans.js';
 
 function okResponse(): Response {
@@ -31,6 +32,63 @@ function buildApp(fetchImpl: FetchImpl = vi.fn(async () => okResponse())) {
   const service = new ScannerService(db, { fetchImpl, tlsCheckImpl: okTlsCheckImpl() });
   return { app: createScansRoutes(service), service };
 }
+
+describe('POST /scans against a program', () => {
+  async function buildProgramApp() {
+    const db = createDb(':memory:');
+    const programsService = new ProgramsService(db, {
+      enumerationImpl: {
+        enumerate: async () => [{ hostname: 'a.example.com', source: 'ct-log' as const }],
+        resolveEndpoint: async (hostname: string) => `https://${hostname}`,
+      },
+    });
+    const program = await programsService.createProgram({ url: 'https://example.com' });
+    for (const entry of program.scopeEntries) await programsService.confirmScopeEntry(program.id, entry.id);
+    await programsService.enumerateProgram(program.id);
+    const service = new ScannerService(db, {
+      fetchImpl: () => new Promise(() => {}),
+      tlsCheckImpl: okTlsCheckImpl(),
+      programsService,
+    });
+    return { app: createScansRoutes(service), service, program };
+  }
+
+  it('starts a scan with no submitted URLs, drawing targets from the program inventory', async () => {
+    const { app, service, program } = await buildProgramApp();
+
+    const res = await app.request('/scans', {
+      method: 'POST',
+      body: JSON.stringify({ urls: [], programId: program.id }),
+    });
+
+    expect(res.status).toBe(201);
+    const scan = await json<ScanBody>(res);
+    const stored = await service.getScan(scan.id);
+    expect(stored?.targets.map((t) => t.url)).toEqual(['https://a.example.com']);
+  });
+
+  it('rejects a non-numeric programId', async () => {
+    const { app } = await buildProgramApp();
+
+    const res = await app.request('/scans', {
+      method: 'POST',
+      body: JSON.stringify({ urls: [], programId: 'one' }),
+    });
+
+    expect(res.status).toBe(400);
+  });
+
+  it('returns 400 when the program does not exist', async () => {
+    const { app } = await buildProgramApp();
+
+    const res = await app.request('/scans', {
+      method: 'POST',
+      body: JSON.stringify({ urls: [], programId: 404 }),
+    });
+
+    expect(res.status).toBe(400);
+  });
+});
 
 describe('POST /scans', () => {
   it('returns 201 with an id and pending status for a valid submission', async () => {

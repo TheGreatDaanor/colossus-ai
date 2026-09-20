@@ -48,11 +48,21 @@ function findingsTable(findingList: Finding[]): string {
   return `<table><thead><tr>${header}</tr></thead><tbody>${rows}</tbody></table>`;
 }
 
+// Where a target came from: the operator's own submission, a host the program's
+// inventory turned up, or a link the crawl followed. An operator reading results
+// needs to tell them apart — they never typed most of these URLs.
+function targetSource(target: ScanTarget): string {
+  if (target.enumeratedHostId !== null) return 'inventory';
+  if (target.discoveredFrom !== null) return 'discovered';
+  return 'submitted';
+}
+
 function targetsTable(targets: (ScanTarget & { findings: Finding[] })[]): string {
   const rows = targets
     .map(
       (target) => `<tr>
         <td>${escapeHtml(target.url)}</td>
+        <td>${targetSource(target)}</td>
         <td>${escapeHtml(target.status)}</td>
         <td>${target.statusCode ?? ''}</td>
         <td>${target.responseTimeMs ?? ''}</td>
@@ -64,7 +74,7 @@ function targetsTable(targets: (ScanTarget & { findings: Finding[] })[]): string
     .join('');
 
   return `<table>
-    <thead><tr><th>url</th><th>status</th><th>status_code</th><th>response_time_ms</th><th>redirect_location</th><th>error</th><th>findings</th></tr></thead>
+    <thead><tr><th>url</th><th>source</th><th>status</th><th>status_code</th><th>response_time_ms</th><th>redirect_location</th><th>error</th><th>findings</th></tr></thead>
     <tbody>${rows}</tbody>
   </table>`;
 }

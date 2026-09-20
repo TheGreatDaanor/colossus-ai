@@ -31,6 +31,9 @@ export const scans = sqliteTable('scans', {
   userAgent: text('user_agent'),
   mode: text('mode').$type<ScanMode>().notNull().default('passive'),
   confirmAuthorized: integer('confirm_authorized', { mode: 'boolean' }),
+  // The program whose inventory this scan drew targets from. Null on a legacy
+  // URL-only scan, which behaves exactly as it did before programs existed.
+  programId: integer('program_id').references(() => programs.id),
   authorizationNote: text('authorization_note'),
   error: text('error'),
   createdAt: integer('created_at', { mode: 'timestamp' }).notNull(),
@@ -53,6 +56,9 @@ export const scanTargets = sqliteTable('scan_targets', {
   injectionAttempts: text('injection_attempts', { mode: 'json' }).$type<InjectionAttempt[]>(),
   error: text('error'),
   discoveredFrom: integer('discovered_from').references((): AnySQLiteColumn => scanTargets.id),
+  // The inventory host this target came from, so results can show which targets
+  // the operator never submitted. Null for a submitted or crawl-discovered URL.
+  enumeratedHostId: integer('enumerated_host_id').references((): AnySQLiteColumn => enumeratedHosts.id),
 });
 
 export const findings = sqliteTable('findings', {
@@ -89,6 +95,11 @@ export const programs = sqliteTable('programs', {
   activeHostCap: integer('active_host_cap'),
   enumerationError: text('enumeration_error'),
   lastEnumeratedAt: integer('last_enumerated_at', { mode: 'timestamp' }),
+  // When enumeration was last *tried*, as distinct from last succeeded. The
+  // scheduler paces itself on this: a program whose source is down never
+  // advances `lastEnumeratedAt`, and pacing on that would make every failing
+  // program due on every pass rather than once per cadence.
+  lastAttemptedAt: integer('last_attempted_at', { mode: 'timestamp' }),
   createdAt: integer('created_at', { mode: 'timestamp' }).notNull(),
 });
 
@@ -136,6 +147,10 @@ export const enumeratedHosts = sqliteTable(
     // has gone dark keeps its row and its history rather than being dropped:
     // NXDOMAIN on a host that still CNAMEs somewhere is itself a takeover signal.
     failedResolutions: integer('failed_resolutions').notNull().default(0),
+    // When a scan last drew a target from this host. Null until it has been
+    // scanned once, which is what puts a newly appeared host at the front of
+    // the queue ahead of hosts already covered by an earlier run.
+    lastScannedAt: integer('last_scanned_at', { mode: 'timestamp' }),
     firstSeenAt: integer('first_seen_at', { mode: 'timestamp' }).notNull(),
   },
   (table) => [uniqueIndex('enumerated_hosts_program_hostname').on(table.programId, table.hostname)],

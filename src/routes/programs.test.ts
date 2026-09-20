@@ -15,7 +15,13 @@ type ScopeEntryBody = {
   confirmed_at: string | null;
   authorization_notice: string | null;
 };
-type ProgramBody = { id: number; name: string; scope_entries: ScopeEntryBody[] };
+type ProgramBody = {
+  id: number;
+  name: string;
+  scope_entries: ScopeEntryBody[];
+  last_enumerated_at: string | null;
+  enumeration_error: string | null;
+};
 type ClassifyBody = { host: string; status: string };
 type ErrorBody = { error: string };
 type HostBody = {
@@ -27,8 +33,9 @@ type HostBody = {
   endpoint_url: string | null;
   last_resolved_at: string | null;
   is_dormant: boolean;
+  is_new: boolean;
 };
-type HostsBody = { hosts: HostBody[]; enumeration_error: string | null };
+type HostsBody = { hosts: HostBody[]; enumeration_error: string | null; new_since: string | null };
 
 function buildApp(options: ProgramsServiceOptions = {}) {
   const service = new ProgramsService(createDb(':memory:'), options);
@@ -421,5 +428,95 @@ describe('GET /programs/:id/hosts', () => {
     const { app } = buildApp();
 
     expect((await app.request('/programs/404/hosts')).status).toBe(404);
+  });
+});
+
+describe('GET /programs/:id/hosts — hosts that appeared since last time', () => {
+  // Enumeration times are stored to the second, so each run is given its own
+  // day: two runs in the same second would be indistinguishable as batches.
+  function clock() {
+    let day = 0;
+    return () => new Date(Date.UTC(2026, 0, (day += 1)));
+  }
+
+  function enumerationOf(batches: string[][]) {
+    let call = 0;
+    return {
+      enumerate: async () => {
+        const batch = batches[Math.min(call, batches.length - 1)] ?? [];
+        call += 1;
+        return batch.map((hostname) => ({ hostname, source: 'ct-log' as const }));
+      },
+    };
+  }
+
+  it('marks nothing as new after a first enumeration', async () => {
+    const { app } = buildApp({ now: clock(), enumerationImpl: enumerationOf([['a.example.com']]) });
+    const program = await createConfirmedProgram(app, 'https://example.com');
+    await postJson(app, `/programs/${program.id}/enumerate`, {});
+
+    const body = await json<HostsBody>(await app.request(`/programs/${program.id}/hosts`));
+    expect(body.hosts.map((host) => host.is_new)).toEqual([false]);
+    expect(body.new_since).toBeNull();
+  });
+
+  it('distinguishes the hosts that appeared in the second enumeration', async () => {
+    const { app } = buildApp({
+      now: clock(),
+      enumerationImpl: enumerationOf([['a.example.com'], ['a.example.com', 'b.example.com']]),
+    });
+    const program = await createConfirmedProgram(app, 'https://example.com');
+    await postJson(app, `/programs/${program.id}/enumerate`, {});
+    await postJson(app, `/programs/${program.id}/enumerate`, {});
+
+    const body = await json<HostsBody>(await app.request(`/programs/${program.id}/hosts`));
+    expect(body.hosts.map((host) => [host.hostname, host.is_new])).toEqual([
+      ['a.example.com', false],
+      ['b.example.com', true],
+    ]);
+    expect(body.new_since).not.toBeNull();
+    // A new host is reported as inventory, never as a finding: nothing on the
+    // wire gives it a severity or a category.
+    expect(Object.keys(body.hosts[1]!)).not.toContain('severity');
+  });
+});
+
+describe('GET /programs/:id — scheduled enumeration', () => {
+  it('shows last_enumerated_at advancing after a scheduled pass, with no scan having run', async () => {
+    const { app, service } = buildApp({
+      enumerationImpl: { enumerate: async () => [{ hostname: 'a.example.com', source: 'ct-log' as const }] },
+    });
+    const program = await createConfirmedProgram(app, 'https://example.com');
+
+    const before = await json<ProgramBody>(await app.request(`/programs/${program.id}`));
+    expect(before.last_enumerated_at).toBeNull();
+
+    await service.enumerateDuePrograms({ cadenceMs: 0 });
+
+    const after = await json<ProgramBody>(await app.request(`/programs/${program.id}`));
+    expect(after.last_enumerated_at).not.toBeNull();
+    expect(after.enumeration_error).toBeNull();
+  });
+
+  it('surfaces a failed scheduled run without clearing the inventory', async () => {
+    let fail = false;
+    const { app, service } = buildApp({
+      enumerationImpl: {
+        enumerate: async () => {
+          if (fail) throw new EnumerationError('crt.sh: 503 Service Unavailable');
+          return [{ hostname: 'a.example.com', source: 'ct-log' as const }];
+        },
+      },
+    });
+    const program = await createConfirmedProgram(app, 'https://example.com');
+    await service.enumerateDuePrograms({ cadenceMs: 0 });
+
+    fail = true;
+    await service.enumerateDuePrograms({ cadenceMs: 0 });
+
+    const after = await json<ProgramBody>(await app.request(`/programs/${program.id}`));
+    expect(after.enumeration_error).toContain('503');
+    const hosts = await json<HostsBody>(await app.request(`/programs/${program.id}/hosts`));
+    expect(hosts.hosts.map((host) => host.hostname)).toEqual(['a.example.com']);
   });
 });
