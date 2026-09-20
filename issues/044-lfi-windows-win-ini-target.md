@@ -1,7 +1,7 @@
 ---
 id: 044
 title: Deepen LFI to catch Windows targets via a win.ini traversal
-status: open
+status: done
 type: afk
 blocked-by: []
 ---

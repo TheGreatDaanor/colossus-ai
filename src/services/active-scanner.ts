@@ -413,18 +413,24 @@ export const sqliInjectionClass: InjectionClass = makeSqliInjectionClass();
 // systems. Enough `../` to climb out of any plausible include directory; the depth
 // is harmless when it overshoots, since a leading-slash-normalised path still lands
 // on the filesystem root.
-const LFI_PAYLOAD = '../../../../etc/passwd';
+// Two traversal payloads, one per OS family: `/etc/passwd` on Unix and `win.ini` on
+// Windows/IIS, so a vulnerable host doesn't read clean just because it isn't Unix.
+// Enough `../` (and `..\`) to climb out of any plausible include directory; the depth
+// is harmless when it overshoots, since a leading-slash-normalised path still lands
+// on the filesystem root.
+const LFI_PAYLOADS = ['../../../../etc/passwd', '..\\..\\..\\..\\windows\\win.ini'];
 
-// The `/etc/passwd` signature: the root account's entry, uid and gid zero. A line
-// this shaped doesn't appear on a page by accident, and its presence proves the
+// Signatures for the two target files. The `/etc/passwd` one matches the root account's
+// entry, uid and gid zero. The `win.ini` one matches its canonical section headers.
+// A line either shape doesn't appear on a page by accident, and its presence proves the
 // traversal resolved to the real file rather than being echoed as a string.
-const PASSWD_SIGNATURE = /root:.*:0:0:/;
+const FILE_SIGNATURES = [/root:.*:0:0:/, /^\s*\[(?:fonts|extensions)\]\s*$/im];
 
-// The first line of the body carrying the passwd signature, so the finding's evidence
+// The first line of the body carrying either file signature, so the finding's evidence
 // quotes the line that proved the inclusion rather than the whole file.
-function matchedPasswdLine(body: string): string | null {
+function matchedFileLine(body: string): string | null {
   for (const line of body.split(/\r?\n/)) {
-    if (PASSWD_SIGNATURE.test(line)) return line.trim();
+    if (FILE_SIGNATURES.some((signature) => signature.test(line))) return line.trim();
   }
   return null;
 }
@@ -439,15 +445,16 @@ function lfiBaselineUrlFor(point: InjectionPoint): string {
 }
 
 // Local file inclusion as an InjectionClass: enumeration mutates each query param with a
-// path-traversal payload toward `/etc/passwd`; confirmation fetches the injected and a
-// baseline response and confirms iff the passwd signature appears in the injected body
-// and was absent from the baseline. A page that echoes the payload or 404s (no signature)
+// path-traversal payload toward `/etc/passwd` (Unix) and `win.ini` (Windows); confirmation
+// fetches the injected and a baseline response and confirms iff a file signature appears in
+// the injected body and was absent from the baseline. A page that echoes the payload or 404s
 // is `not_vulnerable`; a page that shows the signature unconditionally is `not_vulnerable`;
 // a fetch that fails is `unavailable`.
 export function makeLfiInjectionClass(fetchImpl: BodyFetchImpl = guardedFetchText): InjectionClass {
   return {
     category: 'lfi',
-    enumerate: (target) => enumerateInjectionPoints(target, () => LFI_PAYLOAD),
+    enumerate: (target) =>
+      LFI_PAYLOADS.flatMap((payload) => enumerateInjectionPoints(target, () => payload)),
     confirm: async (point) => {
       let injectedBody: string;
       try {
@@ -456,8 +463,8 @@ export function makeLfiInjectionClass(fetchImpl: BodyFetchImpl = guardedFetchTex
         return { outcome: 'unavailable', error: `injection fetch failed: ${errorMessage(err)}` };
       }
 
-      const passwdLine = matchedPasswdLine(injectedBody);
-      if (passwdLine === null) return { outcome: 'not_vulnerable' };
+      const fileLine = matchedFileLine(injectedBody);
+      if (fileLine === null) return { outcome: 'not_vulnerable' };
 
       // The signature is present, but only the traversal proves it: if the baseline shows
       // it too, the page emits it unconditionally. A baseline we can't fetch can't clear
@@ -468,9 +475,9 @@ export function makeLfiInjectionClass(fetchImpl: BodyFetchImpl = guardedFetchTex
       } catch (err) {
         return { outcome: 'unavailable', error: `baseline fetch failed: ${errorMessage(err)}` };
       }
-      if (matchedPasswdLine(baselineBody) !== null) return { outcome: 'not_vulnerable' };
+      if (matchedFileLine(baselineBody) !== null) return { outcome: 'not_vulnerable' };
 
-      return { outcome: 'confirmed', evidenceSnippet: passwdLine };
+      return { outcome: 'confirmed', evidenceSnippet: fileLine };
     },
   };
 }

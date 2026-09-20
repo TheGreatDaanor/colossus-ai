@@ -256,12 +256,17 @@ describe('lfiInjectionClass', () => {
     expect(makeLfiInjectionClass(fetchText).category).toBe('lfi');
   });
 
-  it('enumerates one injection point per query parameter', () => {
+  const WIN_INI = '; for 16-bit app support\n[fonts]\n[extensions]\n[mci extensions]';
+
+  it('enumerates a Unix and a Windows traversal per query parameter', () => {
     const points = makeLfiInjectionClass(fetchText).enumerate(
       new URL('https://example.com/p?a=1&b=2'),
     );
 
-    expect(points.map((p) => p.injectionPoint).sort()).toEqual(['a', 'b']);
+    expect(points.map((p) => p.injectionPoint).sort()).toEqual(['a', 'a', 'b', 'b']);
+    const payloads = points.map((p) => p.payload);
+    expect(payloads.some((p) => p.includes('etc/passwd'))).toBe(true);
+    expect(payloads.some((p) => p.includes('win.ini'))).toBe(true);
   });
 
   it('confirms and captures the passwd line when the traversal payload returns /etc/passwd', async () => {
@@ -288,6 +293,39 @@ describe('lfiInjectionClass', () => {
     const [point] = lfi.enumerate(new URL(`${origin}/?q=seed`));
 
     const result = await lfi.confirm(point!);
+
+    expect(result.outcome).toBe('not_vulnerable');
+    expect(result.evidenceSnippet).toBeUndefined();
+  });
+
+  it('confirms and captures the win.ini line when the traversal payload returns win.ini', async () => {
+    // A vulnerable Windows/IIS endpoint: the win.ini traversal resolves to the real
+    // file; the passwd traversal and a neutral value return a clean page.
+    const origin = await fixture((q) =>
+      q.includes('win.ini')
+        ? WIN_INI
+        : `<html><body>results for ${q}</body></html>`,
+    );
+    const lfi = makeLfiInjectionClass(fetchText);
+    const winPoint = lfi
+      .enumerate(new URL(`${origin}/?q=seed`))
+      .find((p) => p.payload.includes('win.ini'));
+
+    const result = await lfi.confirm(winPoint!);
+
+    expect(result.outcome).toBe('confirmed');
+    expect(result.evidenceSnippet).toContain('[fonts]');
+  });
+
+  it('reports not_vulnerable when the win.ini signature is already in the baseline', async () => {
+    // The signature is present regardless of the payload, so the differential fails.
+    const origin = await fixture(() => WIN_INI);
+    const lfi = makeLfiInjectionClass(fetchText);
+    const winPoint = lfi
+      .enumerate(new URL(`${origin}/?q=seed`))
+      .find((p) => p.payload.includes('win.ini'));
+
+    const result = await lfi.confirm(winPoint!);
 
     expect(result.outcome).toBe('not_vulnerable');
     expect(result.evidenceSnippet).toBeUndefined();
