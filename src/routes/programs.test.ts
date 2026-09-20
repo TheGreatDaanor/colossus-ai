@@ -8,11 +8,26 @@ async function json<T>(res: Response): Promise<T> {
   return (await res.json()) as T;
 }
 
-type ScopeEntryBody = { id: number; list: string; pattern: string; confirmed_at: string | null };
+type ScopeEntryBody = {
+  id: number;
+  list: string;
+  pattern: string;
+  confirmed_at: string | null;
+  authorization_notice: string | null;
+};
 type ProgramBody = { id: number; name: string; scope_entries: ScopeEntryBody[] };
 type ClassifyBody = { host: string; status: string };
 type ErrorBody = { error: string };
-type HostBody = { id: number; hostname: string; source: string; scope_status: string; is_wildcard: boolean };
+type HostBody = {
+  id: number;
+  hostname: string;
+  source: string;
+  scope_status: string;
+  is_wildcard: boolean;
+  endpoint_url: string | null;
+  last_resolved_at: string | null;
+  is_dormant: boolean;
+};
 type HostsBody = { hosts: HostBody[]; enumeration_error: string | null };
 
 function buildApp(options: ProgramsServiceOptions = {}) {
@@ -26,6 +41,17 @@ function postJson(app: ReturnType<typeof buildApp>['app'], path: string, body: u
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify(body),
   });
+}
+
+// Creates a program from a URL and confirms its inferred apex through the route,
+// so tests of enumeration and the inventory exercise those rather than the
+// confirmation gate (issue 033), which has its own tests.
+async function createConfirmedProgram(app: ReturnType<typeof buildApp>['app'], url: string): Promise<ProgramBody> {
+  const created = await json<ProgramBody>(await postJson(app, '/programs', { url }));
+  for (const entry of created.scope_entries) {
+    await app.request(`/programs/${created.id}/scope/${entry.id}/confirm`, { method: 'POST' });
+  }
+  return created;
 }
 
 describe('POST /programs', () => {
@@ -180,6 +206,60 @@ describe('DELETE /programs/:id/scope/:entryId', () => {
   });
 });
 
+describe('POST /programs/:id/scope/:entryId/confirm', () => {
+  it('confirms an inferred entry so enumeration may run against it', async () => {
+    const { app } = buildApp();
+    const created = await json<ProgramBody>(await postJson(app, '/programs', { url: 'https://example.com' }));
+    const entry = created.scope_entries[0];
+    if (!entry) throw new Error('expected a seeded scope entry');
+    expect(entry.confirmed_at).toBeNull();
+
+    const res = await app.request(`/programs/${created.id}/scope/${entry.id}/confirm`, { method: 'POST' });
+
+    expect(res.status).toBe(200);
+    expect((await json<ScopeEntryBody>(res)).confirmed_at).not.toBeNull();
+    const after = await json<ProgramBody>(await app.request(`/programs/${created.id}`));
+    expect(after.scope_entries[0]?.confirmed_at).not.toBeNull();
+  });
+
+  it('returns 400 for an entry that does not belong to the program', async () => {
+    const { app } = buildApp();
+    const created = await json<ProgramBody>(await postJson(app, '/programs', { url: 'https://example.com' }));
+
+    const res = await app.request(`/programs/${created.id}/scope/9999/confirm`, { method: 'POST' });
+
+    expect(res.status).toBe(400);
+  });
+
+  it('spells out that confirming widens scope from one host to the whole domain', async () => {
+    const { app } = buildApp();
+    const created = await json<ProgramBody>(await postJson(app, '/programs', { url: 'https://blog.example.com/x' }));
+    const entry = created.scope_entries[0];
+    if (!entry) throw new Error('expected a seeded scope entry');
+
+    // An unconfirmed inferred entry carries the authorization it is asking for,
+    // naming the whole domain — not the one host that was submitted.
+    expect(entry.authorization_notice).toContain('example.com');
+    expect(entry.authorization_notice).not.toBeNull();
+
+    const confirmed = await json<ScopeEntryBody>(
+      await app.request(`/programs/${created.id}/scope/${entry.id}/confirm`, { method: 'POST' }),
+    );
+    // Once confirmed there is nothing left to authorize, so the notice is gone.
+    expect(confirmed.authorization_notice).toBeNull();
+  });
+
+  it('carries no authorization notice on an entry the operator typed', async () => {
+    const { app } = buildApp();
+    const created = await json<ProgramBody>(await postJson(app, '/programs', { name: 'Acme' }));
+    const added = await json<ScopeEntryBody>(
+      await postJson(app, `/programs/${created.id}/scope`, { list: 'in', pattern: 'example.com' }),
+    );
+
+    expect(added.authorization_notice).toBeNull();
+  });
+});
+
 describe('GET /programs/:id/classify', () => {
   it('reports an excluded subtree as out_of_scope even under an in-scope apex', async () => {
     const { app } = buildApp();
@@ -225,7 +305,7 @@ describe('POST /programs/:id/enumerate', () => {
         ],
       },
     });
-    const created = await json<ProgramBody>(await postJson(app, '/programs', { url: 'https://example.com' }));
+    const created = await createConfirmedProgram(app, 'https://example.com');
 
     const res = await app.request(`/programs/${created.id}/enumerate`, { method: 'POST' });
 
@@ -245,7 +325,7 @@ describe('POST /programs/:id/enumerate', () => {
         },
       },
     });
-    const created = await json<ProgramBody>(await postJson(app, '/programs', { url: 'https://example.com' }));
+    const created = await createConfirmedProgram(app, 'https://example.com');
     await service.recordHosts(created.id, [{ hostname: 'known.example.com', source: 'ct-log' }]);
 
     const res = await app.request(`/programs/${created.id}/enumerate`, { method: 'POST' });
@@ -289,7 +369,7 @@ describe('GET /programs/:id/hosts', () => {
         ],
       },
     });
-    const created = await json<ProgramBody>(await postJson(app, '/programs', { url: 'https://example.com' }));
+    const created = await createConfirmedProgram(app, 'https://example.com');
     await service.enumerateProgram(created.id);
 
     const body = await json<HostsBody>(await app.request(`/programs/${created.id}/hosts`));
@@ -298,6 +378,36 @@ describe('GET /programs/:id/hosts', () => {
       ['blog.example.com', false],
       ['example.com', true],
     ]);
+  });
+
+  it('shows the endpoint each host answers on, and marks a host that has gone dark', async () => {
+    let answers = true;
+    const { app, service } = buildApp({
+      enumerationImpl: {
+        enumerate: async () => [
+          { hostname: 'blog.example.com', source: 'ct-log' as const },
+          { hostname: 'legacy.example.com', source: 'ct-log' as const },
+        ],
+        resolveEndpoint: async (hostname: string) => {
+          if (hostname === 'legacy.example.com') return `http://${hostname}`;
+          return answers ? `https://${hostname}` : null;
+        },
+      },
+    });
+    const created = await createConfirmedProgram(app, 'https://example.com');
+    await service.enumerateProgram(created.id);
+    answers = false;
+    await service.enumerateProgram(created.id);
+    await service.enumerateProgram(created.id);
+    await service.enumerateProgram(created.id);
+
+    const body = await json<HostsBody>(await app.request(`/programs/${created.id}/hosts`));
+
+    expect(body.hosts.map((h) => [h.hostname, h.endpoint_url, h.is_dormant])).toEqual([
+      ['blog.example.com', 'https://blog.example.com', true],
+      ['legacy.example.com', 'http://legacy.example.com', false],
+    ]);
+    expect(body.hosts[0]?.last_resolved_at).not.toBeNull();
   });
 
   it('returns an empty list for a program that has never been enumerated', async () => {

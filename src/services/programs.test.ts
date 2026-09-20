@@ -492,9 +492,21 @@ describe('ProgramsService.enumerateProgram', () => {
     return { enumerate: async () => hosts.map((hostname) => ({ hostname, source: 'ct-log' as const })) };
   }
 
+  // Creates a program from a URL and confirms its inferred apex, so these tests
+  // exercise enumeration itself rather than the confirmation gate — which has
+  // its own tests above and below. Enumeration never runs against an
+  // unconfirmed apex (issue 033).
+  async function createConfirmedProgram(service: ProgramsService, url: string) {
+    const program = await service.createProgram({ url });
+    for (const entry of program.scopeEntries) {
+      await service.confirmScopeEntry(program.id, entry.id);
+    }
+    return program;
+  }
+
   it('records the hosts the enumeration source returned for each in-scope apex', async () => {
     const service = buildService({ enumerationImpl: stubEnumeration(['blog.example.com', 'api.example.com']) });
-    const program = await service.createProgram({ url: 'https://example.com' });
+    const program = await createConfirmedProgram(service, 'https://example.com');
 
     const hosts = await service.enumerateProgram(program.id);
 
@@ -511,7 +523,7 @@ describe('ProgramsService.enumerateProgram', () => {
         },
       },
     });
-    const program = await service.createProgram({ url: 'https://example.com' });
+    const program = await createConfirmedProgram(service, 'https://example.com');
     await service.addScopeEntry(program.id, { list: 'in', pattern: 'partner.example.org' });
 
     await service.enumerateProgram(program.id);
@@ -521,7 +533,7 @@ describe('ProgramsService.enumerateProgram', () => {
 
   it('stamps the program with the time it was last enumerated', async () => {
     const service = buildService({ enumerationImpl: stubEnumeration([]) });
-    const program = await service.createProgram({ url: 'https://example.com' });
+    const program = await createConfirmedProgram(service, 'https://example.com');
 
     await service.enumerateProgram(program.id);
 
@@ -538,7 +550,7 @@ describe('ProgramsService.enumerateProgram', () => {
         },
       },
     });
-    const program = await service.createProgram({ url: 'https://example.com' });
+    const program = await createConfirmedProgram(service, 'https://example.com');
     await service.recordHosts(program.id, [{ hostname: 'known.example.com', source: 'ct-log' }]);
 
     const hosts = await service.enumerateProgram(program.id);
@@ -557,7 +569,7 @@ describe('ProgramsService.enumerateProgram', () => {
         },
       },
     });
-    const program = await service.createProgram({ url: 'https://example.com' });
+    const program = await createConfirmedProgram(service, 'https://example.com');
 
     await service.enumerateProgram(program.id);
     fail = false;
@@ -576,16 +588,209 @@ describe('ProgramsService.enumerateProgram', () => {
         },
       },
     });
-    const program = await service.createProgram({ url: 'https://example.com' });
+    const program = await createConfirmedProgram(service, 'https://example.com');
 
     await service.enumerateProgram(program.id);
 
     expect((await service.getProgram(program.id))?.lastEnumeratedAt).toBeNull();
   });
 
+  it('records the endpoint each host answers on', async () => {
+    const service = buildService({
+      enumerationImpl: {
+        ...stubEnumeration(['blog.example.com']),
+        resolveEndpoint: async (hostname: string) => `https://${hostname}`,
+      },
+    });
+    const program = await createConfirmedProgram(service, 'https://example.com');
+
+    await service.enumerateProgram(program.id);
+
+    const [host] = await service.listHosts(program.id);
+    expect(host?.endpointUrl).toBe('https://blog.example.com');
+    expect(host?.lastResolvedAt).toBeInstanceOf(Date);
+  });
+
+  it('retains a host that stops resolving, with the endpoint it last answered on', async () => {
+    let answers = true;
+    const service = buildService({
+      enumerationImpl: {
+        ...stubEnumeration(['blog.example.com']),
+        resolveEndpoint: async (hostname: string) => (answers ? `https://${hostname}` : null),
+      },
+    });
+    const program = await createConfirmedProgram(service, 'https://example.com');
+
+    await service.enumerateProgram(program.id);
+    const resolvedAt = (await service.listHosts(program.id))[0]?.lastResolvedAt;
+    answers = false;
+    await service.enumerateProgram(program.id);
+    await service.enumerateProgram(program.id);
+    await service.enumerateProgram(program.id);
+
+    const [host] = await service.listHosts(program.id);
+    expect(host?.endpointUrl).toBe('https://blog.example.com');
+    expect(host?.lastResolvedAt).toEqual(resolvedAt);
+    expect(host?.failedResolutions).toBe(3);
+  });
+
+  it('clears the failure count once a dormant host answers again', async () => {
+    let answers = false;
+    const service = buildService({
+      enumerationImpl: {
+        ...stubEnumeration(['blog.example.com']),
+        resolveEndpoint: async (hostname: string) => (answers ? `http://${hostname}` : null),
+      },
+    });
+    const program = await createConfirmedProgram(service, 'https://example.com');
+
+    await service.enumerateProgram(program.id);
+    answers = true;
+    await service.enumerateProgram(program.id);
+
+    const [host] = await service.listHosts(program.id);
+    expect(host?.failedResolutions).toBe(0);
+    expect(host?.endpointUrl).toBe('http://blog.example.com');
+  });
+
+  it('probes only in-scope hosts, so no traffic reaches a host outside the engagement', async () => {
+    const probed: string[] = [];
+    const service = buildService({
+      enumerationImpl: {
+        enumerate: async () => [
+          { hostname: 'blog.example.com', source: 'ct-log' as const },
+          { hostname: 'secret.example.com', source: 'ct-log' as const },
+        ],
+        resolveEndpoint: async (hostname: string) => {
+          probed.push(hostname);
+          return `https://${hostname}`;
+        },
+      },
+    });
+    const program = await createConfirmedProgram(service, 'https://example.com');
+    await service.addScopeEntry(program.id, { list: 'out', pattern: 'secret.example.com' });
+
+    await service.enumerateProgram(program.id);
+
+    expect(probed).toEqual(['blog.example.com']);
+  });
+
+  it('does not probe a wildcard host, which would answer whatever the name', async () => {
+    const probed: string[] = [];
+    const service = buildService({
+      enumerationImpl: {
+        enumerate: async () => [{ hostname: 'example.com', source: 'ct-log' as const, isWildcard: true }],
+        resolveEndpoint: async (hostname: string) => {
+          probed.push(hostname);
+          return `https://${hostname}`;
+        },
+      },
+    });
+    const program = await createConfirmedProgram(service, 'https://example.com');
+
+    await service.enumerateProgram(program.id);
+
+    expect(probed).toEqual([]);
+    expect((await service.listHosts(program.id))[0]?.endpointUrl).toBeNull();
+  });
+
+  it('stops offering a host for scanning after three consecutive failed resolutions', async () => {
+    let answers = true;
+    const service = buildService({
+      enumerationImpl: {
+        ...stubEnumeration(['blog.example.com']),
+        resolveEndpoint: async (hostname: string) => (answers ? `https://${hostname}` : null),
+      },
+    });
+    const program = await createConfirmedProgram(service, 'https://example.com');
+
+    await service.enumerateProgram(program.id);
+    answers = false;
+    await service.enumerateProgram(program.id);
+    await service.enumerateProgram(program.id);
+    expect((await service.listScannableHosts(program.id)).map((h) => h.hostname)).toEqual(['blog.example.com']);
+
+    await service.enumerateProgram(program.id);
+
+    expect(await service.listScannableHosts(program.id)).toEqual([]);
+    expect(await service.listHosts(program.id)).toHaveLength(1);
+  });
+
   it('rejects enumerating an unknown program', async () => {
     const service = buildService({ enumerationImpl: stubEnumeration([]) });
 
     await expect(service.enumerateProgram(404)).rejects.toThrow(ProgramValidationError);
+  });
+
+  it('does not enumerate an inferred apex the operator has not confirmed', async () => {
+    // Inferring an apex from a URL widens authorization from one host to a whole
+    // domain, so it must not be enumerated until the operator confirms it.
+    const apexes: string[] = [];
+    const service = buildService({
+      enumerationImpl: {
+        enumerate: async (apex: string) => {
+          apexes.push(apex);
+          return [];
+        },
+      },
+    });
+    const program = await service.createProgram({ url: 'https://example.com' });
+
+    const hosts = await service.enumerateProgram(program.id);
+
+    expect(apexes).toEqual([]);
+    expect(hosts).toEqual([]);
+  });
+
+  it('enumerates an inferred apex once the operator confirms it', async () => {
+    const service = buildService({ enumerationImpl: stubEnumeration(['blog.example.com']) });
+    const program = await service.createProgram({ url: 'https://example.com' });
+    const seeded = program.scopeEntries[0];
+    if (!seeded) throw new Error('expected a seeded scope entry');
+
+    await service.confirmScopeEntry(program.id, seeded.id);
+    const hosts = await service.enumerateProgram(program.id);
+
+    expect(hosts.map((h) => h.hostname)).toEqual(['blog.example.com']);
+  });
+});
+
+describe('ProgramsService.confirmScopeEntry', () => {
+  it('stamps an unconfirmed inferred entry with the time it was confirmed', async () => {
+    const service = buildService();
+    const program = await service.createProgram({ url: 'https://example.com' });
+    const seeded = program.scopeEntries[0];
+    if (!seeded) throw new Error('expected a seeded scope entry');
+    expect(seeded.confirmedAt).toBeNull();
+
+    const confirmed = await service.confirmScopeEntry(program.id, seeded.id);
+
+    expect(confirmed.confirmedAt).toBeInstanceOf(Date);
+  });
+
+  it('leaves an already-confirmed entry with its original confirmation time', async () => {
+    const service = buildService();
+    const program = await service.createProgram({ name: 'acme' });
+    const entry = await service.addScopeEntry(program.id, { list: 'in', pattern: 'example.com' });
+
+    const confirmed = await service.confirmScopeEntry(program.id, entry.id);
+
+    expect(confirmed.confirmedAt).toEqual(entry.confirmedAt);
+  });
+
+  it('rejects confirming an entry that belongs to another program', async () => {
+    const service = buildService();
+    const owner = await service.createProgram({ url: 'https://example.com' });
+    const other = await service.createProgram({ name: 'other' });
+    const seeded = owner.scopeEntries[0];
+    if (!seeded) throw new Error('expected a seeded scope entry');
+
+    await expect(service.confirmScopeEntry(other.id, seeded.id)).rejects.toThrow(ProgramValidationError);
+  });
+
+  it('rejects confirming an entry on an unknown program', async () => {
+    const service = buildService();
+
+    await expect(service.confirmScopeEntry(404, 1)).rejects.toThrow(ProgramValidationError);
   });
 });

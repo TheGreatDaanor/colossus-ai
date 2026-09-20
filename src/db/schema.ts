@@ -127,6 +127,15 @@ export const enumeratedHosts = sqliteTable(
     // answer — a `*.` certificate identity, or an apex whose random-nonce label
     // resolves. A wildcard host is shown to the operator and never scanned.
     isWildcard: integer('is_wildcard', { mode: 'boolean' }).notNull().default(false),
+    // The URL the host last answered on — HTTPS when it answers on both. Null
+    // until it has been probed, and left at its last known value once a host
+    // goes dark, so the operator can still see where it used to answer.
+    endpointUrl: text('endpoint_url'),
+    lastResolvedAt: integer('last_resolved_at', { mode: 'timestamp' }),
+    // Consecutive probes that found nothing, reset by any answer. A host that
+    // has gone dark keeps its row and its history rather than being dropped:
+    // NXDOMAIN on a host that still CNAMEs somewhere is itself a takeover signal.
+    failedResolutions: integer('failed_resolutions').notNull().default(0),
     firstSeenAt: integer('first_seen_at', { mode: 'timestamp' }).notNull(),
   },
   (table) => [uniqueIndex('enumerated_hosts_program_hostname').on(table.programId, table.hostname)],

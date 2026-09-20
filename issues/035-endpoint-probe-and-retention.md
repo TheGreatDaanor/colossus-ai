@@ -1,7 +1,7 @@
 ---
 id: 035
 title: Probe each host's scheme and retain hosts that stop resolving
-status: open
+status: done
 type: afk
 blocked-by: [032]
 ---
@@ -31,10 +31,10 @@ dark rather than dropping them.
 
 ## Definition of done
 
-- [ ] Failing test written first, confirmed red
-- [ ] Implementation makes it green
-- [ ] `test`, `typecheck`, `lint` all pass
-- [ ] Visible at: `GET /programs/:id/hosts` shows `https://` for a host
+- [x] Failing test written first, confirmed red
+- [x] Implementation makes it green
+- [x] `test`, `typecheck`, `lint` all pass
+- [x] Visible at: `GET /programs/:id/hosts` shows `https://` for a host
       answering on both, `http://` for an HTTP-only host, and a dormant host
       retained with its `last_resolved_at` after 3 failures.
 

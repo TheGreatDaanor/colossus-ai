@@ -24,9 +24,14 @@ export type CreateProgramOptions = {
 
 export type AddScopeEntryOptions = { list: ScopeList; pattern: string };
 
-// The one thing this service needs from the enumeration side: given an apex,
-// what hosts exist. Injected so scope rules stay testable without a network.
-export type EnumerationImpl = { enumerate(apex: string): Promise<ObservedHost[]> };
+// What this service needs from the enumeration side: given an apex, what hosts
+// exist, and given a host, where it answers. Injected so scope rules stay
+// testable without a network. `resolveEndpoint` is optional — a source that only
+// names hosts is still usable, and the inventory simply carries no endpoints.
+export type EnumerationImpl = {
+  enumerate(apex: string): Promise<ObservedHost[]>;
+  resolveEndpoint?(hostname: string): Promise<string | null>;
+};
 
 export type ProgramsServiceOptions = { enumerationImpl?: EnumerationImpl };
 
@@ -38,6 +43,17 @@ const WILDCARD_PREFIX = '*.';
 // binds five, so a large inventory goes in as several statements inside one
 // transaction rather than one statement that would be refused.
 const UPSERT_BATCH_SIZE = 100;
+
+// One failed probe is a blip — a resolver hiccup or a moment of downtime. Three
+// consecutive ones is a host that has gone dark, and scanning it would spend the
+// run's budget on nothing. The row is kept either way.
+const DORMANT_AFTER_FAILED_RESOLUTIONS = 3;
+
+// A host nothing has answered for in three consecutive probes. Exported because
+// the inventory shows it to the operator as well as withholding it from scans.
+export function isDormant(host: EnumeratedHost): boolean {
+  return host.failedResolutions >= DORMANT_AFTER_FAILED_RESOLUTIONS;
+}
 
 // DNS names are case-insensitive and a trailing dot only marks the root, so both
 // hosts and patterns are folded to one form before any comparison.
@@ -290,6 +306,15 @@ export class ProgramsService {
       .all();
   }
 
+  // The hosts a scan may reach: in scope, not a wildcard, and not dormant. A
+  // dormant host stays in the inventory and stays eligible for takeover checks —
+  // it is only scanning that has nothing left to talk to.
+  async listScannableHosts(programId: number): Promise<EnumeratedHost[]> {
+    return (await this.listHosts(programId)).filter(
+      (host) => host.scopeStatus === 'in_scope' && !host.isWildcard && !isDormant(host),
+    );
+  }
+
   // Enumerates every apex on the in-scope list and records what comes back.
   // A source outage is recorded on the program rather than thrown: the operator
   // still gets the inventory they already had, plus the reason nothing is new.
@@ -310,6 +335,7 @@ export class ProgramsService {
     }
 
     await this.recordHosts(programId, observed);
+    await this.#probeEndpoints(programId);
 
     // `lastEnumeratedAt` answers "how fresh is this inventory", so it is stamped
     // only when a source was actually read. A run where every apex failed left
@@ -327,11 +353,69 @@ export class ProgramsService {
     return this.listHosts(programId);
   }
 
+  // Probes each in-scope host for the scheme it answers on. A host that answers
+  // has its endpoint and resolution time refreshed and its failure count
+  // cleared; one that does not keeps its row, its last known endpoint and its
+  // last resolution time, and has its failure count raised.
+  //
+  // Only in-scope hosts are probed. A probe is a live request, and an
+  // `out_of_scope` or `unscoped` host is one the engagement does not authorize
+  // traffic to — the inventory may know it exists without touching it.
+  //
+  // Wildcard hosts are skipped too: under a wildcard every name answers, so a
+  // probe would record an endpoint for a host nobody has seen.
+  async #probeEndpoints(programId: number): Promise<void> {
+    const probedAt = new Date();
+    for (const host of await this.listHosts(programId)) {
+      if (host.isWildcard || host.scopeStatus !== 'in_scope') continue;
+      const endpointUrl = await this.#enumerationImpl?.resolveEndpoint?.(host.hostname);
+      // A source that does not probe at all leaves the inventory as it is,
+      // rather than counting a probe that never happened as a failure.
+      if (endpointUrl === undefined) return;
+      this.#db
+        .update(enumeratedHosts)
+        .set(
+          endpointUrl === null
+            ? { failedResolutions: host.failedResolutions + 1 }
+            : { endpointUrl, lastResolvedAt: probedAt, failedResolutions: 0 },
+        )
+        .where(eq(enumeratedHosts.id, host.id))
+        .run();
+    }
+  }
+
+  // Confirms an inferred scope entry, authorizing enumeration against it. An
+  // entry the operator typed was already confirmed on creation, so confirming it
+  // again is a no-op that keeps its original time rather than resetting it.
+  async confirmScopeEntry(programId: number, entryId: number): Promise<ScopeEntry> {
+    this.#requireProgram(programId);
+    const entry = this.#db
+      .select()
+      .from(scopeEntries)
+      .where(and(eq(scopeEntries.programId, programId), eq(scopeEntries.id, entryId)))
+      .get();
+    if (!entry) throw new ProgramValidationError(`scope entry ${entryId} not found on program ${programId}`);
+    if (entry.confirmedAt !== null) return entry;
+
+    const updated = this.#db
+      .update(scopeEntries)
+      .set({ confirmedAt: new Date() })
+      .where(eq(scopeEntries.id, entryId))
+      .returning()
+      .get();
+    if (!updated) throw new Error('failed to confirm scope entry');
+    return updated;
+  }
+
   // Only apexes are enumerated: an exact-host entry authorizes that one host,
   // and enumerating its domain would widen the engagement past what was agreed.
+  //
+  // Only *confirmed* entries are enumerated: an inferred apex the operator has
+  // not confirmed carries no authorization to widen scope from one host to its
+  // whole domain, so enumeration never runs against it (issue 033).
   #apexesOf(programId: number): string[] {
     const patterns = this.#scopeEntriesOf(programId)
-      .filter((entry) => entry.list === 'in')
+      .filter((entry) => entry.list === 'in' && entry.confirmedAt !== null)
       .map((entry) => normaliseHostname(entry.pattern));
     return [...new Set(patterns.filter((pattern) => apexOf(pattern) === pattern))];
   }
