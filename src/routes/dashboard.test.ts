@@ -54,10 +54,15 @@ describe('GET /dashboard/scans/:id', () => {
   it('renders per-target raw data', async () => {
     const { app, service } = buildApp();
     const scan = await service.startScan(['https://example.com']);
-    await vi.waitFor(async () => {
-      const s = await service.getScan(scan.id);
-      if (!s || s.status !== 'completed') throw new Error('not yet completed');
-    });
+    await vi.waitFor(
+      async () => {
+        const s = await service.getScan(scan.id);
+        if (!s || s.status !== 'completed') throw new Error('not yet completed');
+      },
+      // A scan finishes on a background task; the 1s default budget is a flake
+      // source on a loaded machine.
+      { timeout: 15_000 },
+    );
 
     const res = await app.request(`/dashboard/scans/${scan.id}`);
     const html = await res.text();

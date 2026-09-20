@@ -22,6 +22,24 @@ function deferred<T>(): { promise: Promise<T>; resolve: (v: T) => void } {
   return { promise, resolve };
 }
 
+// A scan completes on a background task, so every assertion about a finished
+// scan has to wait for it. `vi.waitFor` defaults to a 1s budget, which a loaded
+// machine running the whole suite in parallel can miss on a scan that does real
+// async work - the failure is a timeout, not a wrong result, so it surfaces as
+// flake. Waiting lives here, with one budget, rather than open-coded per test.
+const SCAN_COMPLETION_TIMEOUT_MS = 15_000;
+
+async function completedScan(svc: ScannerService, scanId: number) {
+  return await vi.waitFor(
+    async () => {
+      const s = await svc.getScan(scanId);
+      if (!s || s.status !== 'completed') throw new Error('not yet completed');
+      return s;
+    },
+    { timeout: SCAN_COMPLETION_TIMEOUT_MS },
+  );
+}
+
 // A response that trips none of the header checks — used to pin the zero-findings shape.
 const FULLY_HARDENED_HEADERS: Record<string, string> = {
   'content-security-policy': "default-src 'self'; frame-ancestors 'none'",
@@ -179,14 +197,7 @@ describe('ScannerService scope-aware crawl discovery', () => {
     );
     const svc = new ScannerService(db, { fetchImpl, tlsCheckImpl: okTlsCheckImpl(), programsService });
     const scan = await svc.startScan(['https://example.com/'], { programId });
-    const completed = await vi.waitFor(
-      async () => {
-        const s = await svc.getScan(scan.id);
-        if (!s || s.status !== 'completed') throw new Error('not yet completed');
-        return s;
-      },
-      { timeout: 5000 },
-    );
+    const completed = await completedScan(svc, scan.id);
     return { completed, fetchImpl };
   }
 
@@ -228,14 +239,7 @@ describe('ScannerService scope-aware crawl discovery', () => {
     );
     const svc = new ScannerService(db, { fetchImpl, tlsCheckImpl: okTlsCheckImpl() });
     const scan = await svc.startScan(['https://example.com/']);
-    const completed = await vi.waitFor(
-      async () => {
-        const s = await svc.getScan(scan.id);
-        if (!s || s.status !== 'completed') throw new Error('not yet completed');
-        return s;
-      },
-      { timeout: 5000 },
-    );
+    const completed = await completedScan(svc, scan.id);
 
     expect(completed.targets.map((t) => t.url)).toEqual(['https://example.com/']);
   });
@@ -286,10 +290,7 @@ describe('ScannerService User-Agent', () => {
     });
     const scan = await svc.startScan(['https://example.com']);
 
-    await vi.waitFor(async () => {
-      const s = await svc.getScan(scan.id);
-      if (!s || s.status !== 'completed') throw new Error('not yet completed');
-    });
+    await completedScan(svc, scan.id);
 
     expect(fetchImpl).toHaveBeenCalledWith(
       'https://example.com',
@@ -306,10 +307,7 @@ describe('ScannerService User-Agent', () => {
     });
     const scan = await svc.startScan(['https://example.com'], { userAgent: 'custom-agent/2.0' });
 
-    await vi.waitFor(async () => {
-      const s = await svc.getScan(scan.id);
-      if (!s || s.status !== 'completed') throw new Error('not yet completed');
-    });
+    await completedScan(svc, scan.id);
 
     expect(fetchImpl).toHaveBeenCalledWith(
       'https://example.com',
@@ -357,11 +355,7 @@ describe('ScannerService', () => {
     const svc = new ScannerService(createDb(':memory:'), { fetchImpl, tlsCheckImpl: okTlsCheckImpl() });
     const scan = await svc.startScan(['https://example.com']);
 
-    const completed = await vi.waitFor(async () => {
-      const s = await svc.getScan(scan.id);
-      if (!s || s.status !== 'completed') throw new Error('not yet completed');
-      return s;
-    });
+    const completed = await completedScan(svc, scan.id);
 
     expect(completed.targets).toHaveLength(1);
     const [target] = completed.targets;
@@ -378,11 +372,7 @@ describe('ScannerService', () => {
     const svc = new ScannerService(createDb(':memory:'), { fetchImpl });
     const scan = await svc.startScan(['https://example.com']);
 
-    const completed = await vi.waitFor(async () => {
-      const s = await svc.getScan(scan.id);
-      if (!s || s.status !== 'completed') throw new Error('not yet completed');
-      return s;
-    });
+    const completed = await completedScan(svc, scan.id);
 
     const [target] = completed.targets;
     expect(target?.status).toBe('unreachable');
@@ -403,11 +393,7 @@ describe('ScannerService', () => {
     const svc = new ScannerService(createDb(':memory:'), { fetchImpl, timeoutMs: 5 });
     const scan = await svc.startScan(['https://example.com']);
 
-    const completed = await vi.waitFor(async () => {
-      const s = await svc.getScan(scan.id);
-      if (!s || s.status !== 'completed') throw new Error('not yet completed');
-      return s;
-    });
+    const completed = await completedScan(svc, scan.id);
 
     const [target] = completed.targets;
     expect(target?.status).toBe('timeout');
@@ -421,11 +407,7 @@ describe('ScannerService', () => {
     const svc = new ScannerService(createDb(':memory:'), { fetchImpl, tlsCheckImpl: okTlsCheckImpl() });
     const scan = await svc.startScan(['https://example.com']);
 
-    const completed = await vi.waitFor(async () => {
-      const s = await svc.getScan(scan.id);
-      if (!s || s.status !== 'completed') throw new Error('not yet completed');
-      return s;
-    });
+    const completed = await completedScan(svc, scan.id);
 
     const [target] = completed.targets;
     expect(target?.status).toBe('ok');
@@ -444,11 +426,7 @@ describe('ScannerService', () => {
     const svc = new ScannerService(createDb(':memory:'), { fetchImpl, tlsCheckImpl: okTlsCheckImpl() });
     const scan = await svc.startScan(['https://example.com']);
 
-    const completed = await vi.waitFor(async () => {
-      const s = await svc.getScan(scan.id);
-      if (!s || s.status !== 'completed') throw new Error('not yet completed');
-      return s;
-    });
+    const completed = await completedScan(svc, scan.id);
 
     const [target] = completed.targets;
     expect(target?.findings).toHaveLength(9);
@@ -481,11 +459,7 @@ describe('ScannerService', () => {
     const svc = new ScannerService(createDb(':memory:'), { fetchImpl, tlsCheckImpl: okTlsCheckImpl() });
     const scan = await svc.startScan(['https://example.com', 'https://example.org']);
 
-    const completed = await vi.waitFor(async () => {
-      const s = await svc.getScan(scan.id);
-      if (!s || s.status !== 'completed') throw new Error('not yet completed');
-      return s;
-    });
+    const completed = await completedScan(svc, scan.id);
 
     // Both targets get the same response — no security headers, plus a cookie missing
     // all three tracked attributes — which yields nine findings each: 2 high (missing
@@ -507,11 +481,7 @@ describe('ScannerService', () => {
     const svc = new ScannerService(createDb(':memory:'), { fetchImpl, tlsCheckImpl: okTlsCheckImpl() });
     const scan = await svc.startScan(['https://example.com']);
 
-    const completed = await vi.waitFor(async () => {
-      const s = await svc.getScan(scan.id);
-      if (!s || s.status !== 'completed') throw new Error('not yet completed');
-      return s;
-    });
+    const completed = await completedScan(svc, scan.id);
 
     expect(completed.targets.flatMap((t) => t.findings)).toHaveLength(0);
     expect(completed.findingsBySeverity).toEqual({
@@ -529,11 +499,7 @@ describe('ScannerService', () => {
     const svc = new ScannerService(db, { fetchImpl, tlsCheckImpl: okTlsCheckImpl() });
     const scan = await svc.startScan(['https://example.com']);
 
-    const completed = await vi.waitFor(async () => {
-      const s = await svc.getScan(scan.id);
-      if (!s || s.status !== 'completed') throw new Error('not yet completed');
-      return s;
-    });
+    const completed = await completedScan(svc, scan.id);
 
     // `severity` is `text().$type<FindingSeverity>()` — a compile-time cast with no
     // runtime constraint, so a row can carry a value outside the union. Write one
@@ -577,11 +543,7 @@ describe('ScannerService', () => {
 
     const scan = await svc.startScan(['https://example.com']);
 
-    const completed = await vi.waitFor(async () => {
-      const s = await svc.getScan(scan.id);
-      if (!s || s.status !== 'completed') throw new Error('not yet completed');
-      return s;
-    });
+    const completed = await completedScan(svc, scan.id);
 
     const [target] = completed.targets;
     expect(target?.tlsVersion).toBe('TLSv1.3');
@@ -598,11 +560,7 @@ describe('ScannerService', () => {
 
     const scan = await svc.startScan(['https://example.com']);
 
-    const completed = await vi.waitFor(async () => {
-      const s = await svc.getScan(scan.id);
-      if (!s || s.status !== 'completed') throw new Error('not yet completed');
-      return s;
-    });
+    const completed = await completedScan(svc, scan.id);
 
     const [target] = completed.targets;
     expect(target?.findings.find((f) => f.category === 'outdated-tls')).toMatchObject({
@@ -619,11 +577,7 @@ describe('ScannerService', () => {
 
     const scan = await svc.startScan(['https://example.com']);
 
-    const completed = await vi.waitFor(async () => {
-      const s = await svc.getScan(scan.id);
-      if (!s || s.status !== 'completed') throw new Error('not yet completed');
-      return s;
-    });
+    const completed = await completedScan(svc, scan.id);
 
     const [target] = completed.targets;
     expect(target?.findings.find((f) => f.category === 'cert-expiring-soon')).toMatchObject({
@@ -642,11 +596,7 @@ describe('ScannerService', () => {
 
     const scan = await svc.startScan(['http://example.com']);
 
-    const completed = await vi.waitFor(async () => {
-      const s = await svc.getScan(scan.id);
-      if (!s || s.status !== 'completed') throw new Error('not yet completed');
-      return s;
-    });
+    const completed = await completedScan(svc, scan.id);
 
     const [target] = completed.targets;
     expect(target?.findings.find((f) => f.category === 'no-tls')).toMatchObject({
@@ -666,11 +616,7 @@ describe('ScannerService', () => {
 
     const scan = await svc.startScan(['https://example.com']);
 
-    const completed = await vi.waitFor(async () => {
-      const s = await svc.getScan(scan.id);
-      if (!s || s.status !== 'completed') throw new Error('not yet completed');
-      return s;
-    });
+    const completed = await completedScan(svc, scan.id);
 
     const [target] = completed.targets;
     expect(target?.status).toBe('ok');
@@ -684,11 +630,7 @@ describe('ScannerService', () => {
 
     const scan = await svc.startScan(['http://127.0.0.1', 'http://169.254.169.254']);
 
-    const completed = await vi.waitFor(async () => {
-      const s = await svc.getScan(scan.id);
-      if (!s || s.status !== 'completed') throw new Error('not yet completed');
-      return s;
-    });
+    const completed = await completedScan(svc, scan.id);
 
     expect(completed.targets).toHaveLength(2);
     for (const target of completed.targets) {
@@ -769,11 +711,7 @@ describe('ScannerService', () => {
 
     const scan = await svc.startScan(['https://example.com']);
 
-    const completed = await vi.waitFor(async () => {
-      const s = await svc.getScan(scan.id);
-      if (!s || s.status !== 'completed') throw new Error('not yet completed');
-      return s;
-    });
+    const completed = await completedScan(svc, scan.id);
 
     const [target] = completed.targets;
     expect(target?.findings.find((f) => f.category === 'known-vulnerability')).toMatchObject({
@@ -793,11 +731,7 @@ describe('ScannerService', () => {
 
     const scan = await svc.startScan(['https://a.example.com', 'https://b.example.com']);
 
-    const completed = await vi.waitFor(async () => {
-      const s = await svc.getScan(scan.id);
-      if (!s || s.status !== 'completed') throw new Error('not yet completed');
-      return s;
-    });
+    const completed = await completedScan(svc, scan.id);
 
     for (const target of completed.targets) {
       expect(target.findings.find((f) => f.category === 'known-vulnerability')).toMatchObject({
@@ -820,11 +754,7 @@ describe('ScannerService', () => {
 
     const scan = await svc.startScan(['https://example.com']);
 
-    const completed = await vi.waitFor(async () => {
-      const s = await svc.getScan(scan.id);
-      if (!s || s.status !== 'completed') throw new Error('not yet completed');
-      return s;
-    });
+    const completed = await completedScan(svc, scan.id);
 
     const [target] = completed.targets;
     expect(target?.status).toBe('ok');
@@ -846,11 +776,7 @@ describe('ScannerService', () => {
 
     const scan = await svc.startScan(['https://example.com']);
 
-    const completed = await vi.waitFor(async () => {
-      const s = await svc.getScan(scan.id);
-      if (!s || s.status !== 'completed') throw new Error('not yet completed');
-      return s;
-    });
+    const completed = await completedScan(svc, scan.id);
 
     const [target] = completed.targets;
     expect(target?.findings.find((f) => f.category === 'known-vulnerability')).toMatchObject({
@@ -869,11 +795,7 @@ describe('ScannerService', () => {
 
     const scan = await svc.startScan(['https://example.com']);
 
-    const completed = await vi.waitFor(async () => {
-      const s = await svc.getScan(scan.id);
-      if (!s || s.status !== 'completed') throw new Error('not yet completed');
-      return s;
-    });
+    const completed = await completedScan(svc, scan.id);
 
     const [target] = completed.targets;
     expect(target?.findings.find((f) => f.category === 'known-vulnerability')).toBeUndefined();
@@ -894,11 +816,7 @@ describe('ScannerService', () => {
 
     const scan = await svc.startScan(['https://example.com']);
 
-    const completed = await vi.waitFor(async () => {
-      const s = await svc.getScan(scan.id);
-      if (!s || s.status !== 'completed') throw new Error('not yet completed');
-      return s;
-    });
+    const completed = await completedScan(svc, scan.id);
 
     const [target] = completed.targets;
     expect(target?.status).toBe('ok');
@@ -926,10 +844,7 @@ describe('ScannerService', () => {
 
     const scan = await svc.startScan(urls);
 
-    await vi.waitFor(async () => {
-      const s = await svc.getScan(scan.id);
-      if (!s || s.status !== 'completed') throw new Error('not yet completed');
-    });
+    await completedScan(svc, scan.id);
 
     expect(maxInFlight).toBeLessThanOrEqual(3);
   });
@@ -995,11 +910,7 @@ describe('ScannerService exposed-file probing', () => {
   async function categoriesFor(fetchImpl: FetchImpl): Promise<string[]> {
     const svc = new ScannerService(createDb(':memory:'), { fetchImpl, tlsCheckImpl: okTlsCheckImpl() });
     const scan = await svc.startScan(['https://example.com']);
-    const completed = await vi.waitFor(async () => {
-      const s = await svc.getScan(scan.id);
-      if (!s || s.status !== 'completed') throw new Error('not yet completed');
-      return s;
-    });
+    const completed = await completedScan(svc, scan.id);
     return completed.targets.flatMap((t) => t.findings).map((f) => f.category);
   }
 
@@ -1056,11 +967,7 @@ describe('ScannerService exposed-file probing', () => {
       maxExtraRequests: 2,
     });
     const scan = await svc.startScan(['https://example.com']);
-    await vi.waitFor(async () => {
-      const s = await svc.getScan(scan.id);
-      if (!s || s.status !== 'completed') throw new Error('not yet completed');
-      return s;
-    });
+    await completedScan(svc, scan.id);
 
     // 1 primary fetch + exactly 2 extra (robots.txt and probes share the allowance);
     // unbounded, this target would spend 1 + robots + 4 probes = 6.
@@ -1075,11 +982,7 @@ describe('ScannerService exposed-file probing', () => {
       maxExtraRequests: 2,
     });
     const scan = await svc.startScan(['https://a.example.com', 'https://b.example.com']);
-    await vi.waitFor(async () => {
-      const s = await svc.getScan(scan.id);
-      if (!s || s.status !== 'completed') throw new Error('not yet completed');
-      return s;
-    });
+    await completedScan(svc, scan.id);
 
     // Two targets, each allowed a primary fetch plus 2 extras: a shared global
     // budget would cap the whole scan at 2 extras and fail this.
@@ -1109,11 +1012,7 @@ describe('ScannerService weak security headers', () => {
     });
     const scan = await svc.startScan(['https://example.com']);
 
-    const completed = await vi.waitFor(async () => {
-      const s = await svc.getScan(scan.id);
-      if (!s || s.status !== 'completed') throw new Error('not yet completed');
-      return s;
-    });
+    const completed = await completedScan(svc, scan.id);
 
     const bySeverity = new Map(completed.targets.flatMap((t) => t.findings).map((f) => [f.category, f.severity]));
 
@@ -1143,11 +1042,7 @@ describe('ScannerService LLM finding enrichment', () => {
 
     const scan = await svc.startScan(['https://example.com']);
 
-    const completed = await vi.waitFor(async () => {
-      const s = await svc.getScan(scan.id);
-      if (!s || s.status !== 'completed') throw new Error('not yet completed');
-      return s;
-    });
+    const completed = await completedScan(svc, scan.id);
 
     const [target] = completed.targets;
     expect(target?.findings.length).toBeGreaterThan(0);
@@ -1170,11 +1065,7 @@ describe('ScannerService LLM finding enrichment', () => {
 
     const scan = await svc.startScan(['https://a.example.com', 'https://b.example.com']);
 
-    const completed = await vi.waitFor(async () => {
-      const s = await svc.getScan(scan.id);
-      if (!s || s.status !== 'completed') throw new Error('not yet completed');
-      return s;
-    });
+    const completed = await completedScan(svc, scan.id);
 
     for (const target of completed.targets) {
       expect(target.findings.length).toBeGreaterThan(0);
@@ -1198,11 +1089,7 @@ describe('ScannerService LLM finding enrichment', () => {
 
     const scan = await svc.startScan(['https://example.com']);
 
-    const completed = await vi.waitFor(async () => {
-      const s = await svc.getScan(scan.id);
-      if (!s || s.status !== 'completed') throw new Error('not yet completed');
-      return s;
-    });
+    const completed = await completedScan(svc, scan.id);
 
     const [target] = completed.targets;
     expect(target?.status).toBe('ok');
@@ -1230,11 +1117,7 @@ describe('ScannerService LLM finding enrichment', () => {
 
     const scan = await svc.startScan(['https://example.com']);
 
-    const completed = await vi.waitFor(async () => {
-      const s = await svc.getScan(scan.id);
-      if (!s || s.status !== 'completed') throw new Error('not yet completed');
-      return s;
-    });
+    const completed = await completedScan(svc, scan.id);
 
     const [target] = completed.targets;
     for (const finding of target?.findings ?? []) {
@@ -1257,11 +1140,7 @@ describe('ScannerService LLM finding enrichment', () => {
 
     const scan = await svc.startScan(['https://example.com']);
 
-    const completed = await vi.waitFor(async () => {
-      const s = await svc.getScan(scan.id);
-      if (!s || s.status !== 'completed') throw new Error('not yet completed');
-      return s;
-    });
+    const completed = await completedScan(svc, scan.id);
 
     const [target] = completed.targets;
     expect(target?.findings.length).toBe(0);
@@ -1285,11 +1164,7 @@ describe('ScannerService LLM finding enrichment', () => {
 
     const scan = await svc.startScan(['https://example.com']);
 
-    const completed = await vi.waitFor(async () => {
-      const s = await svc.getScan(scan.id);
-      if (!s || s.status !== 'completed') throw new Error('not yet completed');
-      return s;
-    });
+    const completed = await completedScan(svc, scan.id);
 
     const [target] = completed.targets;
     expect(target?.findings.length).toBe(6);
@@ -1326,11 +1201,7 @@ describe('ScannerService LLM finding enrichment', () => {
 
     const scan = await svc.startScan(['https://example.com']);
 
-    const completed = await vi.waitFor(async () => {
-      const s = await svc.getScan(scan.id);
-      if (!s || s.status !== 'completed') throw new Error('not yet completed');
-      return s;
-    });
+    const completed = await completedScan(svc, scan.id);
 
     const [target] = completed.targets;
     const cookieFinding = target?.findings.find((f) => f.category === 'cookie-missing-secure');
@@ -1349,10 +1220,7 @@ describe('ScannerService active-mode query-param injection', () => {
       confirmAuthorized: true,
     });
 
-    await vi.waitFor(async () => {
-      const s = await svc.getScan(scan.id);
-      if (!s || s.status !== 'completed') throw new Error('not yet completed');
-    });
+    await completedScan(svc, scan.id);
 
     const target = (await svc.getScan(scan.id))?.targets[0];
     expect(target?.injectionAttempts?.map((a) => a.injectionPoint)).toEqual(['q', 'page']);
@@ -1366,10 +1234,7 @@ describe('ScannerService active-mode query-param injection', () => {
       confirmAuthorized: true,
     });
 
-    await vi.waitFor(async () => {
-      const s = await svc.getScan(scan.id);
-      if (!s || s.status !== 'completed') throw new Error('not yet completed');
-    });
+    await completedScan(svc, scan.id);
 
     const attempts = (await svc.getScan(scan.id))?.targets[0]?.injectionAttempts ?? [];
     const payloads = attempts.map((a) => a.payload);
@@ -1390,10 +1255,7 @@ describe('ScannerService active-mode query-param injection', () => {
     const svc = new ScannerService(createDb(':memory:'), { fetchImpl, tlsCheckImpl: okTlsCheckImpl() });
     const scan = await svc.startScan(['https://example.com/'], { mode: 'active', confirmAuthorized: true });
 
-    await vi.waitFor(async () => {
-      const s = await svc.getScan(scan.id);
-      if (!s || s.status !== 'completed') throw new Error('not yet completed');
-    });
+    await completedScan(svc, scan.id);
 
     const target = (await svc.getScan(scan.id))?.targets[0];
     expect(target?.status).toBe('ok');
@@ -1414,7 +1276,7 @@ describe('ScannerService same-origin link discovery', () => {
     return new Response(html, { status: 200, headers: HTML_HEADERS });
   }
 
-  async function runScanToCompletion(fetchImpl: FetchImpl, roots: string[], timeout = 5000) {
+  async function runScanToCompletion(fetchImpl: FetchImpl, roots: string[], timeout = SCAN_COMPLETION_TIMEOUT_MS) {
     const svc = new ScannerService(createDb(':memory:'), { fetchImpl, tlsCheckImpl: okTlsCheckImpl() });
     const scan = await svc.startScan(roots);
 
@@ -1557,10 +1419,7 @@ describe('ScannerService active-mode XSS confirmation', () => {
       confirmAuthorized: true,
     });
 
-    await vi.waitFor(async () => {
-      const s = await svc.getScan(scan.id);
-      if (!s || s.status !== 'completed') throw new Error('not yet completed');
-    });
+    await completedScan(svc, scan.id);
 
     const target = (await svc.getScan(scan.id))?.targets[0];
     const xss = target?.findings.find((f) => f.category === 'xss');
@@ -1584,10 +1443,7 @@ describe('ScannerService active-mode XSS confirmation', () => {
       confirmAuthorized: true,
     });
 
-    await vi.waitFor(async () => {
-      const s = await svc.getScan(scan.id);
-      if (!s || s.status !== 'completed') throw new Error('not yet completed');
-    });
+    await completedScan(svc, scan.id);
 
     const target = (await svc.getScan(scan.id))?.targets[0];
     expect(target?.findings.some((f) => f.category === 'xss')).toBe(false);
@@ -1608,10 +1464,7 @@ describe('ScannerService active-mode XSS confirmation', () => {
       confirmAuthorized: true,
     });
 
-    await vi.waitFor(async () => {
-      const s = await svc.getScan(scan.id);
-      if (!s || s.status !== 'completed') throw new Error('not yet completed');
-    });
+    await completedScan(svc, scan.id);
 
     const xss = (await svc.getScan(scan.id))?.targets[0]?.findings.find((f) => f.category === 'xss');
     expect(xss?.evidencePath).toBe(`data/evidence/${scan.id}/${xss?.id}.png`);
@@ -1645,7 +1498,7 @@ describe('ScannerService active-mode XSS confirmation', () => {
         const s = await svc.getScan(scan.id);
         if (!s || s.status !== 'completed') throw new Error('not yet completed');
       },
-      { timeout: 5000 },
+      { timeout: SCAN_COMPLETION_TIMEOUT_MS },
     );
 
     expect(xssConfirmImpl).toHaveBeenCalledTimes(6);
@@ -1675,7 +1528,7 @@ describe('ScannerService active-mode injection classes', () => {
         const s = await svc.getScan(scanId);
         if (!s || s.status !== 'completed') throw new Error('not yet completed');
       },
-      { timeout: 5000 },
+      { timeout: SCAN_COMPLETION_TIMEOUT_MS },
     );
   }
 
@@ -1825,7 +1678,7 @@ describe('ScannerService body-derived passive checks', () => {
   async function scanOne(
     fetchImpl: FetchImpl,
     options: Partial<{ osvCheckImpl: OsvCheckImpl }> = {},
-    timeout = 5000,
+    timeout = SCAN_COMPLETION_TIMEOUT_MS,
   ) {
     const svc = new ScannerService(createDb(':memory:'), {
       fetchImpl,
@@ -1910,14 +1763,7 @@ describe('ScannerService robots.txt bounds', () => {
     const svc = new ScannerService(createDb(':memory:'), { fetchImpl, tlsCheckImpl: okTlsCheckImpl() });
     const scan = await svc.startScan(['https://example.com/']);
 
-    const completed = await vi.waitFor(
-      async () => {
-        const s = await svc.getScan(scan.id);
-        if (!s || s.status !== 'completed') throw new Error('not yet completed');
-        return s;
-      },
-      { timeout: 5000 },
-    );
+    const completed = await completedScan(svc, scan.id);
 
     expect(completed.targets[0]?.status).toBe('ok');
   });
@@ -1935,11 +1781,7 @@ describe('ScannerService robots.txt bounds', () => {
     const svc = new ScannerService(createDb(':memory:'), { fetchImpl, tlsCheckImpl: okTlsCheckImpl() });
     const scan = await svc.startScan(['https://example.com/']);
 
-    const completed = await vi.waitFor(async () => {
-      const s = await svc.getScan(scan.id);
-      if (!s || s.status !== 'completed') throw new Error('not yet completed');
-      return s;
-    });
+    const completed = await completedScan(svc, scan.id);
 
     expect(completed.targets.map((t) => t.url).sort()).toEqual(['https://example.com/', 'https://example.com/ok']);
   });
