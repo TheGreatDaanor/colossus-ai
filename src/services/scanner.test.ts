@@ -1417,6 +1417,19 @@ describe('ScannerService same-origin link discovery', () => {
     expect(discovered?.discoveredFrom).toBe(root?.id);
   });
 
+  // A submitted root without a path and the same address as the crawler resolves
+  // it are one target. `new URL()` normalises `https://example.com` to
+  // `https://example.com/`, and the seen-set compares raw strings, so a root page
+  // linking to `/` booked itself a second time: the same request sent twice, and
+  // every finding on the root counted twice in the severity summary.
+  it('does not re-add the root as a target when a link resolves to the root path', async () => {
+    const fetchImpl: FetchImpl = vi.fn(async () => htmlResponse('<a href="/">Home</a>'));
+
+    const completed = await runScanToCompletion(fetchImpl, ['https://example.com']);
+
+    expect(completed.targets.map((t) => t.url)).toEqual(['https://example.com']);
+  });
+
   // The security property the whole feature rests on: an operator attested for the
   // URLs they submitted, so a page they control must not be able to point the
   // scanner at a third party. discovery.test.ts covers the parser; this asserts the

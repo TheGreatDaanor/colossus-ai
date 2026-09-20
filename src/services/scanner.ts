@@ -404,6 +404,11 @@ type DiscoveryContext = {
   // them. Null means the host must not be crawled at all — its address is one
   // the SSRF guard refuses.
   robotsByOrigin: Map<string, Promise<string[] | null>>;
+  // Keyed by `sameTargetKey`, not by the raw string. A target's URL is whatever
+  // the operator submitted or the inventory resolved (`https://example.com`),
+  // while a discovered link has been through `new URL()` and comes back
+  // normalised (`https://example.com/`). Comparing them raw let a root page
+  // linking to `/` book itself a second time.
   seenUrls: Set<string>;
   depthOf: Map<number, number>;
   rootOf: Map<number, number>;
@@ -649,7 +654,7 @@ export class ScannerService {
       scope,
       discoveredAt: new Date(),
       robotsByOrigin: new Map(),
-      seenUrls: new Set(targetRows.map((t) => t.url)),
+      seenUrls: new Set(targetRows.map((t) => sameTargetKey(t.url))),
       depthOf: new Map(targetRows.map((t) => [t.id, 0])),
       rootOf: new Map(targetRows.map((t) => [t.id, t.id])),
       discoveredCount: new Map(targetRows.map((t) => [t.id, new Budget(MAX_DISCOVERED_PER_ROOT)])),
@@ -866,7 +871,7 @@ export class ScannerService {
     const rows: (typeof scanTargets.$inferInsert)[] = [];
 
     for (const url of links) {
-      if (discovery.seenUrls.has(url)) continue;
+      if (discovery.seenUrls.has(sameTargetKey(url))) continue;
 
       // `discoverLinks` applied this page's robots.txt to this page's own host,
       // which is all it speaks for. A candidate on another host is gated here
@@ -884,7 +889,7 @@ export class ScannerService {
       // per root, not a global "never visit this URL again".
       if (discovery.discoveredCount.get(rootId)?.tryConsume() !== true) break;
 
-      discovery.seenUrls.add(url);
+      discovery.seenUrls.add(sameTargetKey(url));
       rows.push({ scanId: target.scanId, url, status: 'pending', discoveredFrom: target.id });
     }
 
