@@ -1,7 +1,7 @@
 ---
 id: 043
 title: Confirm CRLF injection via a reflected injected response header
-status: open
+status: done
 type: afk
 blocked-by: [042]
 ---
@@ -46,10 +46,10 @@ line in `evidence_snippet`.
 
 ## Definition of done
 
-- [ ] Failing test written first, confirmed red
-- [ ] Implementation makes it green
-- [ ] `test`, `typecheck`, `lint` all pass
-- [ ] Visible at: an active-mode scan of a target reflecting a query param
+- [x] Failing test written first, confirmed red
+- [x] Implementation makes it green
+- [x] `test`, `typecheck`, `lint` all pass
+- [x] Visible at: an active-mode scan of a target reflecting a query param
   into a response header records a confirmed `crlf-injection` finding with a
   non-null `evidence_snippet` and null `evidence_path`, via `GET /scans/:id`.
 

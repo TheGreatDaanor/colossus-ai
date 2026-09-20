@@ -477,3 +477,75 @@ export function makeLfiInjectionClass(fetchImpl: BodyFetchImpl = guardedFetchTex
 
 // The default LFI class, backed by the SSRF-guarded content fetcher.
 export const lfiInjectionClass: InjectionClass = makeLfiInjectionClass();
+
+// A CRLF payload: a carriage-return/line-feed pair followed by a uniquely-valued
+// header line. Enumeration URL-encodes the CR and LF to `%0d%0a`, so a target that
+// copies the parameter into a response header unescaped terminates the current header
+// and starts ours. The name is fixed (recoverable) and the value is a nonce, so the
+// injected header can't collide with anything the server already sends.
+export function generateCrlfPayload(): string {
+  return `\r\nX-Colossus-CRLF: ${randomUUID().replace(/-/g, '')}`;
+}
+
+// Recovers the injected header's name and value from a payload generated above, or
+// null if the string carries no `\r\n<name>: <value>` line (so a hand-built or
+// malformed point is `unavailable`, never silently confirmed).
+function injectedHeaderOf(payload: string): { name: string; value: string } | null {
+  const match = /\r\n([\w-]+):[ \t]*(.+)$/.exec(payload);
+  if (match === null) return null;
+  return { name: match[1]!, value: match[2]! };
+}
+
+// A baseline URL for the same point with a neutral value carrying no CRLF, so an
+// injected header the differential attributes to us is only counted when it's absent
+// without the payload.
+function crlfBaselineUrlFor(point: InjectionPoint): string {
+  const url = new URL(point.url);
+  url.searchParams.set(point.injectionPoint, 'colossus_crlf_baseline');
+  return url.toString();
+}
+
+// CRLF (header) injection as an InjectionClass: enumeration mutates each query param
+// with a `%0d%0a`-crafted, nonce-named header payload; confirmation fetches the injected
+// and a baseline response and confirms iff the injected header appears in the injected
+// response's headers with its nonce value and was absent from the baseline's. A param
+// echoed into the body but not split into a header is `not_vulnerable`; a fetch that
+// fails is `unavailable`. The oracle proves only that a header was injected — not a full
+// response split.
+export function makeCrlfInjectionClass(fetchImpl: BodyFetchImpl = guardedFetchText): InjectionClass {
+  return {
+    category: 'crlf-injection',
+    enumerate: (target) => enumerateInjectionPoints(target, generateCrlfPayload),
+    confirm: async (point) => {
+      const header = injectedHeaderOf(point.payload);
+      if (header === null) return { outcome: 'unavailable', error: 'payload carries no injected header' };
+
+      let injectedHeaders: Headers;
+      try {
+        injectedHeaders = (await fetchImpl(point.url)).headers;
+      } catch (err) {
+        return { outcome: 'unavailable', error: `injection fetch failed: ${errorMessage(err)}` };
+      }
+
+      // The header the payload meant to inject isn't present with its nonce value:
+      // reflected into the body at most, not split into a header line.
+      if (injectedHeaders.get(header.name) !== header.value) return { outcome: 'not_vulnerable' };
+
+      // The injected header is present, but only the payload proves it: if the baseline
+      // already carries it, the server sends it unconditionally. A baseline we can't
+      // fetch can't clear that doubt, so we can't confirm.
+      let baselineHeaders: Headers;
+      try {
+        baselineHeaders = (await fetchImpl(crlfBaselineUrlFor(point))).headers;
+      } catch (err) {
+        return { outcome: 'unavailable', error: `baseline fetch failed: ${errorMessage(err)}` };
+      }
+      if (baselineHeaders.get(header.name) === header.value) return { outcome: 'not_vulnerable' };
+
+      return { outcome: 'confirmed', evidenceSnippet: `${header.name}: ${header.value}` };
+    },
+  };
+}
+
+// The default CRLF class, backed by the SSRF-guarded content fetcher.
+export const crlfInjectionClass: InjectionClass = makeCrlfInjectionClass();

@@ -1677,7 +1677,7 @@ describe('ScannerService active-mode XSS confirmation', () => {
   });
 });
 
-// Stands in for the SSRF-guarded content fetch the ssti/sqli/lfi classes use, driving
+// Stands in for the SSRF-guarded content fetch the ssti/sqli/lfi/crlf classes use, driving
 // each oracle to a confirmation off the URL alone: the injected param carries the
 // arithmetic expression (ssti), the lone quote (sqli) or the passwd traversal (lfi),
 // while baseline URLs (neutral param values) return none of those signals.
@@ -1691,6 +1691,18 @@ function oracleBody(url: string): string {
   return '<p>ok</p>';
 }
 
+// Stands in for the response headers of a target vulnerable to CRLF injection: it copies
+// a `\r\n<name>: <value>`-crafted param straight into the header block, so the injected
+// header appears in the response. Baseline URLs (neutral param values) carry none.
+function oracleHeaders(url: string): Headers {
+  const headers = new Headers();
+  for (const value of new URL(url).searchParams.values()) {
+    const injected = /\r\n([\w-]+):[ \t]*(.+)$/.exec(value);
+    if (injected !== null) headers.set(injected[1]!, injected[2]!);
+  }
+  return headers;
+}
+
 describe('ScannerService active-mode injection classes', () => {
   async function waitCompleted(svc: ScannerService, scanId: number): Promise<void> {
     await vi.waitFor(
@@ -1702,10 +1714,10 @@ describe('ScannerService active-mode injection classes', () => {
     );
   }
 
-  it('confirms xss, ssti, sqli and lfi together on a multi-vuln target', async () => {
+  it('confirms xss, ssti, sqli, lfi and crlf together on a multi-vuln target', async () => {
     const fetchImpl: FetchImpl = vi.fn(async () => okResponse(FULLY_HARDENED_HEADERS));
     const xssConfirmImpl = vi.fn(async () => ({ outcome: 'confirmed' as const }));
-    const bodyFetchImpl = vi.fn(async (url: string) => ({ body: oracleBody(url), headers: new Headers() }));
+    const bodyFetchImpl = vi.fn(async (url: string) => ({ body: oracleBody(url), headers: oracleHeaders(url) }));
     const svc = new ScannerService(createDb(':memory:'), {
       fetchImpl,
       tlsCheckImpl: okTlsCheckImpl(),
@@ -1720,7 +1732,7 @@ describe('ScannerService active-mode injection classes', () => {
 
     const target = (await svc.getScan(scan.id))?.targets[0];
     const byCategory = new Map((target?.findings ?? []).map((f) => [f.category, f]));
-    for (const category of ['xss', 'ssti', 'sqli', 'lfi']) {
+    for (const category of ['xss', 'ssti', 'sqli', 'lfi', 'crlf-injection']) {
       expect(byCategory.get(category)?.confidence).toBe('definitive');
       expect(byCategory.get(category)?.severity).toBe('high');
       expect(byCategory.get(category)?.injectionPoint).toBe('q');
@@ -1728,6 +1740,8 @@ describe('ScannerService active-mode injection classes', () => {
     expect(byCategory.get('ssti')?.evidenceSnippet).toBeTruthy();
     expect(byCategory.get('sqli')?.evidenceSnippet).toContain('SQL syntax');
     expect(byCategory.get('lfi')?.evidenceSnippet).toContain('root:');
+    expect(byCategory.get('crlf-injection')?.evidenceSnippet).toContain('X-Colossus-CRLF');
+    expect(byCategory.get('crlf-injection')?.evidencePath).toBeNull();
   });
 
   it('runs the fetch-based classes above the browser cap, not throttled by it', async () => {

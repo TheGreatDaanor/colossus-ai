@@ -4,6 +4,7 @@ import { afterAll, describe, expect, it } from 'vitest';
 import {
   confirmXss,
   generateCanaryPayload,
+  makeCrlfInjectionClass,
   makeLfiInjectionClass,
   makeSqliInjectionClass,
   makeSstiInjectionClass,
@@ -300,5 +301,69 @@ describe('lfiInjectionClass', () => {
     const result = await lfi.confirm(point!);
 
     expect(result.outcome).toBe('not_vulnerable');
+  });
+});
+
+describe('crlfInjectionClass', () => {
+  const fetchText = async (url: string): Promise<{ body: string; headers: Headers }> => {
+    const response = await fetch(url, { redirect: 'manual' });
+    return { body: await response.text(), headers: response.headers };
+  };
+
+  // A server that copies the `q` param, unescaped, into a response header by writing
+  // the response bytes raw — so a `%0d%0a`-crafted value genuinely splits a new header
+  // line, the way a vulnerable app would. When `reflect` is false the header is fixed.
+  function startHeaderFixture(reflect: boolean): Promise<string> {
+    return new Promise((resolve) => {
+      const server = createServer((req, res) => {
+        const url = new URL(req.url ?? '/', 'http://localhost');
+        const q = url.searchParams.get('q') ?? '';
+        const location = reflect ? q : 'safe';
+        res.socket?.write(
+          `HTTP/1.1 200 OK\r\ncontent-type: text/html\r\nLocation: ${location}\r\ncontent-length: 2\r\n\r\nok`,
+        );
+        res.socket?.end();
+      });
+      servers.push(server);
+      server.listen(0, '127.0.0.1', () => {
+        const { port } = server.address() as AddressInfo;
+        resolve(`http://127.0.0.1:${port}`);
+      });
+    });
+  }
+
+  it('reports the crlf-injection finding category', () => {
+    expect(makeCrlfInjectionClass(fetchText).category).toBe('crlf-injection');
+  });
+
+  it('enumerates one injection point per query parameter with distinct payloads', () => {
+    const points = makeCrlfInjectionClass(fetchText).enumerate(
+      new URL('https://example.com/p?a=1&b=2'),
+    );
+
+    expect(points.map((p) => p.injectionPoint).sort()).toEqual(['a', 'b']);
+    expect(points[0]?.payload).not.toEqual(points[1]?.payload);
+  });
+
+  it('confirms and captures the injected header when the param splits a new header line', async () => {
+    const origin = await startHeaderFixture(true);
+    const crlf = makeCrlfInjectionClass(fetchText);
+    const [point] = crlf.enumerate(new URL(`${origin}/?q=seed`));
+
+    const result = await crlf.confirm(point!);
+
+    expect(result.outcome).toBe('confirmed');
+    expect(result.evidenceSnippet).toContain('X-Colossus-CRLF');
+  });
+
+  it('reports not_vulnerable when the param is not reflected into a header', async () => {
+    const origin = await startHeaderFixture(false);
+    const crlf = makeCrlfInjectionClass(fetchText);
+    const [point] = crlf.enumerate(new URL(`${origin}/?q=seed`));
+
+    const result = await crlf.confirm(point!);
+
+    expect(result.outcome).toBe('not_vulnerable');
+    expect(result.evidenceSnippet).toBeUndefined();
   });
 });
