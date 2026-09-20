@@ -1,7 +1,7 @@
 {
   "version": "6",
   "dialect": "sqlite",
-  "id": "e3c1c9a8-2724-406d-9c6f-a9eda67da013",
+  "id": "035a3566-4f02-474a-9a4c-6f83d073b29b",
   "prevId": "bd06f551-c49d-468d-b9a3-42b768aaba5c",
   "tables": {
     "enumerated_hosts": {
@@ -49,6 +49,28 @@
           "notNull": true,
           "autoincrement": false,
           "default": false
+        },
+        "endpoint_url": {
+          "name": "endpoint_url",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "last_resolved_at": {
+          "name": "last_resolved_at",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "failed_resolutions": {
+          "name": "failed_resolutions",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false,
+          "default": 0
         },
         "first_seen_at": {
           "name": "first_seen_at",
@@ -517,94 +539,6 @@
           "tableTo": "programs",
           "columnsFrom": [
             "program_id"
-          ],
-          "columnsTo": [
-            "id"
-          ],
-          "onDelete": "no action",
-          "onUpdate": "no action"
-        }
-      },
-      "compositePrimaryKeys": {},
-      "uniqueConstraints": {},
-      "checkConstraints": {}
-    },
-    "takeover_findings": {
-      "name": "takeover_findings",
-      "columns": {
-        "id": {
-          "name": "id",
-          "type": "integer",
-          "primaryKey": true,
-          "notNull": true,
-          "autoincrement": true
-        },
-        "enumerated_host_id": {
-          "name": "enumerated_host_id",
-          "type": "integer",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false
-        },
-        "cname_target": {
-          "name": "cname_target",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false
-        },
-        "provider": {
-          "name": "provider",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": false,
-          "autoincrement": false
-        },
-        "severity": {
-          "name": "severity",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false
-        },
-        "confidence": {
-          "name": "confidence",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false
-        },
-        "remediation": {
-          "name": "remediation",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false
-        },
-        "created_at": {
-          "name": "created_at",
-          "type": "integer",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false
-        }
-      },
-      "indexes": {
-        "takeover_findings_host": {
-          "name": "takeover_findings_host",
-          "columns": [
-            "enumerated_host_id"
-          ],
-          "isUnique": true
-        }
-      },
-      "foreignKeys": {
-        "takeover_findings_enumerated_host_id_enumerated_hosts_id_fk": {
-          "name": "takeover_findings_enumerated_host_id_enumerated_hosts_id_fk",
-          "tableFrom": "takeover_findings",
-          "tableTo": "enumerated_hosts",
-          "columnsFrom": [
-            "enumerated_host_id"
           ],
           "columnsTo": [
             "id"

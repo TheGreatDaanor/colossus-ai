@@ -23,8 +23,14 @@ export class EnumerationError extends Error {}
 // live DNS. A name that does not resolve raises, which is not an error here.
 export type WildcardResolverImpl = { resolveAddresses(hostname: string): Promise<string[]> };
 
+// Does this URL answer at all? Narrowed to a yes/no because the scheme probe
+// asks nothing else of the response: any answer, including a 404 or a 500, means
+// something is listening. Injected so no test opens a socket.
+export type EndpointProbeImpl = (url: string) => Promise<boolean>;
+
 export type EnumerationServiceOptions = {
   ctFetchImpl?: CtFetchImpl;
+  endpointProbeImpl?: EndpointProbeImpl;
   resolverImpl?: WildcardResolverImpl;
   nonceLabel?: () => string;
   userAgent?: string;
@@ -135,12 +141,48 @@ export function createCtFetch(options: CtFetchOptions = {}): CtFetchImpl {
   };
 }
 
+// In preference order: a host answering on both is recorded as HTTPS.
+const ENDPOINT_SCHEMES = ['https:', 'http:'] as const;
+
+// A dark host is the common case across a large inventory, and a probe that
+// hangs would hold the whole enumeration open, so each one is bounded tightly.
+const DEFAULT_ENDPOINT_TIMEOUT_MS = 5_000;
+
+export type EndpointProbeOptions = { userAgent?: string; timeoutMs?: number };
+
+// The real scheme probe. A HEAD is enough — the question is whether anything is
+// listening, not what it serves — and any status answers it, so only a transport
+// failure counts as "no". Redirects are not followed: a redirect is an answer.
+export function createEndpointProbe(options: EndpointProbeOptions = {}): EndpointProbeImpl {
+  const userAgent = options.userAgent ?? DEFAULT_USER_AGENT;
+  const timeoutMs = options.timeoutMs ?? DEFAULT_ENDPOINT_TIMEOUT_MS;
+
+  return async (url) => {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      await fetch(url, {
+        method: 'HEAD',
+        redirect: 'manual',
+        headers: { 'user-agent': userAgent },
+        signal: controller.signal,
+      });
+      return true;
+    } catch {
+      return false;
+    } finally {
+      clearTimeout(timer);
+    }
+  };
+}
+
 type CacheEntry = { hosts: ObservedHost[]; storedAt: number };
 
 // All outbound I/O for finding hosts. Kept out of programs.ts so the scope rules
 // stay a pure function with no network behind them.
 export class EnumerationService {
   #ctFetchImpl: CtFetchImpl;
+  #endpointProbeImpl: EndpointProbeImpl;
   #resolverImpl: WildcardResolverImpl;
   #nonceLabel: () => string;
   #cacheTtlMs: number;
@@ -150,6 +192,7 @@ export class EnumerationService {
 
   constructor(options: EnumerationServiceOptions = {}) {
     this.#ctFetchImpl = options.ctFetchImpl ?? createCtFetch({ userAgent: options.userAgent ?? DEFAULT_USER_AGENT });
+    this.#endpointProbeImpl = options.endpointProbeImpl ?? createEndpointProbe({ userAgent: options.userAgent ?? DEFAULT_USER_AGENT });
     this.#resolverImpl = options.resolverImpl ?? createWildcardResolver();
     this.#nonceLabel = options.nonceLabel ?? randomNonceLabel;
     this.#cacheTtlMs = options.cacheTtlMs ?? DEFAULT_CACHE_TTL_MS;
@@ -180,6 +223,28 @@ export class EnumerationService {
       : hosts;
     this.#remember(normalisedApex, withWildcards);
     return withWildcards;
+  }
+
+  // The URL this host actually answers on, or null when it answers on neither
+  // scheme. HTTPS is preferred when both answer: it is the endpoint an operator
+  // would test against, and the one a report should name.
+  async resolveEndpoint(hostname: string): Promise<string | null> {
+    const normalised = normaliseHostname(hostname);
+    for (const scheme of ENDPOINT_SCHEMES) {
+      const url = `${scheme}//${normalised}`;
+      if (await this.#answers(url)) return url;
+    }
+    return null;
+  }
+
+  // A probe that throws is a host that did not answer, not a run that failed:
+  // refused connections and TLS errors are the ordinary case for a dark host.
+  async #answers(url: string): Promise<boolean> {
+    try {
+      return await this.#endpointProbeImpl(url);
+    } catch {
+      return false;
+    }
   }
 
   // Under a wildcard apex, a host inferred from a `*.` identity has nothing
