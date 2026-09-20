@@ -141,3 +141,24 @@ Confirming one is a two-part observation: DNS shows the reference is
 dangling, and the provider's response confirms the resource is unclaimed.
 Colossus reports the defect and how to remediate it; it never claims the
 resource itself.
+
+## Injection class
+
+One kind of defect an **active check** confirms by sending a crafted payload
+into an injection point and observing how the target mishandles it. Each
+class is a self-contained strategy: it enumerates its injection points on a
+target and confirms a hit on its own oracle. Reflected XSS, SSTI,
+error-based SQLi, LFI, and CRLF injection are each an injection class.
+
+Confirmation is always a **deterministic differential** against a baseline
+(unmodified) response: a hit fires only on a positive, non-probabilistic
+signal — an evaluated arithmetic product, a known error signature, a
+known-file signature, an injected header reflected back. A class that can
+only be confirmed by timing or an out-of-band callback is **not** an
+injection class Colossus implements; the absence of a deterministic oracle
+is what keeps such classes out, not the class of vulnerability itself.
+
+Distinct from **finding category**: a category is the greppable identity a
+confirmed hit is recorded under, whereas an injection class is the probe
+that produces it. Most classes map to one category, but the mapping is not
+part of the definition.
