@@ -1,7 +1,7 @@
 ---
 id: 033
 title: Require confirmation of an inferred apex before enumeration runs
-status: open
+status: done
 type: human
 blocked-by: [029]
 ---
@@ -30,9 +30,9 @@ that consequence obvious is a matter of judgement, not a test.
 
 ## Definition of done
 
-- [ ] Failing test written first, confirmed red
-- [ ] Implementation makes it green
-- [ ] `test`, `typecheck`, `lint` all pass
+- [x] Failing test written first, confirmed red
+- [x] Implementation makes it green
+- [x] `test`, `typecheck`, `lint` all pass
 - [ ] Visible at: creating a program from `https://example.com/x` shows
       `example.com` as unconfirmed; enumeration refuses to run until it is
       confirmed; a human has read the confirmation wording and agrees it makes

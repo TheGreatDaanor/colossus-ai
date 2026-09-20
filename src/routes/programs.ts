@@ -36,11 +36,25 @@ function parseScopeEntryBody(body: unknown): AddScopeEntryOptions | null {
   return { list, pattern };
 }
 
+// The consent step 033 turns on lives wherever this API is consumed, so the
+// consequence it is asking the operator to accept is spelled out here rather
+// than left to the client to word: confirming an inferred apex authorizes
+// enumeration of the entire domain, not the one host that was submitted. An
+// operator-typed entry was never inferred, so it carries no notice.
+function authorizationNotice(entry: ScopeEntry): string | null {
+  if (entry.confirmedAt !== null) return null;
+  return (
+    `Confirming authorizes enumeration and scanning of the whole \`${entry.pattern}\` domain — ` +
+    `every subdomain of it — not just the host you submitted. Confirm only if you are authorized ` +
+    `to test the entire domain.`
+  );
+}
+
 // The wire keys are snake_case; the service keeps the camelCase domain names, so
 // the rename happens here at the response boundary, as it does in scans.ts.
 function serializeScopeEntry(entry: ScopeEntry) {
   const { programId, confirmedAt, ...rest } = entry;
-  return { ...rest, program_id: programId, confirmed_at: confirmedAt };
+  return { ...rest, program_id: programId, confirmed_at: confirmedAt, authorization_notice: authorizationNotice(entry) };
 }
 
 function serializeHost(host: EnumeratedHost) {
@@ -129,6 +143,25 @@ export function createProgramsRoutes(service: ProgramsService): Hono {
     try {
       await service.removeScopeEntry(id, entryId);
       return c.body(null, 204);
+    } catch (err) {
+      if (err instanceof ProgramValidationError) return c.json({ error: err.message }, 400);
+      throw err;
+    }
+  });
+
+  // Confirming an inferred entry is what authorizes enumeration to widen scope
+  // from the one submitted host to its whole domain, so it is a deliberate POST
+  // rather than folded into any read.
+  app.post('/programs/:id/scope/:entryId/confirm', async (c) => {
+    const id = Number(c.req.param('id'));
+    const entryId = Number(c.req.param('entryId'));
+    if (!Number.isInteger(id) || !Number.isInteger(entryId)) {
+      return c.json({ error: 'program id and scope entry id must be integers' }, 400);
+    }
+
+    try {
+      const entry = await service.confirmScopeEntry(id, entryId);
+      return c.json(serializeScopeEntry(entry));
     } catch (err) {
       if (err instanceof ProgramValidationError) return c.json({ error: err.message }, 400);
       throw err;

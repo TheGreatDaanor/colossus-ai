@@ -384,11 +384,38 @@ export class ProgramsService {
     }
   }
 
+  // Confirms an inferred scope entry, authorizing enumeration against it. An
+  // entry the operator typed was already confirmed on creation, so confirming it
+  // again is a no-op that keeps its original time rather than resetting it.
+  async confirmScopeEntry(programId: number, entryId: number): Promise<ScopeEntry> {
+    this.#requireProgram(programId);
+    const entry = this.#db
+      .select()
+      .from(scopeEntries)
+      .where(and(eq(scopeEntries.programId, programId), eq(scopeEntries.id, entryId)))
+      .get();
+    if (!entry) throw new ProgramValidationError(`scope entry ${entryId} not found on program ${programId}`);
+    if (entry.confirmedAt !== null) return entry;
+
+    const updated = this.#db
+      .update(scopeEntries)
+      .set({ confirmedAt: new Date() })
+      .where(eq(scopeEntries.id, entryId))
+      .returning()
+      .get();
+    if (!updated) throw new Error('failed to confirm scope entry');
+    return updated;
+  }
+
   // Only apexes are enumerated: an exact-host entry authorizes that one host,
   // and enumerating its domain would widen the engagement past what was agreed.
+  //
+  // Only *confirmed* entries are enumerated: an inferred apex the operator has
+  // not confirmed carries no authorization to widen scope from one host to its
+  // whole domain, so enumeration never runs against it (issue 033).
   #apexesOf(programId: number): string[] {
     const patterns = this.#scopeEntriesOf(programId)
-      .filter((entry) => entry.list === 'in')
+      .filter((entry) => entry.list === 'in' && entry.confirmedAt !== null)
       .map((entry) => normaliseHostname(entry.pattern));
     return [...new Set(patterns.filter((pattern) => apexOf(pattern) === pattern))];
   }
