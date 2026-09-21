@@ -1,7 +1,7 @@
 ---
 id: 048
 title: Surface a stale ground-truth session as a scan error
-status: open
+status: done
 type: afk
 blocked-by: [046]
 ---
@@ -30,13 +30,13 @@ never attempts to re-authenticate.
 
 ## Definition of done
 
-- [ ] Failing test written first, confirmed red
-- [ ] Implementation makes it green
-- [ ] `test`, `typecheck`, `lint` all pass — a fixture where an owner's
+- [x] Failing test written first, confirmed red
+- [x] Implementation makes it green
+- [x] `test`, `typecheck`, `lint` all pass — a fixture where an owner's
   ground-truth fetch returns a 401/redirect surfaces a scan error naming the
   identity, and no `idor`/`unauthenticated-resource-access` finding is fabricated
   for that URL.
-- [ ] Visible at: an active-mode scan with a stale identity reports the error
+- [x] Visible at: an active-mode scan with a stale identity reports the error
   via `GET /scans/:id` rather than returning silently empty.
 
 ## Out of scope

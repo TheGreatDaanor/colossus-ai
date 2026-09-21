@@ -1,7 +1,7 @@
 ---
 id: 047
 title: Report unauthenticated access to a private resource
-status: open
+status: done
 type: afk
 blocked-by: [046]
 ---
@@ -32,13 +32,13 @@ no session at all. This adds the second branch of the oracle established in
 
 ## Definition of done
 
-- [ ] Failing test written first, confirmed red
-- [ ] Implementation makes it green
-- [ ] `test`, `typecheck`, `lint` all pass — a fixture where the no-auth
+- [x] Failing test written first, confirmed red
+- [x] Implementation makes it green
+- [x] `test`, `typecheck`, `lint` all pass — a fixture where the no-auth
   control returns the owner's ground-truth body yields exactly one
   `unauthenticated-resource-access` finding (and no `idor` for that URL), while
   a truly public resource still yields nothing.
-- [ ] Visible at: an active-mode scan of a URL reachable without a session
+- [x] Visible at: an active-mode scan of a URL reachable without a session
   reports an `unauthenticated-resource-access` finding via `GET /scans/:id`.
 
 ## Out of scope
