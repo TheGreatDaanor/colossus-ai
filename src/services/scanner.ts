@@ -13,6 +13,7 @@ import {
   type BodyFetchImpl,
 } from './active-scanner.js';
 import { disallowedPrefixes, discoverLinks } from './discovery.js';
+import { runAccessControlChecks, type Identity, type HeaderedFetchImpl } from './access-control.js';
 import { hostCapFor, ProgramsService, type EnumeratedHost, type Scope } from './programs.js';
 import { findDisallowedAddress, isDisallowedAddress } from './ssrf-guard.js';
 import {
@@ -62,6 +63,12 @@ export type StartScanOptions = {
   mode?: 'passive' | 'active';
   confirmAuthorized?: boolean;
   authorizationNote?: string;
+  // Access-control (IDOR) identities to replay across, and the identity-ownership
+  // attestation gating them. Identities are ephemeral scan inputs — held only for
+  // the run and never persisted. Access-control checks run in active mode only; in
+  // passive mode identities are ignored.
+  identities?: Identity[];
+  confirmIdentitiesAuthorized?: boolean;
 };
 
 function defaultScanName(now: Date): string {
@@ -456,6 +463,10 @@ export class ScannerService {
   // Present only where scans can be run against a program. Null keeps a
   // URL-only deployment from having to construct one.
   readonly #programsService: ProgramsService | null;
+  // The headered fetch the access-control (IDOR) oracle replays identities
+  // through. Default is SSRF-guarded (see #guardedHeaderedFetch); tests inject a
+  // fake mapping (url, headers) → (status, body) to drive the oracle offline.
+  readonly #headeredFetchImpl: HeaderedFetchImpl;
 
   constructor(
     db: Db,
@@ -473,6 +484,7 @@ export class ScannerService {
       browserConcurrency?: number;
       allowedHosts?: string[];
       programsService?: ProgramsService;
+      headeredFetchImpl?: HeaderedFetchImpl;
     } = {},
   ) {
     this.#db = db;
@@ -494,6 +506,7 @@ export class ScannerService {
     this.#fetchSemaphore = new Semaphore(this.#concurrency);
     this.#allowedHosts = new Set(options.allowedHosts ?? []);
     this.#programsService = options.programsService ?? null;
+    this.#headeredFetchImpl = options.headeredFetchImpl ?? ((url, headers) => this.#guardedHeaderedFetch(url, headers));
     this.#tlsCheckImpl =
       options.tlsCheckImpl ?? ((hostname, port) => defaultTlsCheck(hostname, port, this.#timeoutMs));
     this.#osvCheckImpl = options.osvCheckImpl ?? defaultOsvCheck;
@@ -508,6 +521,17 @@ export class ScannerService {
     if (urls.length > MAX_URLS) throw new ScanValidationError(`urls must not exceed ${MAX_URLS}`);
     if (options.mode === 'active' && options.confirmAuthorized !== true) {
       throw new ScanValidationError('mode: "active" requires confirmAuthorized: true');
+    }
+    // The identity-ownership attestation is layered on top of the active-mode one,
+    // and only bites in active mode: replaying real sessions is an authenticated
+    // active action, so a passive scan simply ignores any identities it is handed.
+    if (
+      options.mode === 'active' &&
+      options.identities !== undefined &&
+      options.identities.length > 0 &&
+      options.confirmIdentitiesAuthorized !== true
+    ) {
+      throw new ScanValidationError('access-control identities require confirmIdentitiesAuthorized: true');
     }
     if (options.userAgent !== undefined && options.userAgent.trim() === '') {
       throw new ScanValidationError('userAgent must not be blank');
@@ -590,7 +614,12 @@ export class ScannerService {
 
     const targetRows = [...submittedRows, ...inventoryRows];
 
-    void this.#runScan(scan.id, targetRows, scan.userAgent ?? this.#defaultUserAgent, scan.mode, programId);
+    // Identities ride in memory into the background run and are never written to
+    // the database — the deliberate inverse of durable enumerated hosts. Passive
+    // scans carry none: access-control checks are active-mode only.
+    const identities = mode === 'active' ? options.identities ?? [] : [];
+
+    void this.#runScan(scan.id, targetRows, scan.userAgent ?? this.#defaultUserAgent, scan.mode, programId, identities);
 
     return scan;
   }
@@ -631,6 +660,7 @@ export class ScannerService {
     userAgent: string,
     mode: ScanMode,
     programId: number | null,
+    identities: Identity[],
   ): Promise<void> {
     this.#db.update(scans).set({ status: 'running' }).where(eq(scans.id, scanId)).run();
 
@@ -670,6 +700,12 @@ export class ScannerService {
       );
       for (const discovered of discoveredBatches) queue.push(...discovered);
     }
+
+    // Access-control (IDOR) runs once per scan, after the target queue drains: it
+    // replays operator-declared private URLs across the supplied identities rather
+    // than walking the crawl frontier. Active-mode only, and only when identities
+    // were supplied — startScan already cleared both gates.
+    if (identities.length > 0) await this.#runAccessControlChecks(scanId, identities);
 
     this.#db
       .update(scans)
@@ -990,6 +1026,93 @@ export class ScannerService {
         }),
       ),
     );
+  }
+
+  // Replays each identity's declared-private URLs across the other identities and
+  // the synthesized no-auth control, then persists any `idor` outcome. Each finding
+  // hangs off a fresh scan-target row carrying the leaked URL, so it surfaces under
+  // `GET /scans/:id` exactly like every other finding. The proof is digests, statuses
+  // and identity labels only — no response body — so the report never leaks what the
+  // defect exposes. Identities are never written to the database.
+  async #runAccessControlChecks(scanId: number, identities: Identity[]): Promise<void> {
+    let outcomes;
+    let errors;
+    try {
+      ({ outcomes, errors } = await runAccessControlChecks(identities, this.#headeredFetchImpl));
+    } catch (err) {
+      // A replay fetch failing (unreachable host, refused address) degrades to "no
+      // access-control findings" rather than aborting the scan — mirrors the TLS/CVE
+      // degrade paths.
+      const message = err instanceof Error ? err.message : String(err);
+      console.warn(`[scan ${scanId}] access-control checks failed: ${message}`);
+      return;
+    }
+
+    // A stale identity session surfaces as a reported scan error rather than a
+    // silent miss: one target row per stale-URL carries the error naming the
+    // identity, so the operator sees it via GET /scans/:id and knows to re-supply
+    // that identity. No finding is fabricated for the URL. The error message is
+    // digests/labels only — never the private body.
+    for (const error of errors) {
+      this.#db
+        .insert(scanTargets)
+        .values({ scanId, url: error.url, status: 'unreachable', error: error.message })
+        .run();
+    }
+
+    // One target row per leaked URL, reused across outcomes: a URL exposed to two
+    // peers (or mutually declared by both) yields two distinct findings — different
+    // unauthorized principals — but must not double as two target rows for the one
+    // URL, which would inflate the target count under GET /scans/:id.
+    const targetIdByUrl = new Map<string, number>();
+    for (const outcome of outcomes) {
+      let targetId = targetIdByUrl.get(outcome.url);
+      if (targetId === undefined) {
+        const [target] = this.#db
+          .insert(scanTargets)
+          .values({ scanId, url: outcome.url, status: 'ok' })
+          .returning()
+          .all();
+        if (target === undefined) throw new Error('failed to insert access-control scan target');
+        targetId = target.id;
+        targetIdByUrl.set(outcome.url, targetId);
+      }
+
+      this.#db
+        .insert(findings)
+        .values({
+          scanTargetId: targetId,
+          category: outcome.category,
+          severity: 'high',
+          // The cross-identity match is a fact about the responses, not a guess:
+          // definitive, exactly as the oracle-confirmed injection findings are.
+          confidence: 'definitive',
+          accessControlEvidence: JSON.stringify(outcome.proof),
+        })
+        .run();
+    }
+  }
+
+  // The SSRF-guarded headered fetch the access-control oracle replays through in
+  // production: it refuses a private/loopback/link-local/metadata address before
+  // issuing the request, attaches the identity's opaque headers verbatim, and reads
+  // a bounded body so a huge response can't exhaust memory. The body is only ever
+  // digested downstream, never stored.
+  async #guardedHeaderedFetch(url: string, headers: Record<string, string>): Promise<{ status: number; body: string }> {
+    const hostname = new URL(url).hostname;
+    if (!this.#allowedHosts.has(hostname)) {
+      const disallowed = await findDisallowedAddress(hostname);
+      if (disallowed !== null) throw new Error(`refusing to replay ${hostname}: resolves to disallowed address ${disallowed}`);
+    }
+
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), this.#timeoutMs);
+    try {
+      const response = await this.#fetchImpl(url, { redirect: 'manual', signal: controller.signal, headers });
+      return { status: response.status, body: await readBoundedText(response, MAX_HTML_BYTES) };
+    } finally {
+      clearTimeout(timer);
+    }
   }
 
   // One robots.txt per origin per run, memoised on the promise so that pages

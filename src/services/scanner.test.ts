@@ -2021,3 +2021,178 @@ describe('defaultOsvCheck request body', () => {
     expect(capturedBody).toEqual({ version: '1.20.1', package: { name: 'nginx' } });
   });
 });
+
+describe('ScannerService access-control (idor)', () => {
+  // Two signed-in identities plus the primary submitted target. The headered fetch
+  // is faked at the injected seam, keyed on the cookie header, so the oracle runs
+  // with no live sessions: both users see Alice's invoice, a logged-out request is
+  // bounced — a textbook horizontal IDOR.
+  const invoiceUrl = 'https://app.test/invoice/1';
+  const identities = [
+    { label: 'alice', headers: { cookie: 'session=alice' }, privateUrls: [invoiceUrl] },
+    { label: 'bob', headers: { cookie: 'session=bob' }, privateUrls: [] },
+  ];
+
+  function headeredFetchImpl() {
+    return vi.fn(async (url: string, headers: Record<string, string>) => {
+      if (url !== invoiceUrl) return { status: 404, body: '' };
+      const cookie = headers['cookie'] ?? '';
+      if (cookie === '') return { status: 302, body: 'redirecting to /login' };
+      return { status: 200, body: 'Invoice #1 — total $500' };
+    });
+  }
+
+  it('records an idor finding, visible via getScan, with digest-only evidence', async () => {
+    const svc = new ScannerService(createDb(':memory:'), {
+      fetchImpl: vi.fn(async () => okResponse(FULLY_HARDENED_HEADERS)),
+      tlsCheckImpl: okTlsCheckImpl(),
+      headeredFetchImpl: headeredFetchImpl(),
+    });
+    const scan = await svc.startScan(['https://example.com'], {
+      mode: 'active',
+      confirmAuthorized: true,
+      confirmIdentitiesAuthorized: true,
+      identities,
+    });
+    const completed = await completedScan(svc, scan.id);
+
+    const idorFindings = completed.targets.flatMap((t) => t.findings).filter((f) => f.category === 'idor');
+    expect(idorFindings).toHaveLength(1);
+    const finding = idorFindings[0];
+    expect(finding?.severity).toBe('high');
+    expect(finding?.confidence).toBe('definitive');
+    expect(finding?.evidenceSnippet).toBeNull();
+    expect(finding?.evidencePath).toBeNull();
+    // The proof carries digests and labels but never the private body.
+    expect(finding?.accessControlEvidence).toBeTruthy();
+    expect(finding?.accessControlEvidence).not.toContain('Invoice');
+    expect(finding?.accessControlEvidence).toContain('alice');
+    expect(finding?.accessControlEvidence).toContain('bob');
+    // The finding hangs off a target carrying the leaked URL.
+    const idorTarget = completed.targets.find((t) => t.findings.some((f) => f.category === 'idor'));
+    expect(idorTarget?.url).toBe(invoiceUrl);
+  });
+
+  it('records an unauthenticated-resource-access finding, visible via getScan', async () => {
+    // Bob is turned away (403) — the resource is genuinely gated — yet a logged-out
+    // request receives Alice's invoice verbatim: reachable with no session at all.
+    const noAuthFetch = vi.fn(async (url: string, headers: Record<string, string>) => {
+      if (url !== invoiceUrl) return { status: 404, body: '' };
+      const cookie = headers['cookie'] ?? '';
+      if (cookie === 'session=bob') return { status: 403, body: 'forbidden' };
+      return { status: 200, body: 'Invoice #1 — total $500' };
+    });
+    const svc = new ScannerService(createDb(':memory:'), {
+      fetchImpl: vi.fn(async () => okResponse(FULLY_HARDENED_HEADERS)),
+      tlsCheckImpl: okTlsCheckImpl(),
+      headeredFetchImpl: noAuthFetch,
+    });
+    const scan = await svc.startScan(['https://example.com'], {
+      mode: 'active',
+      confirmAuthorized: true,
+      confirmIdentitiesAuthorized: true,
+      identities,
+    });
+    const completed = await completedScan(svc, scan.id);
+
+    const findings = completed.targets.flatMap((t) => t.findings);
+    const unauth = findings.filter((f) => f.category === 'unauthenticated-resource-access');
+    expect(unauth).toHaveLength(1);
+    // No idor is recorded for this URL — the peer never received the ground truth.
+    expect(findings.filter((f) => f.category === 'idor')).toHaveLength(0);
+    expect(unauth[0]?.severity).toBe('high');
+    expect(unauth[0]?.confidence).toBe('definitive');
+    expect(unauth[0]?.evidenceSnippet).toBeNull();
+    expect(unauth[0]?.accessControlEvidence).toBeTruthy();
+    expect(unauth[0]?.accessControlEvidence).not.toContain('Invoice');
+    const target = completed.targets.find((t) =>
+      t.findings.some((f) => f.category === 'unauthenticated-resource-access'),
+    );
+    expect(target?.url).toBe(invoiceUrl);
+  });
+
+  it('rejects an active scan carrying identities without the identity attestation', async () => {
+    const svc = new ScannerService(createDb(':memory:'), { fetchImpl: vi.fn(async () => okResponse()) });
+    await expect(
+      svc.startScan(['https://example.com'], { mode: 'active', confirmAuthorized: true, identities }),
+    ).rejects.toThrow(ScanValidationError);
+  });
+
+  it('collapses one URL leaking to multiple peers onto a single target row', async () => {
+    const threeIdentities = [
+      { label: 'alice', headers: { cookie: 'session=alice' }, privateUrls: [invoiceUrl] },
+      { label: 'bob', headers: { cookie: 'session=bob' }, privateUrls: [] },
+      { label: 'carol', headers: { cookie: 'session=carol' }, privateUrls: [] },
+    ];
+    const svc = new ScannerService(createDb(':memory:'), {
+      fetchImpl: vi.fn(async () => okResponse(FULLY_HARDENED_HEADERS)),
+      tlsCheckImpl: okTlsCheckImpl(),
+      headeredFetchImpl: headeredFetchImpl(),
+    });
+    const scan = await svc.startScan(['https://example.com'], {
+      mode: 'active',
+      confirmAuthorized: true,
+      confirmIdentitiesAuthorized: true,
+      identities: threeIdentities,
+    });
+    const completed = await completedScan(svc, scan.id);
+
+    const idorTargets = completed.targets.filter((t) => t.findings.some((f) => f.category === 'idor'));
+    expect(idorTargets).toHaveLength(1);
+    expect(idorTargets[0]?.findings.filter((f) => f.category === 'idor')).toHaveLength(2);
+  });
+
+  it('runs no access-control checks on a passive-mode scan', async () => {
+    const fake = headeredFetchImpl();
+    const svc = new ScannerService(createDb(':memory:'), {
+      fetchImpl: vi.fn(async () => okResponse(FULLY_HARDENED_HEADERS)),
+      tlsCheckImpl: okTlsCheckImpl(),
+      headeredFetchImpl: fake,
+    });
+    const scan = await svc.startScan(['https://example.com'], { identities });
+    const completed = await completedScan(svc, scan.id);
+
+    expect(completed.targets.flatMap((t) => t.findings).some((f) => f.category === 'idor')).toBe(false);
+    expect(fake).not.toHaveBeenCalled();
+  });
+
+  it('reports a stale-session error via getScan instead of a silent miss or a fabricated finding', async () => {
+    // Alice's own session is stale: her ground-truth fetch to her declared-private
+    // URL is bounced to login (302). Bob still receives the invoice — but with no
+    // valid ground truth no finding may be fabricated; the operator must instead see
+    // a reported error naming Alice so they know to re-supply the identity.
+    const staleFetch = vi.fn(async (url: string, headers: Record<string, string>) => {
+      if (url !== invoiceUrl) return { status: 404, body: '' };
+      const cookie = headers['cookie'] ?? '';
+      if (cookie === 'session=alice') return { status: 302, body: 'redirecting to /login' };
+      if (cookie === 'session=bob') return { status: 200, body: 'Invoice #1 — total $500' };
+      return { status: 302, body: 'redirecting to /login' };
+    });
+    const svc = new ScannerService(createDb(':memory:'), {
+      fetchImpl: vi.fn(async () => okResponse(FULLY_HARDENED_HEADERS)),
+      tlsCheckImpl: okTlsCheckImpl(),
+      headeredFetchImpl: staleFetch,
+    });
+    const scan = await svc.startScan(['https://example.com'], {
+      mode: 'active',
+      confirmAuthorized: true,
+      confirmIdentitiesAuthorized: true,
+      identities,
+    });
+    const completed = await completedScan(svc, scan.id);
+
+    // No access-control finding is fabricated for the stale URL.
+    const acFindings = completed.targets
+      .flatMap((t) => t.findings)
+      .filter((f) => f.category === 'idor' || f.category === 'unauthenticated-resource-access');
+    expect(acFindings).toHaveLength(0);
+
+    // A target carrying the stale URL surfaces the error, naming the identity.
+    const errored = completed.targets.find((t) => t.url === invoiceUrl && t.status !== 'ok');
+    expect(errored).toBeTruthy();
+    expect(errored?.error).toContain('alice');
+    // The reported error never leaks the private body.
+    expect(errored?.error).not.toContain('Invoice');
+    expect(errored?.findings).toHaveLength(0);
+  });
+});

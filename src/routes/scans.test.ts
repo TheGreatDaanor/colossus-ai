@@ -250,3 +250,56 @@ describe('GET /scans/:id', () => {
     expect(res.status).toBe(400);
   });
 });
+
+describe('POST /scans with access-control identities', () => {
+  const identities = [
+    { label: 'alice', headers: { cookie: 'session=alice' }, privateUrls: ['https://app.test/invoice/1'] },
+    { label: 'bob', headers: { cookie: 'session=bob' }, privateUrls: [] },
+  ];
+
+  it('rejects an active scan carrying identities without the identity attestation', async () => {
+    const { app } = buildApp();
+    const res = await app.request('/scans', {
+      method: 'POST',
+      body: JSON.stringify({ urls: ['https://example.com'], mode: 'active', confirmAuthorized: true, identities }),
+    });
+    expect(res.status).toBe(400);
+    expect((await json<ErrorBody>(res)).error).toContain('confirmIdentitiesAuthorized');
+  });
+
+  it('accepts an active scan with identities and the identity attestation', async () => {
+    const { app } = buildApp();
+    const res = await app.request('/scans', {
+      method: 'POST',
+      body: JSON.stringify({
+        urls: ['https://example.com'],
+        mode: 'active',
+        confirmAuthorized: true,
+        confirmIdentitiesAuthorized: true,
+        identities,
+      }),
+    });
+    expect(res.status).toBe(201);
+  });
+
+  it('rejects a malformed identity shape with a 400', async () => {
+    const { app } = buildApp();
+    const res = await app.request('/scans', {
+      method: 'POST',
+      body: JSON.stringify({ urls: ['https://example.com'], identities: [{ label: 'x', headers: { a: 1 }, privateUrls: [] }] }),
+    });
+    expect(res.status).toBe(400);
+  });
+
+  it('rejects an identity carrying a malformed private URL with a 400', async () => {
+    const { app } = buildApp();
+    const res = await app.request('/scans', {
+      method: 'POST',
+      body: JSON.stringify({
+        urls: ['https://example.com'],
+        identities: [{ label: 'x', headers: { cookie: 'session=x' }, privateUrls: ['not a url'] }],
+      }),
+    });
+    expect(res.status).toBe(400);
+  });
+});

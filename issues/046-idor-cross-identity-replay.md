@@ -1,7 +1,7 @@
 ---
 id: 046
 title: Confirm horizontal IDOR by cross-identity replay
-status: open
+status: done
 type: afk
 blocked-by: []
 ---
@@ -58,14 +58,14 @@ existing scan API.
 
 ## Definition of done
 
-- [ ] Failing test written first, confirmed red
-- [ ] Implementation makes it green
-- [ ] `test`, `typecheck`, `lint` all pass — the oracle is driven by a fake
+- [x] Failing test written first, confirmed red
+- [x] Implementation makes it green
+- [x] `test`, `typecheck`, `lint` all pass — the oracle is driven by a fake
   `HeaderedFetchImpl` mapping (url, headers) → (status, body): an `idor` hit
   (peer == owner, no-auth diverges), a public resource (no-auth == owner → no
   finding), and the persisted finding carrying `access_control_evidence` with
   `evidence_snippet`/`evidence_path` null.
-- [ ] Visible at: an active-mode scan started with two identities and the
+- [x] Visible at: an active-mode scan started with two identities and the
   attestation reports an `idor` finding via `GET /scans/:id`; the same scan
   without the attestation is rejected.
 

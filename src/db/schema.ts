@@ -9,7 +9,7 @@ export type FindingConfidence = 'definitive' | 'possible';
 // Oracle-confirmed active-scan categories. Passive/CVE detectors emit many more
 // free-form category strings, so this is a documented subset the injection-class
 // confirmers annotate against, not an exhaustive enum of the `category` column.
-export type FindingCategory = 'xss' | 'ssti' | 'sqli' | 'lfi' | 'crlf-injection';
+export type FindingCategory = 'xss' | 'ssti' | 'sqli' | 'lfi' | 'crlf-injection' | 'idor';
 
 export type XssOutcome = 'confirmed' | 'not_vulnerable' | 'unavailable';
 
@@ -82,6 +82,12 @@ export const findings = sqliteTable('findings', {
   // Set only on oracle-confirmed non-XSS findings (ssti/sqli/lfi/crlf-injection): the response
   // substring that proved the injection. XSS keeps using `evidencePath` (screenshot).
   evidenceSnippet: text('evidence_snippet'),
+  // Set only on access-control findings (idor): compact JSON differential proof —
+  // the URL, the owner/peer/no-auth response statuses and normalized-body digests,
+  // and the owner and unauthorized identity labels. Never any response body, so the
+  // report itself does not leak what the defect exposes. `evidenceSnippet` and
+  // `evidencePath` stay null for these categories.
+  accessControlEvidence: text('access_control_evidence'),
 });
 
 // A program is one engagement, not one domain: its in-scope list holds however

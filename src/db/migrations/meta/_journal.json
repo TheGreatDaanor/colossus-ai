@@ -99,6 +99,13 @@
       "when": 1789919711963,
       "tag": "0013_powerful_cobalt_man",
       "breakpoints": true
+    },
+    {
+      "idx": 14,
+      "version": "6",
+      "when": 1789998059976,
+      "tag": "0014_first_living_mummy",
+      "breakpoints": true
     }
   ]
 }

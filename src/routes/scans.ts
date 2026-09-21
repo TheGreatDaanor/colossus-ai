@@ -1,11 +1,54 @@
 import { Hono } from 'hono';
 import { ScanValidationError, type ScannerService, type StartScanOptions } from '../services/scanner.js';
+import type { Identity } from '../services/access-control.js';
 
 type StartScanBody = { urls: string[] } & StartScanOptions;
 
+function isHttpUrl(raw: string): boolean {
+  try {
+    const parsed = new URL(raw);
+    return parsed.protocol === 'http:' || parsed.protocol === 'https:';
+  } catch {
+    return false;
+  }
+}
+
+function isStringRecord(value: unknown): value is Record<string, string> {
+  return (
+    typeof value === 'object' &&
+    value !== null &&
+    !Array.isArray(value) &&
+    Object.values(value).every((v) => typeof v === 'string')
+  );
+}
+
+// Identities are opaque to Colossus: the header bundle is attached verbatim, so it
+// is validated only as a string→string map, never parsed for meaning. Returns the
+// sentinel `'invalid'` for a malformed shape so the caller can 400, distinct from
+// `undefined` (the field was simply absent).
+function parseIdentities(value: unknown): Identity[] | undefined | 'invalid' {
+  if (value === undefined) return undefined;
+  if (!Array.isArray(value)) return 'invalid';
+
+  const identities: Identity[] = [];
+  for (const entry of value) {
+    if (typeof entry !== 'object' || entry === null) return 'invalid';
+    const { label, headers, privateUrls } = entry as Record<string, unknown>;
+    if (typeof label !== 'string') return 'invalid';
+    if (!isStringRecord(headers)) return 'invalid';
+    if (!Array.isArray(privateUrls) || !privateUrls.every((u): u is string => typeof u === 'string')) return 'invalid';
+    // A private URL is fetched verbatim, so a malformed one would throw deep in the
+    // replay; reject it here as a 400 rather than letting it drop the whole pass.
+    if (!privateUrls.every(isHttpUrl)) return 'invalid';
+    identities.push({ label, headers, privateUrls });
+  }
+  return identities;
+}
+
 function parseStartScanBody(body: unknown): StartScanBody | null {
   if (typeof body !== 'object' || body === null) return null;
-  const { urls, programId, name, userAgent, mode, confirmAuthorized, authorizationNote } = body as Record<string, unknown>;
+  const { urls, programId, name, userAgent, mode, confirmAuthorized, authorizationNote, confirmIdentitiesAuthorized } =
+    body as Record<string, unknown>;
 
   if (!Array.isArray(urls) || !urls.every((u): u is string => typeof u === 'string')) return null;
   if (programId !== undefined && !Number.isInteger(programId)) return null;
@@ -14,6 +57,9 @@ function parseStartScanBody(body: unknown): StartScanBody | null {
   if (mode !== undefined && mode !== 'passive' && mode !== 'active') return null;
   if (confirmAuthorized !== undefined && typeof confirmAuthorized !== 'boolean') return null;
   if (authorizationNote !== undefined && typeof authorizationNote !== 'string') return null;
+  if (confirmIdentitiesAuthorized !== undefined && typeof confirmIdentitiesAuthorized !== 'boolean') return null;
+  const identities = parseIdentities((body as Record<string, unknown>).identities);
+  if (identities === 'invalid') return null;
 
   const parsed: StartScanBody = { urls };
   if (typeof programId === 'number') parsed.programId = programId;
@@ -22,6 +68,8 @@ function parseStartScanBody(body: unknown): StartScanBody | null {
   if (mode === 'passive' || mode === 'active') parsed.mode = mode;
   if (typeof confirmAuthorized === 'boolean') parsed.confirmAuthorized = confirmAuthorized;
   if (typeof authorizationNote === 'string') parsed.authorizationNote = authorizationNote;
+  if (typeof confirmIdentitiesAuthorized === 'boolean') parsed.confirmIdentitiesAuthorized = confirmIdentitiesAuthorized;
+  if (identities !== undefined) parsed.identities = identities;
   return parsed;
 }
 
