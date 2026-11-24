@@ -15,6 +15,7 @@ import {
   type LlmEnrichImpl,
 } from './scanner.js';
 import { ProgramsService, type CreateProgramOptions } from './programs.js';
+import type { CollaboratorClient, CollaboratorHit } from './ssrf-probe.js';
 
 function deferred<T>(): { promise: Promise<T>; resolve: (v: T) => void } {
   let resolve!: (v: T) => void;
@@ -2196,5 +2197,104 @@ describe('ScannerService access-control (idor)', () => {
     // The reported error never leaks the private body.
     expect(errored?.error).not.toContain('Invoice');
     expect(errored?.findings).toHaveLength(0);
+  });
+});
+
+describe('ScannerService active-mode SSRF', () => {
+  // A target that fetches whatever URL its `url` param names, and a collaborator that
+  // records the callback — the shared world a vulnerable server would create.
+  function ssrfWorld() {
+    let minted = 0;
+    const tokenByUrl = new Map<string, string>();
+    const hits: CollaboratorHit[] = [];
+    const collaborator: CollaboratorClient = {
+      mint() {
+        minted += 1;
+        const token = `tok${minted}`;
+        const url = `http://${token}.collab.test/`;
+        tokenByUrl.set(url, token);
+        return { token, url };
+      },
+      async poll(tokens) {
+        return hits.filter((h) => tokens.includes(h.token));
+      },
+    };
+    const bodyFetchImpl = vi.fn(async (url: string) => {
+      const token = tokenByUrl.get(new URL(url).searchParams.get('url') ?? '');
+      if (token !== undefined) {
+        hits.push({ token, protocol: 'http', callerSourceIp: '203.0.113.7', observedAt: new Date(0) });
+      }
+      return { body: '', headers: new Headers() };
+    });
+    return { collaborator, bodyFetchImpl };
+  }
+
+  const instantDrain = { windowMs: 30_000, pollIntervalMs: 3_000, sleep: async () => {} };
+
+  it('records a high, definitive ssrf finding when the target calls back to the collaborator', async () => {
+    const world = ssrfWorld();
+    const svc = new ScannerService(createDb(':memory:'), {
+      fetchImpl: vi.fn(async () => okResponse(FULLY_HARDENED_HEADERS)),
+      tlsCheckImpl: okTlsCheckImpl(),
+      xssConfirmImpl: vi.fn(async () => ({ outcome: 'not_vulnerable' as const })),
+      bodyFetchImpl: world.bodyFetchImpl,
+      collaborator: world.collaborator,
+      ssrfDrainTiming: instantDrain,
+    });
+    const scan = await svc.startScan(['https://example.com/fetch?url=a&q=b'], {
+      mode: 'active',
+      confirmAuthorized: true,
+    });
+    const completed = await completedScan(svc, scan.id);
+
+    const ssrf = completed.targets.flatMap((t) => t.findings).filter((f) => f.category === 'ssrf');
+    expect(ssrf).toHaveLength(1);
+    expect(ssrf[0]?.severity).toBe('high');
+    expect(ssrf[0]?.confidence).toBe('definitive');
+    expect(ssrf[0]?.injectionPoint).toBe('url');
+    const evidence = JSON.parse(ssrf[0]?.structuredEvidence ?? '{}');
+    expect(evidence).toMatchObject({ kind: 'ssrf', param: 'url', tier: 'oob', protocols: ['http'] });
+  });
+
+  it('records an ssrf attempt per param alongside, never instead of, the xss attempts', async () => {
+    const world = ssrfWorld();
+    const svc = new ScannerService(createDb(':memory:'), {
+      fetchImpl: vi.fn(async () => okResponse(FULLY_HARDENED_HEADERS)),
+      tlsCheckImpl: okTlsCheckImpl(),
+      xssConfirmImpl: vi.fn(async () => ({ outcome: 'not_vulnerable' as const })),
+      bodyFetchImpl: world.bodyFetchImpl,
+      collaborator: world.collaborator,
+      ssrfDrainTiming: instantDrain,
+    });
+    const scan = await svc.startScan(['https://example.com/fetch?url=a&q=b'], {
+      mode: 'active',
+      confirmAuthorized: true,
+    });
+    const completed = await completedScan(svc, scan.id);
+
+    const attempts = completed.targets[0]?.injectionAttempts ?? [];
+    const xss = attempts.filter((a) => (a.check ?? 'xss') === 'xss');
+    const ssrf = attempts.filter((a) => a.check === 'ssrf');
+    expect(xss.map((a) => a.injectionPoint).sort()).toEqual(['q', 'url']);
+    expect(ssrf.map((a) => [a.injectionPoint, a.phase, a.outcome]).sort()).toEqual([
+      ['q', 'oob', 'not_vulnerable'],
+      ['url', 'oob', 'confirmed'],
+    ]);
+  });
+
+  it('fires no ssrf payload in a passive-mode scan', async () => {
+    const world = ssrfWorld();
+    const svc = new ScannerService(createDb(':memory:'), {
+      fetchImpl: vi.fn(async () => okResponse(FULLY_HARDENED_HEADERS)),
+      tlsCheckImpl: okTlsCheckImpl(),
+      bodyFetchImpl: world.bodyFetchImpl,
+      collaborator: world.collaborator,
+      ssrfDrainTiming: instantDrain,
+    });
+    const scan = await svc.startScan(['https://example.com/fetch?url=a'], { mode: 'passive' });
+    const completed = await completedScan(svc, scan.id);
+
+    expect(world.bodyFetchImpl).not.toHaveBeenCalled();
+    expect(completed.targets.flatMap((t) => t.findings).filter((f) => f.category === 'ssrf')).toHaveLength(0);
   });
 });
