@@ -17,7 +17,15 @@ import { disallowedPrefixes, discoverLinks } from './discovery.js';
 import { runAccessControlChecks, type Identity, type HeaderedFetchImpl } from './access-control.js';
 import { hostCapFor, ProgramsService, type EnumeratedHost, type Scope } from './programs.js';
 import { findDisallowedAddress, isDisallowedAddress } from './ssrf-guard.js';
-import { makeSsrfProbe, type CollaboratorClient, type DrainTiming, type SsrfOutcome, type SsrfProbe } from './ssrf-probe.js';
+import {
+  DEFAULT_DRAIN_TIMING,
+  makeSsrfProbe,
+  makeUnavailableSsrfProbe,
+  type CollaboratorClient,
+  type DrainTiming,
+  type SsrfOutcome,
+  type SsrfProbe,
+} from './ssrf-probe.js';
 import {
   detectHeaderFindings,
   detectTlsFindings,
@@ -470,7 +478,7 @@ export class ScannerService {
   // fake mapping (url, headers) → (status, body) to drive the oracle offline.
   readonly #headeredFetchImpl: HeaderedFetchImpl;
   // The out-of-band SSRF collaborator. Null when the deployment has none, in which
-  // case no SSRF payloads are fired (reporting that as `unavailable` is 053).
+  // case no SSRF payloads are fired and every param is reported `unavailable`.
   readonly #collaborator: CollaboratorClient | null;
   readonly #ssrfDrainTiming: DrainTiming | undefined;
   // SSRF fire is a plain body fetch, so it reuses the oracle classes' fetcher.
@@ -705,16 +713,7 @@ export class ScannerService {
       discoveredCount: new Map(targetRows.map((t) => [t.id, new Budget(MAX_DISCOVERED_PER_ROOT)])),
     };
 
-    // One SSRF probe per scan run: it holds this scan's pending tokens in memory
-    // until the drain below resolves them. Fire shares the oracle fetch budget.
-    const ssrf =
-      mode === 'active' && this.#collaborator !== null
-        ? makeSsrfProbe<number>(
-            (url) => this.#fetchSemaphore.run(() => this.#ssrfFetchImpl(url)),
-            this.#collaborator,
-            this.#ssrfDrainTiming,
-          )
-        : null;
+    const ssrf = mode === 'active' ? await this.#preflightSsrf(scanId) : null;
 
     const queue = [...targetRows];
     while (queue.length > 0) {
@@ -733,7 +732,13 @@ export class ScannerService {
 
     // The scan-level drain barrier: every SSRF payload across the whole scan has been
     // fired, so one bounded window resolves them all before the scan completes.
-    if (ssrf !== null) this.#persistSsrfOutcomes(await ssrf.drainCollaborator());
+    if (ssrf !== null) {
+      this.#persistSsrfOutcomes(await ssrf.drainCollaborator());
+      const { fired, received, late, ownEgressDiscarded, unavailable } = ssrf.stats();
+      console.warn(
+        `[scan ${scanId}] ssrf fired=${fired} received=${received} late=${late} own-egress-discarded=${ownEgressDiscarded} unavailable=${unavailable}`,
+      );
+    }
 
     this.#db
       .update(scans)
@@ -1058,6 +1063,30 @@ export class ScannerService {
     );
   }
 
+  // One SSRF probe per active scan run: it holds this scan's pending tokens in memory
+  // until the drain resolves them, and fire shares the oracle fetch budget. The
+  // preflight self-test proves the collaborator end-to-end and learns Colossus's own
+  // egress IPs; with no collaborator, or a failed or throwing self-test, the probe
+  // fires nothing and reports SSRF `unavailable` per param — never a failed scan.
+  async #preflightSsrf(scanId: number): Promise<SsrfProbe<number>> {
+    if (this.#collaborator === null) return makeUnavailableSsrfProbe('collaborator-not-configured');
+    let result;
+    try {
+      result = await this.#collaborator.selfTest(this.#ssrfFetchImpl);
+    } catch (err) {
+      result = { ok: false as const, reason: err instanceof Error ? err.message : String(err) };
+    }
+    if (!result.ok) {
+      console.warn(`[scan ${scanId}] ssrf collaborator self-test failed: ${result.reason}`);
+      return makeUnavailableSsrfProbe(`collaborator-self-test-failed: ${result.reason}`);
+    }
+    return makeSsrfProbe<number>(
+      (url) => this.#fetchSemaphore.run(() => this.#ssrfFetchImpl(url)),
+      this.#collaborator,
+      { ...(this.#ssrfDrainTiming ?? DEFAULT_DRAIN_TIMING), ownEgressIps: result.ownEgressIps },
+    );
+  }
+
   // Every SSRF verdict is recorded as an `oob` attempt on its target, merged into —
   // never replacing — the XSS attempts already there; an `internal-read` attempt is
   // added only on a signature match (a miss has no honest negative). Either signal
@@ -1074,6 +1103,7 @@ export class ScannerService {
         injectionPoint: outcome.param,
         payload: outcome.payload,
         outcome: outcome.outcome,
+        ...(outcome.error === undefined ? {} : { error: outcome.error }),
       });
       if (outcome.internalRead !== undefined) {
         attempts.push({

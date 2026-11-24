@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import type { CollaboratorClient, CollaboratorHit } from './ssrf-probe.js';
-import { makeSsrfProbe } from './ssrf-probe.js';
+import { makeSsrfProbe, makeUnavailableSsrfProbe } from './ssrf-probe.js';
 
 // A fake collaborator plus a fake target that share one world: when the target
 // "fetches" a URL whose `fetches` param holds a collaborator URL, the collaborator
@@ -23,6 +23,7 @@ function fakeWorld(vulnerableParams: string[]) {
       polls += 1;
       return hits.filter((h) => tokens.includes(h.token));
     },
+    selfTest: async () => ({ ok: true, ownEgressIps: [] }),
   };
 
   const fetched: string[] = [];
@@ -106,6 +107,7 @@ describe('ssrf probe callback protocols', () => {
       async poll(asked) {
         return asked.flatMap((token) => script(token).map((hit) => ({ token, ...hit })));
       },
+      selfTest: async () => ({ ok: true, ownEgressIps: [] }),
     };
   }
   const noopFetch = async () => ({ body: '', headers: new Headers() });
@@ -183,6 +185,7 @@ describe('ssrf probe internal-read tier', () => {
       async poll(tokens) {
         return hits.filter((h) => tokens.includes(h.token));
       },
+      selfTest: async () => ({ ok: true, ownEgressIps: [] }),
     };
     const fetched: string[] = [];
     const fetchImpl = async (url: string) => {
@@ -277,5 +280,83 @@ describe('ssrf probe internal-read tier', () => {
     await probe.fire(new URL('https://example.com/fetch?url=a'), 1);
     const [o] = await probe.drainCollaborator();
     expect(o?.internalRead).toBeUndefined();
+  });
+});
+
+describe('ssrf probe degraded outcomes', () => {
+  // Every minted token calls back over http from `caller`; `failPolls` lists the
+  // (1-based) poll numbers that throw, as an unreachable listener would.
+  function callingBack(caller: string, failPolls: number[] = [], callsBack = (_token: string) => true) {
+    let minted = 0;
+    let polls = 0;
+    const collaborator: CollaboratorClient = {
+      mint() {
+        minted += 1;
+        return { token: `tok${minted}`, url: `http://tok${minted}.collab.test/` };
+      },
+      async poll(tokens) {
+        polls += 1;
+        if (failPolls.includes(polls)) throw new Error('ECONNREFUSED');
+        return tokens
+          .filter(callsBack)
+          .map((token) => ({ token, protocol: 'http' as const, callerSourceIp: caller, observedAt: new Date(0) }));
+      },
+      selfTest: async () => ({ ok: true, ownEgressIps: [] }),
+    };
+    return collaborator;
+  }
+  const noopFetch = async () => ({ body: '', headers: new Headers() });
+
+  it("discards a callback from colossus's own egress ip", async () => {
+    const probe = makeSsrfProbe<number>(noopFetch, callingBack('192.0.2.10'), {
+      ...instantDrain,
+      ownEgressIps: ['192.0.2.10'],
+    });
+    await probe.fire(new URL('https://example.com/?url=a'), 1);
+    const [o] = await probe.drainCollaborator();
+
+    expect(o?.outcome).toBe('not_vulnerable');
+    expect(o?.evidence).toBeUndefined();
+    expect(probe.stats().ownEgressDiscarded).toBe(1);
+  });
+
+  it('marks unconfirmed points unavailable when a poll fails mid-drain, and still completes', async () => {
+    // tok1 calls back, tok2 never does; poll 2 fails.
+    const collaborator = callingBack('203.0.113.7', [2], (t) => t === 'tok1');
+    const probe = makeSsrfProbe<number>(noopFetch, collaborator, instantDrain);
+    await probe.fire(new URL('https://example.com/?a=1&b=2'), 1);
+    const outcomes = await probe.drainCollaborator();
+
+    const byParam = new Map(outcomes.map((o) => [o.param, o]));
+    expect(byParam.get('a')?.outcome).toBe('confirmed');
+    expect(byParam.get('b')?.outcome).toBe('unavailable');
+    expect(byParam.get('b')?.error).toBe('collaborator-unreachable-mid-drain');
+    expect(probe.stats()).toMatchObject({ fired: 2, received: 1, unavailable: 1 });
+  });
+
+  it('drops and counts, once, a hit for a token this scan is not waiting on', async () => {
+    const collaborator: CollaboratorClient = {
+      mint: () => ({ token: 'mine', url: 'http://mine.collab.test/' }),
+      poll: async () => [{ token: 'stale', protocol: 'dns', callerSourceIp: '203.0.113.7', observedAt: new Date(0) }],
+      selfTest: async () => ({ ok: true, ownEgressIps: [] }),
+    };
+    const probe = makeSsrfProbe<number>(noopFetch, collaborator, instantDrain);
+    await probe.fire(new URL('https://example.com/?url=a'), 1);
+    const [o] = await probe.drainCollaborator();
+
+    expect(o?.outcome).toBe('not_vulnerable');
+    expect(probe.stats().late).toBe(1);
+  });
+
+  it('an unavailable probe fires nothing and reports every param unavailable with its reason', async () => {
+    const probe = makeUnavailableSsrfProbe<number>('collaborator-not-configured');
+    await probe.fire(new URL('https://example.com/?a=1&b=2'), 7);
+    const outcomes = await probe.drainCollaborator();
+
+    expect(outcomes.map((o) => [o.param, o.outcome, o.error, o.context])).toEqual([
+      ['a', 'unavailable', 'collaborator-not-configured', 7],
+      ['b', 'unavailable', 'collaborator-not-configured', 7],
+    ]);
+    expect(probe.stats()).toMatchObject({ fired: 0, unavailable: 2 });
   });
 });

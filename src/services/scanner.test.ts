@@ -3,7 +3,7 @@ import type { AddressInfo } from 'node:net';
 import { readFile, rm } from 'node:fs/promises';
 import { afterAll, describe, expect, it, vi } from 'vitest';
 import { createDb } from '../db/client.js';
-import { findings, scans, scanTargets } from '../db/schema.js';
+import { findings, scans, scanTargets, type InjectionAttempt } from '../db/schema.js';
 import {
   ScannerService,
   ScanValidationError,
@@ -61,6 +61,13 @@ function okResponse(body: Record<string, string> = { 'x-test': '1' }): Response 
 // sockets in tests" testing decision) and stay fast/offline-safe.
 function okTlsCheckImpl(): TlsCheckImpl {
   return vi.fn(async () => ({ version: 'TLSv1.3', certExpiresAt: new Date('2099-01-01T00:00:00Z') }));
+}
+
+
+// Active scans also record SSRF attempts (unavailable with no collaborator); XSS
+// assertions look at the XSS rows alone. Rows without `check` read as xss.
+function xssAttempts(attempts: InjectionAttempt[] | null | undefined): InjectionAttempt[] {
+  return (attempts ?? []).filter((a) => (a.check ?? 'xss') === 'xss');
 }
 
 describe('ScannerService program scans', () => {
@@ -1381,7 +1388,7 @@ describe('ScannerService active-mode query-param injection', () => {
     await completedScan(svc, scan.id);
 
     const target = (await svc.getScan(scan.id))?.targets[0];
-    expect(target?.injectionAttempts?.map((a) => a.injectionPoint)).toEqual(['q', 'page']);
+    expect(xssAttempts(target?.injectionAttempts).map((a) => a.injectionPoint)).toEqual(['q', 'page']);
   });
 
   it('records a unique canary marker payload per injection point', async () => {
@@ -1394,7 +1401,7 @@ describe('ScannerService active-mode query-param injection', () => {
 
     await completedScan(svc, scan.id);
 
-    const attempts = (await svc.getScan(scan.id))?.targets[0]?.injectionAttempts ?? [];
+    const attempts = xssAttempts((await svc.getScan(scan.id))?.targets[0]?.injectionAttempts);
     const payloads = attempts.map((a) => a.payload);
     for (const payload of payloads) {
       expect(payload).toMatch(/^<script>window\.__colossus_xss_marker='[0-9a-f-]{36}'<\/script>$/);
@@ -1598,7 +1605,7 @@ describe('ScannerService active-mode XSS confirmation', () => {
     expect(xss?.confidence).toBe('definitive');
     expect(xss?.injectionPoint).toBe('q');
     expect(xss?.payload).toContain('__colossus_xss_marker');
-    expect(target?.injectionAttempts?.map((a) => a.outcome)).toEqual(['confirmed']);
+    expect(xssAttempts(target?.injectionAttempts).map((a) => a.outcome)).toEqual(['confirmed']);
   });
 
   it('records a not_vulnerable outcome and writes no finding when execution is not confirmed', async () => {
@@ -1618,7 +1625,7 @@ describe('ScannerService active-mode XSS confirmation', () => {
 
     const target = (await svc.getScan(scan.id))?.targets[0];
     expect(target?.findings.some((f) => f.category === 'xss')).toBe(false);
-    expect(target?.injectionAttempts?.map((a) => a.outcome)).toEqual(['not_vulnerable']);
+    expect(xssAttempts(target?.injectionAttempts).map((a) => a.outcome)).toEqual(['not_vulnerable']);
   });
 
   it('saves the confirmation screenshot to disk and exposes evidencePath on the finding', async () => {
@@ -2203,7 +2210,10 @@ describe('ScannerService access-control (idor)', () => {
 describe('ScannerService active-mode SSRF', () => {
   // A target that fetches whatever URL its `url` param names, and a collaborator that
   // records the callback — the shared world a vulnerable server would create.
-  function ssrfWorld(metadataBody = '') {
+  function ssrfWorld(
+    metadataBody = '',
+    selfTest: CollaboratorClient['selfTest'] = async () => ({ ok: true, ownEgressIps: [] }),
+  ) {
     let minted = 0;
     const tokenByUrl = new Map<string, string>();
     const hits: CollaboratorHit[] = [];
@@ -2218,6 +2228,7 @@ describe('ScannerService active-mode SSRF', () => {
       async poll(tokens) {
         return hits.filter((h) => tokens.includes(h.token));
       },
+      selfTest,
     };
     const bodyFetchImpl = vi.fn(async (url: string) => {
       const token = tokenByUrl.get(new URL(url).searchParams.get('url') ?? '');
@@ -2314,6 +2325,57 @@ describe('ScannerService active-mode SSRF', () => {
       ['url', 'internal-read', 'confirmed'],
       ['url', 'oob', 'confirmed'],
     ]);
+  });
+
+  async function activeScan(world: ReturnType<typeof ssrfWorld> | null) {
+    const bodyFetchImpl = world?.bodyFetchImpl ?? vi.fn(async () => ({ body: '', headers: new Headers() }));
+    const svc = new ScannerService(createDb(':memory:'), {
+      fetchImpl: vi.fn(async () => okResponse(FULLY_HARDENED_HEADERS)),
+      tlsCheckImpl: okTlsCheckImpl(),
+      xssConfirmImpl: vi.fn(async () => ({ outcome: 'not_vulnerable' as const })),
+      bodyFetchImpl,
+      ...(world === null ? {} : { collaborator: world.collaborator }),
+      ssrfDrainTiming: instantDrain,
+    });
+    const scan = await svc.startScan(['https://example.com/fetch?url=a&q=b'], {
+      mode: 'active',
+      confirmAuthorized: true,
+    });
+    return completedScan(svc, scan.id);
+  }
+
+  it('marks ssrf unavailable per param when no collaborator is configured, and the scan still completes', async () => {
+    const completed = await activeScan(null);
+
+    expect(completed.status).toBe('completed');
+    const attempts = completed.targets[0]?.injectionAttempts ?? [];
+    expect(xssAttempts(attempts)).toHaveLength(2);
+    const ssrf = attempts.filter((a) => a.check === 'ssrf');
+    expect(ssrf.map((a) => [a.injectionPoint, a.phase, a.outcome, a.error]).sort()).toEqual([
+      ['q', 'oob', 'unavailable', 'collaborator-not-configured'],
+      ['url', 'oob', 'unavailable', 'collaborator-not-configured'],
+    ]);
+  });
+
+  it('marks ssrf unavailable with the self-test reason, and fires no ssrf payload', async () => {
+    const world = ssrfWorld('', async () => ({ ok: false, reason: 'dns delegation missing' }));
+    const completed = await activeScan(world);
+
+    expect(completed.status).toBe('completed');
+    const ssrf = (completed.targets[0]?.injectionAttempts ?? []).filter((a) => a.check === 'ssrf');
+    expect(ssrf.map((a) => [a.outcome, a.error])).toEqual([
+      ['unavailable', 'collaborator-self-test-failed: dns delegation missing'],
+      ['unavailable', 'collaborator-self-test-failed: dns delegation missing'],
+    ]);
+    const fired = world.bodyFetchImpl.mock.calls.map(([u]) => u).filter((u) => u.includes('collab.test'));
+    expect(fired).toEqual([]);
+  });
+
+  it("never confirms from a callback made by colossus's own egress ip", async () => {
+    const world = ssrfWorld('', async () => ({ ok: true, ownEgressIps: ['203.0.113.7'] }));
+    const completed = await activeScan(world);
+
+    expect(completed.targets.flatMap((t) => t.findings).filter((f) => f.category === 'ssrf')).toHaveLength(0);
   });
 
   it('fires no ssrf payload in a passive-mode scan', async () => {

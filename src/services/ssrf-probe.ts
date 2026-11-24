@@ -7,7 +7,13 @@ import type { BodyFetchImpl } from './active-scanner.js';
 export interface CollaboratorClient {
   mint(): { token: string; url: string };
   poll(tokens: string[]): Promise<CollaboratorHit[]>;
+  // The preflight: Colossus fetches a fresh token URL itself, proving DNS delegation,
+  // the HTTP listener and the query API end-to-end, and learning its own egress IPs
+  // so their callbacks can be discarded. Not a health ping.
+  selfTest(fetchImpl: BodyFetchImpl): Promise<SelfTestResult>;
 }
+
+export type SelfTestResult = { ok: true; ownEgressIps: string[] } | { ok: false; reason: string };
 
 export type CollaboratorHit = {
   token: string;
@@ -57,7 +63,9 @@ export type SsrfOutcome<C> = {
   url: string;
   param: string;
   payload: string;
-  outcome: 'confirmed' | 'not_vulnerable';
+  outcome: 'confirmed' | 'not_vulnerable' | 'unavailable';
+  // Why the `oob` attempt is `unavailable` (e.g. `collaborator-unreachable-mid-drain`).
+  error?: string;
   internalRead?: { payload: string; matchedSignature: string };
   severity?: 'high' | 'critical';
   evidence?: SsrfEvidence;
@@ -67,7 +75,24 @@ export type DrainTiming = {
   windowMs: number;
   pollIntervalMs: number;
   sleep?: (ms: number) => Promise<void>;
+  // Colossus's own egress, learned by the self-test: callbacks from these are
+  // Colossus fetching a reflected URL, never the target, so they never confirm.
+  ownEgressIps?: string[];
 };
+
+export const DEFAULT_DRAIN_TIMING: DrainTiming = { windowMs: 30_000, pollIntervalMs: 3_000 };
+
+// Observability for one scan's SSRF run, logged by the scanner after the drain.
+// `late` counts hits for tokens this probe is not (or no longer) waiting on.
+export type SsrfStats = {
+  fired: number;
+  received: number;
+  late: number;
+  ownEgressDiscarded: number;
+  unavailable: number;
+};
+
+export const MID_DRAIN_REASON = 'collaborator-unreachable-mid-drain';
 
 export interface SsrfProbe<C> {
   // Sends a collaborator URL into every query param of `target`, registering each
@@ -77,6 +102,27 @@ export interface SsrfProbe<C> {
   // The scan-level barrier: polls the collaborator across one bounded window and
   // resolves every pending token. Returns immediately when nothing was fired.
   drainCollaborator(): Promise<SsrfOutcome<C>[]>;
+  stats(): SsrfStats;
+}
+
+// The probe when SSRF cannot be tested (no collaborator, or a failed self-test): it
+// fires nothing and reports every param `unavailable` with `reason`, so a clean
+// report is never mistaken for "no SSRF".
+export function makeUnavailableSsrfProbe<C>(reason: string): SsrfProbe<C> {
+  const outcomes: SsrfOutcome<C>[] = [];
+  let unavailable = 0;
+  return {
+    async fire(target, context) {
+      for (const param of new Set(target.searchParams.keys())) {
+        unavailable += 1;
+        outcomes.push({ context, url: target.toString(), param, payload: '', outcome: 'unavailable', error: reason });
+      }
+    },
+    async drainCollaborator() {
+      return outcomes.splice(0);
+    },
+    stats: () => ({ fired: 0, received: 0, late: 0, ownEgressDiscarded: 0, unavailable }),
+  };
 }
 
 // `earliest` keeps one hit per protocol — the earliest seen — so a cumulative
@@ -100,10 +146,20 @@ const defaultSleep = (ms: number) => new Promise<void>((resolve) => setTimeout(r
 export function makeSsrfProbe<C>(
   fetchImpl: BodyFetchImpl,
   collaborator: CollaboratorClient,
-  timing: DrainTiming = { windowMs: 30_000, pollIntervalMs: 3_000 },
+  timing: DrainTiming = DEFAULT_DRAIN_TIMING,
 ): SsrfProbe<C> {
   const pending = new Map<string, Pending<C>>();
   const sleep = timing.sleep ?? defaultSleep;
+  const ownEgress = new Set(timing.ownEgressIps ?? []);
+  const stats: SsrfStats = { fired: 0, received: 0, late: 0, ownEgressDiscarded: 0, unavailable: 0 };
+  // The listener buffer is cumulative, so dropped hits are counted once each.
+  const dropped = new Set<string>();
+  const dropOnce = (hit: CollaboratorHit) => {
+    const key = `${hit.token}|${hit.protocol}|${hit.callerSourceIp}|${hit.observedAt.toISOString()}`;
+    if (dropped.has(key)) return false;
+    dropped.add(key);
+    return true;
+  };
 
   return {
     async fire(target, context) {
@@ -119,6 +175,7 @@ export function makeSsrfProbe<C>(
           internalReadMatched: false,
         };
         pending.set(token, entry);
+        stats.fired += 1;
         const mutated = new URL(target);
         mutated.searchParams.set(param, payload);
         fires.push(fetchImpl(mutated.toString()).catch(() => undefined));
@@ -141,12 +198,33 @@ export function makeSsrfProbe<C>(
       if (pending.size === 0) return [];
       const tokens = [...pending.keys()];
       const polls = Math.max(1, Math.ceil(timing.windowMs / timing.pollIntervalMs));
+      // One failed poll means callbacks may have gone unread, so every point still
+      // unconfirmed at the end is `unavailable`, not `not_vulnerable`. Polling goes on:
+      // a later poll still returns the cumulative buffer.
+      let pollFailed = false;
       for (let i = 0; i < polls; i++) {
         await sleep(timing.pollIntervalMs);
-        const seen = await collaborator.poll(tokens);
+        let seen: CollaboratorHit[];
+        try {
+          seen = await collaborator.poll(tokens);
+        } catch (err) {
+          pollFailed = true;
+          console.warn(`ssrf collaborator poll failed: ${err instanceof Error ? err.message : String(err)}`);
+          continue;
+        }
         for (const hit of seen) {
           const entry = pending.get(hit.token);
-          if (entry === undefined) continue;
+          if (entry === undefined) {
+            if (dropOnce(hit)) {
+              stats.late += 1;
+              console.warn(`ssrf callback for unknown or expired token ${hit.token} dropped`);
+            }
+            continue;
+          }
+          if (ownEgress.has(hit.callerSourceIp)) {
+            if (dropOnce(hit)) stats.ownEgressDiscarded += 1;
+            continue;
+          }
           const known = entry.earliest.get(hit.protocol);
           if (known === undefined || hit.observedAt < known.observedAt) entry.earliest.set(hit.protocol, hit);
         }
@@ -159,8 +237,12 @@ export function makeSsrfProbe<C>(
           (soonest, hit) => (soonest === undefined || hit.observedAt < soonest.observedAt ? hit : soonest),
           undefined,
         );
-        const outcome = first === undefined ? 'not_vulnerable' : 'confirmed';
-        const base = { context, url, param, payload, outcome } as const;
+        if (first !== undefined) stats.received += 1;
+        const unavailable = first === undefined && pollFailed;
+        if (unavailable) stats.unavailable += 1;
+        const base: SsrfOutcome<C> = unavailable
+          ? { context, url, param, payload, outcome: 'unavailable', error: MID_DRAIN_REASON }
+          : { context, url, param, payload, outcome: first === undefined ? 'not_vulnerable' : 'confirmed' };
         if (!entry.internalReadMatched && first === undefined) return base;
         const callback =
           first === undefined
@@ -192,5 +274,7 @@ export function makeSsrfProbe<C>(
       pending.clear();
       return outcomes;
     },
+
+    stats: () => ({ ...stats }),
   };
 }
