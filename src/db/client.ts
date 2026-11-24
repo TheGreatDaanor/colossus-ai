@@ -12,5 +12,20 @@ export function createDb(path: string): Db {
   const sqlite = new Database(path);
   const db = drizzle(sqlite, { schema });
   migrate(db, { migrationsFolder: './src/db/migrations' });
+  carryLegacyAccessControlEvidence(sqlite);
   return db;
+}
+
+// Data move that drizzle-kit can't generate: access-control proof written before
+// `structured_evidence` existed lives only in `access_control_evidence`. Copy it
+// across, tagged with its `kind`. Idempotent (touches only rows not yet copied), so
+// it is safe on every start. Remove together with the follow-up migration that
+// drops `access_control_evidence`.
+function carryLegacyAccessControlEvidence(sqlite: Database.Database): void {
+  sqlite.exec(`
+    UPDATE findings
+       SET structured_evidence = json_patch('{"kind":"access-control"}', access_control_evidence)
+     WHERE access_control_evidence IS NOT NULL
+       AND structured_evidence IS NULL
+  `);
 }

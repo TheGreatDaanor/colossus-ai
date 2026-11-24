@@ -1,0 +1,1 @@
+ALTER TABLE `findings` ADD `structured_evidence` text;

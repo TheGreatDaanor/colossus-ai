@@ -2064,10 +2064,11 @@ describe('ScannerService access-control (idor)', () => {
     expect(finding?.evidenceSnippet).toBeNull();
     expect(finding?.evidencePath).toBeNull();
     // The proof carries digests and labels but never the private body.
-    expect(finding?.accessControlEvidence).toBeTruthy();
-    expect(finding?.accessControlEvidence).not.toContain('Invoice');
-    expect(finding?.accessControlEvidence).toContain('alice');
-    expect(finding?.accessControlEvidence).toContain('bob');
+    expect(finding?.structuredEvidence).toBeTruthy();
+    expect(JSON.parse(finding?.structuredEvidence ?? '{}').kind).toBe('access-control');
+    expect(finding?.structuredEvidence).not.toContain('Invoice');
+    expect(finding?.structuredEvidence).toContain('alice');
+    expect(finding?.structuredEvidence).toContain('bob');
     // The finding hangs off a target carrying the leaked URL.
     const idorTarget = completed.targets.find((t) => t.findings.some((f) => f.category === 'idor'));
     expect(idorTarget?.url).toBe(invoiceUrl);
@@ -2103,8 +2104,9 @@ describe('ScannerService access-control (idor)', () => {
     expect(unauth[0]?.severity).toBe('high');
     expect(unauth[0]?.confidence).toBe('definitive');
     expect(unauth[0]?.evidenceSnippet).toBeNull();
-    expect(unauth[0]?.accessControlEvidence).toBeTruthy();
-    expect(unauth[0]?.accessControlEvidence).not.toContain('Invoice');
+    expect(unauth[0]?.structuredEvidence).toBeTruthy();
+    expect(JSON.parse(unauth[0]?.structuredEvidence ?? '{}').kind).toBe('access-control');
+    expect(unauth[0]?.structuredEvidence).not.toContain('Invoice');
     const target = completed.targets.find((t) =>
       t.findings.some((f) => f.category === 'unauthenticated-resource-access'),
     );

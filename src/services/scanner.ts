@@ -1087,7 +1087,7 @@ export class ScannerService {
           // The cross-identity match is a fact about the responses, not a guess:
           // definitive, exactly as the oracle-confirmed injection findings are.
           confidence: 'definitive',
-          accessControlEvidence: JSON.stringify(outcome.proof),
+          structuredEvidence: JSON.stringify({ kind: 'access-control', ...outcome.proof }),
         })
         .run();
     }
