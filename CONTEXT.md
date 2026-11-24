@@ -211,3 +211,45 @@ the unmodified response plays for an injection class: the fixed point a hit is
 a deviation from. An access-control hit is confirmed when an identity that
 should not have the resource nonetheless receives a response matching the
 ground-truth resource.
+
+## Collaborator
+
+The **self-hosted listener Colossus controls** for out-of-band confirmation: a
+host a target's server can be induced to contact, and which Colossus can ask
+"who contacted you, carrying which token?". One collaborator serves a whole
+deployment; tokens, not network isolation, separate scans.
+
+## Callback
+
+A **DNS lookup or HTTP request reaching the collaborator that carries an
+injected token** — the out-of-band evidence that the target's own server made
+a request it was told to make. A bare DNS resolution counts. A callback whose
+caller is Colossus itself is not evidence and is discarded.
+
+## Drain window
+
+The **single bounded wait at the end of a scan** during which Colossus
+collects callbacks for every token it fired. Callbacks arriving after it are
+ignored: a finished scan's verdicts are final.
+
+## SSRF tier
+
+How far a confirmed SSRF demonstrably reaches:
+
+- **`oob`** — the target's server made an outbound request (proved by a
+  callback).
+- **`internal-read`** — the target's server fetched an internal resource and
+  returned content only that resource produces (a known signature, never an
+  echo of the payload). Proof stands on its own, with or without a callback.
+
+A change of tier for the same parameter is new exposure, not a repeat. An
+internal read that was not observed is **not demonstrated**, never *not
+vulnerable*: the miss cannot tell a protected endpoint from an app that simply
+never shows what it fetched.
+
+## Unavailable
+
+A check outcome meaning **"Colossus could not test this"** — distinct from
+*not vulnerable*. A missing browser, an unconfigured or unreachable
+collaborator, or callbacks that could not be read all yield `unavailable`,
+carry a reason, and must never read as a clean result.
