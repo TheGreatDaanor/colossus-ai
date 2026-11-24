@@ -2214,6 +2214,7 @@ describe('ScannerService active-mode SSRF', () => {
     metadataBody = '',
     selfTest: CollaboratorClient['selfTest'] = async () => ({ ok: true, ownEgressIps: [] }),
   ) {
+    let metadata = metadataBody;
     let minted = 0;
     const tokenByUrl = new Map<string, string>();
     const hits: CollaboratorHit[] = [];
@@ -2236,9 +2237,15 @@ describe('ScannerService active-mode SSRF', () => {
         hits.push({ token, protocol: 'http', callerSourceIp: '203.0.113.7', observedAt: new Date(0) });
       }
       const reflectsMetadata = new URL(url).searchParams.get('url') === 'http://169.254.169.254/latest/meta-data/';
-      return { body: reflectsMetadata ? metadataBody : '', headers: new Headers() };
+      return { body: reflectsMetadata ? metadata : '', headers: new Headers() };
     });
-    return { collaborator, bodyFetchImpl };
+    return {
+      collaborator,
+      bodyFetchImpl,
+      reflectMetadata(body: string) {
+        metadata = body;
+      },
+    };
   }
 
   const instantDrain = { windowMs: 30_000, pollIntervalMs: 3_000, sleep: async () => {} };
@@ -2378,6 +2385,33 @@ describe('ScannerService active-mode SSRF', () => {
     expect(completed.targets.flatMap((t) => t.findings).filter((f) => f.category === 'ssrf')).toHaveLength(0);
   });
 
+  it('marks a standing ssrf not-new on a re-scan, and a tier upgrade new', async () => {
+    const world = ssrfWorld();
+    const svc = new ScannerService(createDb(':memory:'), {
+      fetchImpl: vi.fn(async () => okResponse(FULLY_HARDENED_HEADERS)),
+      tlsCheckImpl: okTlsCheckImpl(),
+      xssConfirmImpl: vi.fn(async () => ({ outcome: 'not_vulnerable' as const })),
+      bodyFetchImpl: world.bodyFetchImpl,
+      collaborator: world.collaborator,
+      ssrfDrainTiming: instantDrain,
+    });
+    const scanOnce = async () => {
+      const scan = await svc.startScan(['https://example.com/fetch?url=a'], { mode: 'active', confirmAuthorized: true });
+      const completed = await completedScan(svc, scan.id);
+      return completed.targets.flatMap((t) => t.findings).filter((f) => f.category === 'ssrf');
+    };
+
+    const first = await scanOnce();
+    const second = await scanOnce();
+    world.reflectMetadata(['ami-id', 'instance-id', 'instance-type', 'local-ipv4'].join('\n'));
+    const upgraded = await scanOnce();
+
+    expect(first.map((f) => f.isNew)).toEqual([true]);
+    // A fresh token was fired, yet the standing bug is the same (target, param, tier).
+    expect(second.map((f) => f.isNew)).toEqual([false]);
+    expect(upgraded.map((f) => [f.severity, f.isNew])).toEqual([['critical', true]]);
+  });
+
   it('fires no ssrf payload in a passive-mode scan', async () => {
     const world = ssrfWorld();
     const svc = new ScannerService(createDb(':memory:'), {
@@ -2392,5 +2426,48 @@ describe('ScannerService active-mode SSRF', () => {
 
     expect(world.bodyFetchImpl).not.toHaveBeenCalled();
     expect(completed.targets.flatMap((t) => t.findings).filter((f) => f.category === 'ssrf')).toHaveLength(0);
+  });
+});
+
+describe('ScannerService finding newness', () => {
+  function service() {
+    // No security headers, so every scan of a target yields the same missing-header findings.
+    return new ScannerService(createDb(':memory:'), {
+      fetchImpl: vi.fn(async () => okResponse()),
+      tlsCheckImpl: okTlsCheckImpl(),
+    });
+  }
+  const scanFindings = async (svc: ScannerService, urls: string[]) => {
+    const scan = await svc.startScan(urls);
+    return (await completedScan(svc, scan.id)).targets.flatMap((t) => t.findings);
+  };
+
+  it('marks every finding new on the first scan of a target and not-new when it stands on a re-scan', async () => {
+    const svc = service();
+    const first = await scanFindings(svc, ['https://example.com/']);
+    const second = await scanFindings(svc, ['https://example.com']);
+
+    expect(first.length).toBeGreaterThan(0);
+    expect(first.every((f) => f.isNew)).toBe(true);
+    expect(second.map((f) => f.category).sort()).toEqual(first.map((f) => f.category).sort());
+    expect(second.every((f) => !f.isNew)).toBe(true);
+  });
+
+  it('does not count a finding on a different target as prior', async () => {
+    const svc = service();
+    await scanFindings(svc, ['https://other.example/']);
+    const findingsHere = await scanFindings(svc, ['https://example.com/']);
+
+    expect(findingsHere.every((f) => f.isNew)).toBe(true);
+  });
+
+  it('judges an earlier scan against only the scans before it', async () => {
+    const svc = service();
+    const first = await svc.startScan(['https://example.com/']);
+    await completedScan(svc, first.id);
+    await scanFindings(svc, ['https://example.com/']);
+
+    const reread = (await svc.getScan(first.id))?.targets.flatMap((t) => t.findings) ?? [];
+    expect(reread.every((f) => f.isNew)).toBe(true);
   });
 });

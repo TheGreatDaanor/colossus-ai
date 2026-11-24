@@ -1,5 +1,5 @@
 import { connect as tlsConnect } from 'node:tls';
-import { eq } from 'drizzle-orm';
+import { eq, lt } from 'drizzle-orm';
 import type { Db } from '../db/client.js';
 import {
   makeXssInjectionClass,
@@ -60,7 +60,8 @@ export type Scan = typeof scans.$inferSelect;
 export type ScanTarget = typeof scanTargets.$inferSelect;
 export type Finding = typeof findings.$inferSelect;
 export type ScanWithTargets = Scan & {
-  targets: (ScanTarget & { findings: Finding[] })[];
+  // `isNew` is derived, never stored: see `findingIdentity`.
+  targets: (ScanTarget & { findings: (Finding & { isNew: boolean })[] })[];
   findingsBySeverity: Record<FindingSeverity, number>;
 };
 
@@ -118,6 +119,30 @@ function lowercaseHeaders(headers: Headers): Record<string, string> {
     out[key.toLowerCase()] = value;
   });
   return out;
+}
+
+// What makes two findings "the same standing defect" across scans: the target (in its
+// `sameTargetKey` form), the category, and whatever names the instance — injection
+// point, CVE, and for SSRF the tier, so an `oob` → `internal-read` upgrade is new.
+// Never the payload: SSRF fires a fresh token every scan. Module-private, covered
+// through `getScan`.
+function findingIdentity(targetUrl: string, finding: Finding): string {
+  let tier = '';
+  if (finding.structuredEvidence !== null) {
+    try {
+      const evidence = JSON.parse(finding.structuredEvidence) as { kind?: string; tier?: string };
+      if (evidence.kind === 'ssrf') tier = evidence.tier ?? '';
+    } catch {
+      // Unparseable evidence names no tier; the rest of the identity still holds.
+    }
+  }
+  return JSON.stringify([
+    sameTargetKey(targetUrl),
+    finding.category,
+    finding.injectionPoint ?? '',
+    finding.cveId ?? '',
+    tier,
+  ]);
 }
 
 // Module-private: the only caller is `getScan`, and it is covered through that
@@ -660,10 +685,28 @@ export class ScannerService {
     const scan = this.#db.select().from(scans).where(eq(scans.id, id)).get();
     if (!scan) return null;
 
+    // Newness is derived per read, like the inventory's (041): a finding is new unless
+    // an earlier scan — by id, so re-reading an old scan never changes its answer —
+    // recorded the same defect. Findings are still recorded on every scan.
+    const prior = new Set(
+      this.#db
+        .select({ url: scanTargets.url, finding: findings })
+        .from(findings)
+        .innerJoin(scanTargets, eq(findings.scanTargetId, scanTargets.id))
+        .where(lt(scanTargets.scanId, id))
+        .all()
+        .map(({ url, finding }) => findingIdentity(url, finding)),
+    );
+
     const targetRows = this.#db.select().from(scanTargets).where(eq(scanTargets.scanId, id)).all();
     const targets = targetRows.map((target) => ({
       ...target,
-      findings: this.#db.select().from(findings).where(eq(findings.scanTargetId, target.id)).all(),
+      findings: this.#db
+        .select()
+        .from(findings)
+        .where(eq(findings.scanTargetId, target.id))
+        .all()
+        .map((finding) => ({ ...finding, isNew: !prior.has(findingIdentity(target.url, finding)) })),
     }));
 
     const allFindings = targets.flatMap((target) => target.findings);
