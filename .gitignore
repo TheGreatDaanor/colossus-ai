@@ -7,3 +7,7 @@ node_modules/
 
 # scanner SQLite data
 data/
+
+# never commit SSH keys
+yes
+yes.pub
