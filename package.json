@@ -10,7 +10,8 @@
     "lint": "eslint .",
     "lint:fix": "eslint . --fix",
     "dev": "tsx watch src/index.ts",
-    "build": "tsc -p tsconfig.build.json"
+    "build": "tsc -p tsconfig.build.json",
+    "collaborator": "tsx src/collaborator/main.ts"
   },
   "devDependencies": {
     "@types/better-sqlite3": "^9.6.0",
