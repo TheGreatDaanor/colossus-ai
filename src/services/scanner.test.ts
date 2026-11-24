@@ -2203,7 +2203,7 @@ describe('ScannerService access-control (idor)', () => {
 describe('ScannerService active-mode SSRF', () => {
   // A target that fetches whatever URL its `url` param names, and a collaborator that
   // records the callback — the shared world a vulnerable server would create.
-  function ssrfWorld() {
+  function ssrfWorld(metadataBody = '') {
     let minted = 0;
     const tokenByUrl = new Map<string, string>();
     const hits: CollaboratorHit[] = [];
@@ -2224,7 +2224,8 @@ describe('ScannerService active-mode SSRF', () => {
       if (token !== undefined) {
         hits.push({ token, protocol: 'http', callerSourceIp: '203.0.113.7', observedAt: new Date(0) });
       }
-      return { body: '', headers: new Headers() };
+      const reflectsMetadata = new URL(url).searchParams.get('url') === 'http://169.254.169.254/latest/meta-data/';
+      return { body: reflectsMetadata ? metadataBody : '', headers: new Headers() };
     });
     return { collaborator, bodyFetchImpl };
   }
@@ -2278,6 +2279,39 @@ describe('ScannerService active-mode SSRF', () => {
     expect(xss.map((a) => a.injectionPoint).sort()).toEqual(['q', 'url']);
     expect(ssrf.map((a) => [a.injectionPoint, a.phase, a.outcome]).sort()).toEqual([
       ['q', 'oob', 'not_vulnerable'],
+      ['url', 'oob', 'confirmed'],
+    ]);
+  });
+
+  it('records one critical internal-read finding and attempt when the target reflects the metadata listing', async () => {
+    const world = ssrfWorld(['ami-id', 'hostname', 'instance-id', 'instance-type', 'local-ipv4', 'reservation-id'].join('\n'));
+    const svc = new ScannerService(createDb(':memory:'), {
+      fetchImpl: vi.fn(async () => okResponse(FULLY_HARDENED_HEADERS)),
+      tlsCheckImpl: okTlsCheckImpl(),
+      xssConfirmImpl: vi.fn(async () => ({ outcome: 'not_vulnerable' as const })),
+      bodyFetchImpl: world.bodyFetchImpl,
+      collaborator: world.collaborator,
+      ssrfDrainTiming: instantDrain,
+    });
+    const scan = await svc.startScan(['https://example.com/fetch?url=a&q=b'], {
+      mode: 'active',
+      confirmAuthorized: true,
+    });
+    const completed = await completedScan(svc, scan.id);
+
+    const ssrf = completed.targets.flatMap((t) => t.findings).filter((f) => f.category === 'ssrf');
+    expect(ssrf).toHaveLength(1);
+    expect(ssrf[0]?.severity).toBe('critical');
+    expect(ssrf[0]?.confidence).toBe('definitive');
+    expect(JSON.parse(ssrf[0]?.structuredEvidence ?? '{}')).toMatchObject({
+      tier: 'internal-read',
+      protocols: ['http'],
+      matchedSignature: 'aws-imdsv1-metadata-listing',
+    });
+    const attempts = (completed.targets[0]?.injectionAttempts ?? []).filter((a) => a.check === 'ssrf');
+    expect(attempts.map((a) => [a.injectionPoint, a.phase, a.outcome]).sort()).toEqual([
+      ['q', 'oob', 'not_vulnerable'],
+      ['url', 'internal-read', 'confirmed'],
       ['url', 'oob', 'confirmed'],
     ]);
   });

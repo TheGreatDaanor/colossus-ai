@@ -21,21 +21,45 @@ export type SsrfEvidence = {
   kind: 'ssrf';
   url: string;
   param: string;
-  tier: 'oob';
+  tier: 'oob' | 'internal-read';
+  // Empty, with no caller IP or timestamp, on an internal read confirmed without a callback.
   protocols: ('dns' | 'http')[];
-  callerSourceIp: string;
-  observedAt: string;
+  callerSourceIp?: string;
+  observedAt?: string;
+  matchedSignature?: string;
+  // On an `oob` finding whose metadata probe did not match: credential theft was
+  // neither proven nor ruled out (IMDSv2, a non-AWS host, or a non-reflecting fetch).
+  internalRead?: 'not-demonstrated';
 };
+
+// The one internal target a forged GET can read without a token or special header.
+export const IMDSV1_METADATA_URL = 'http://169.254.169.254/latest/meta-data/';
+export const IMDSV1_SIGNATURE = 'aws-imdsv1-metadata-listing';
+
+// Lines only the IMDSv1 metadata listing returns, each standing alone on its line.
+// None is a substring of the payload URL, so a target echoing the payload never matches.
+const IMDS_LISTING_LINES = ['ami-id', 'instance-id', 'instance-type', 'local-ipv4', 'local-hostname', 'reservation-id'];
+const IMDS_MIN_MATCHES = 4;
+
+function matchesImdsListing(body: string): boolean {
+  const lines = new Set(body.split(/\r?\n/).map((line) => line.replace(/<[^>]*>/g, '').trim()));
+  return IMDS_LISTING_LINES.filter((line) => lines.has(line)).length >= IMDS_MIN_MATCHES;
+}
 
 // One verdict per fired (target, param). `context` is whatever the caller passed to
 // `fire` (the scanner passes its scan-target id) so outcomes route back without the
-// probe knowing about the database.
+// probe knowing about the database. `outcome` is the `oob` attempt's verdict alone;
+// `internalRead` is present only on a signature match (a miss has no honest negative).
+// `evidence` and `severity` are present when either signal confirmed — one finding per
+// (target, param), at the highest tier.
 export type SsrfOutcome<C> = {
   context: C;
   url: string;
   param: string;
   payload: string;
   outcome: 'confirmed' | 'not_vulnerable';
+  internalRead?: { payload: string; matchedSignature: string };
+  severity?: 'high' | 'critical';
   evidence?: SsrfEvidence;
 };
 
@@ -64,6 +88,7 @@ type Pending<C> = {
   param: string;
   payload: string;
   earliest: Map<'dns' | 'http', CollaboratorHit>;
+  internalReadMatched: boolean;
 };
 
 const PROTOCOL_ORDER: readonly ('dns' | 'http')[] = ['dns', 'http'];
@@ -85,10 +110,29 @@ export function makeSsrfProbe<C>(
       const fires: Promise<unknown>[] = [];
       for (const param of new Set(target.searchParams.keys())) {
         const { token, url: payload } = collaborator.mint();
-        pending.set(token, { context, url: target.toString(), param, payload, earliest: new Map() });
+        const entry: Pending<C> = {
+          context,
+          url: target.toString(),
+          param,
+          payload,
+          earliest: new Map(),
+          internalReadMatched: false,
+        };
+        pending.set(token, entry);
         const mutated = new URL(target);
         mutated.searchParams.set(param, payload);
         fires.push(fetchImpl(mutated.toString()).catch(() => undefined));
+        // The in-band signal: the reflected body is checked here and never kept.
+        const metadata = new URL(target);
+        metadata.searchParams.set(param, IMDSV1_METADATA_URL);
+        fires.push(
+          fetchImpl(metadata.toString()).then(
+            ({ body }) => {
+              if (matchesImdsListing(body)) entry.internalReadMatched = true;
+            },
+            () => undefined,
+          ),
+        );
       }
       await Promise.all(fires);
     },
@@ -115,22 +159,34 @@ export function makeSsrfProbe<C>(
           (soonest, hit) => (soonest === undefined || hit.observedAt < soonest.observedAt ? hit : soonest),
           undefined,
         );
-        if (first === undefined) return { context, url, param, payload, outcome: 'not_vulnerable' };
+        const outcome = first === undefined ? 'not_vulnerable' : 'confirmed';
+        const base = { context, url, param, payload, outcome } as const;
+        if (!entry.internalReadMatched && first === undefined) return base;
+        const callback =
+          first === undefined
+            ? {}
+            : { callerSourceIp: first.callerSourceIp, observedAt: first.observedAt.toISOString() };
+        const protocols = PROTOCOL_ORDER.filter((p) => entry.earliest.has(p));
+        if (entry.internalReadMatched) {
+          return {
+            ...base,
+            internalRead: { payload: IMDSV1_METADATA_URL, matchedSignature: IMDSV1_SIGNATURE },
+            severity: 'critical',
+            evidence: {
+              kind: 'ssrf',
+              url,
+              param,
+              tier: 'internal-read',
+              protocols,
+              ...callback,
+              matchedSignature: IMDSV1_SIGNATURE,
+            },
+          };
+        }
         return {
-          context,
-          url,
-          param,
-          payload,
-          outcome: 'confirmed',
-          evidence: {
-            kind: 'ssrf',
-            url,
-            param,
-            tier: 'oob',
-            protocols: PROTOCOL_ORDER.filter((p) => entry.earliest.has(p)),
-            callerSourceIp: first.callerSourceIp,
-            observedAt: first.observedAt.toISOString(),
-          },
+          ...base,
+          severity: 'high',
+          evidence: { kind: 'ssrf', url, param, tier: 'oob', protocols, ...callback, internalRead: 'not-demonstrated' },
         };
       });
       pending.clear();

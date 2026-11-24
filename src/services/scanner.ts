@@ -1059,8 +1059,10 @@ export class ScannerService {
   }
 
   // Every SSRF verdict is recorded as an `oob` attempt on its target, merged into —
-  // never replacing — the XSS attempts already there. A confirmed SSRF also writes one
-  // definitive finding per (target, param), carrying its body-free proof as
+  // never replacing — the XSS attempts already there; an `internal-read` attempt is
+  // added only on a signature match (a miss has no honest negative). Either signal
+  // writes one definitive finding per (target, param) at the highest tier — `high` for
+  // oob, `critical` for internal-read — carrying its body-free proof as
   // `structured_evidence`. `context` is the scan-target id.
   #persistSsrfOutcomes(outcomes: SsrfOutcome<number>[]): void {
     const byTarget = new Map<number, InjectionAttempt[]>();
@@ -1073,6 +1075,15 @@ export class ScannerService {
         payload: outcome.payload,
         outcome: outcome.outcome,
       });
+      if (outcome.internalRead !== undefined) {
+        attempts.push({
+          check: 'ssrf',
+          phase: 'internal-read',
+          injectionPoint: outcome.param,
+          payload: outcome.internalRead.payload,
+          outcome: 'confirmed',
+        });
+      }
       byTarget.set(outcome.context, attempts);
     }
     for (const [targetId, ssrfAttempts] of byTarget) {
@@ -1086,13 +1097,13 @@ export class ScannerService {
     }
 
     for (const outcome of outcomes) {
-      if (outcome.outcome !== 'confirmed') continue;
+      if (outcome.evidence === undefined || outcome.severity === undefined) continue;
       this.#db
         .insert(findings)
         .values({
           scanTargetId: outcome.context,
           category: 'ssrf',
-          severity: 'high',
+          severity: outcome.severity,
           confidence: 'definitive',
           injectionPoint: outcome.param,
           payload: outcome.payload,
