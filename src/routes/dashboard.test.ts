@@ -89,3 +89,142 @@ describe('GET /dashboard/scans/:id', () => {
     expect(html).toContain('&lt;script&gt;');
   });
 });
+
+describe('GET /dashboard/scans/:id — SSRF report surface', () => {
+  const baseTarget = {
+    id: 1,
+    scanId: 1,
+    url: 'https://t.example.com/?url=x',
+    status: 'ok',
+    statusCode: 200,
+    responseHeaders: null,
+    responseTimeMs: 10,
+    tlsVersion: null,
+    tlsCertExpiresAt: null,
+    redirectLocation: null,
+    injectionAttempts: null,
+    error: null,
+    discoveredFrom: null,
+    enumeratedHostId: null,
+  };
+  const baseFinding = {
+    id: 1,
+    scanTargetId: 1,
+    category: 'ssrf',
+    severity: 'high',
+    confidence: 'definitive',
+    cveId: null,
+    explanation: null,
+    suggestedFix: null,
+    injectionPoint: 'url',
+    payload: 'http://tok.collab.example/',
+    evidencePath: null,
+    evidenceSnippet: null,
+    structuredEvidence: null,
+    accessControlEvidence: null,
+  };
+
+  function appFor(target: Record<string, unknown>) {
+    const service = {
+      getScan: async () => ({ id: 1, name: 'ssrf scan', status: 'completed', targets: [target] }),
+    } as unknown as ScannerService;
+    return createDashboardRoutes(service);
+  }
+
+  async function render(target: Record<string, unknown>): Promise<string> {
+    return (await appFor(target).request('/dashboard/scans/1')).text();
+  }
+
+  it('renders ssrf proof as labeled fields instead of raw JSON', async () => {
+    const evidence = {
+      kind: 'ssrf',
+      url: 'https://t.example.com/?url=x',
+      param: 'url',
+      tier: 'oob',
+      protocols: ['dns', 'http'],
+      callerSourceIp: '203.0.113.7',
+      observedAt: '2026-11-24T10:00:00.000Z',
+      internalRead: 'not-demonstrated',
+    };
+    const html = await render({
+      ...baseTarget,
+      findings: [{ ...baseFinding, structuredEvidence: JSON.stringify(evidence) }],
+    });
+
+    expect(html).not.toContain('&quot;kind&quot;');
+    expect(html).toMatch(/<dt>param<\/dt><dd>url<\/dd>/);
+    expect(html).toMatch(/<dt>protocols<\/dt><dd>dns, http<\/dd>/);
+    expect(html).toMatch(/<dt>caller egress IP<\/dt><dd>203\.0\.113\.7<\/dd>/);
+    expect(html).toMatch(/<dt>tier<\/dt><dd>oob<\/dd>/);
+    expect(html).toContain('metadata read: not demonstrated');
+  });
+
+  it('shows the matched signature on an internal-read finding and omits absent fields', async () => {
+    const evidence = {
+      kind: 'ssrf',
+      url: 'https://t.example.com/?url=x',
+      param: 'url',
+      tier: 'internal-read',
+      protocols: [],
+      matchedSignature: 'aws-imdsv1-metadata-listing',
+    };
+    const html = await render({
+      ...baseTarget,
+      findings: [{ ...baseFinding, severity: 'critical', structuredEvidence: JSON.stringify(evidence) }],
+    });
+
+    expect(html).toMatch(/<dt>matched signature<\/dt><dd>aws-imdsv1-metadata-listing<\/dd>/);
+    expect(html).not.toContain('caller egress IP');
+    expect(html).not.toContain('metadata read: not demonstrated');
+  });
+
+  it('shows a per-parameter not-tested indicator with its reason when SSRF was unavailable', async () => {
+    const html = await render({
+      ...baseTarget,
+      injectionAttempts: [
+        { check: 'xss', injectionPoint: 'q', payload: 'p', outcome: 'unavailable', error: 'browser down' },
+        { check: 'ssrf', phase: 'oob', injectionPoint: 'url', payload: '', outcome: 'unavailable', error: 'collaborator-not-configured' },
+        { check: 'ssrf', phase: 'oob', injectionPoint: 'next', payload: '', outcome: 'unavailable' },
+      ],
+      findings: [],
+    });
+
+    expect(html).toContain('SSRF: not tested (collaborator-not-configured) — param url');
+    expect(html).toContain('SSRF: not tested (unknown reason) — param next');
+    expect(html).not.toContain('browser down');
+  });
+
+  it('summarises untested SSRF params at the top of the scan, grouped by reason', async () => {
+    const unavailable = (param: string, error?: string) => ({
+      check: 'ssrf', phase: 'oob', injectionPoint: param, payload: '', outcome: 'unavailable', ...(error ? { error } : {}),
+    });
+    const service = {
+      getScan: async () => ({
+        id: 1,
+        name: 'ssrf scan',
+        status: 'completed',
+        targets: [
+          { ...baseTarget, id: 1, injectionAttempts: [unavailable('url', 'collaborator-not-configured'), unavailable('next', 'collaborator-not-configured')], findings: [] },
+          { ...baseTarget, id: 2, injectionAttempts: [unavailable('dest', 'collaborator-unreachable-mid-drain')], findings: [] },
+        ],
+      }),
+    } as unknown as ScannerService;
+
+    const html = await (await createDashboardRoutes(service).request('/dashboard/scans/1')).text();
+    const summary = html.slice(0, html.indexOf('<table'));
+
+    expect(summary).toContain('SSRF: not tested on 3 parameters across 2 targets');
+    expect(summary).toContain('collaborator-not-configured: 2');
+    expect(summary).toContain('collaborator-unreachable-mid-drain: 1');
+  });
+
+  it('shows no not-tested indicator when SSRF ran', async () => {
+    const html = await render({
+      ...baseTarget,
+      injectionAttempts: [{ check: 'ssrf', phase: 'oob', injectionPoint: 'url', payload: 'p', outcome: 'not_vulnerable' }],
+      findings: [],
+    });
+
+    expect(html).not.toContain('not tested');
+  });
+});

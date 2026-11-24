@@ -2,6 +2,10 @@
 
 ## How to use the scanner
 
+**Full operator manual: [docs/MANUAL.md](docs/MANUAL.md)** — active scans,
+programs and scope, SSRF/collaborator setup, reading the report, and viewing the
+dashboard on a headless server. The section below is the short version.
+
 Start the server:
 
 ```
@@ -46,4 +50,5 @@ Returns scans newest first.
 ### Dashboard
 
 Visit `http://localhost:3000/dashboard` in a browser for an HTML view of
-scans and their targets/findings.
+scans and their targets/findings. On a headless server, see
+[docs/MANUAL.md §4](docs/MANUAL.md#4-the-dashboard).
