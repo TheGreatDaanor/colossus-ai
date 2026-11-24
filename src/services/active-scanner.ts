@@ -282,7 +282,8 @@ function baselineUrlFor(point: InjectionPoint): string {
 export async function guardedFetchText(url: string): Promise<{ body: string; headers: Headers }> {
   const disallowed = await findDisallowedAddress(new URL(url).hostname);
   if (disallowed !== null) throw new Error(`fetch to a disallowed address (${disallowed}) was blocked`);
-  const response = await fetch(url, { redirect: 'manual' });
+  // The timeout also covers the body read, so a trickling response is cut off too.
+  const response = await fetch(url, { redirect: 'manual', signal: AbortSignal.timeout(10_000) });
   return { body: await response.text(), headers: response.headers };
 }
 

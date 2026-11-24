@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
-import { buildDnsAnswer, parseDnsQuestion } from './dns.js';
+import { buildDnsAnswer, isIpv4Address, parseDnsQuestion, respondToDns } from './dns.js';
 import { HitBuffer, tokenFromHostname } from './hit-buffer.js';
+import { mintSignedToken, isSignedToken } from './token.js';
 import { createQueryApi } from './query-api.js';
 
 describe('tokenFromHostname', () => {
@@ -53,6 +54,28 @@ describe('HitBuffer', () => {
 
     expect(buffer.size).toBe(2);
     expect(buffer.query(['a', 'b', 'c']).map((h) => h.token)).toEqual(['b', 'c']);
+  });
+});
+
+describe('signed tokens', () => {
+  it('accepts a token minted with the same secret, and nothing forged or minted with another', () => {
+    const token = mintSignedToken('s3cret');
+
+    expect(token).toMatch(/^[a-z2-7]{20}$/);
+    expect(isSignedToken('s3cret', token)).toBe(true);
+    expect(isSignedToken('other', token)).toBe(false);
+    expect(isSignedToken('s3cret', `${token.slice(0, 19)}${token.endsWith('a') ? 'b' : 'a'}`)).toBe(false);
+    expect(isSignedToken('s3cret', 'aaaaaaaaaaaaaaaaaaaa')).toBe(false);
+    expect(isSignedToken('s3cret', 'short')).toBe(false);
+  });
+
+  it('keeps a buffer that only accepts signed tokens from being flooded out by unsigned ones', () => {
+    const buffer = new HitBuffer({ ttlMs: 600_000, maxHits: 2, now: () => 0, accepts: (t) => isSignedToken('s3cret', t) });
+    const real = mintSignedToken('s3cret');
+    buffer.record({ token: real, protocol: 'http', callerSourceIp: '203.0.113.7' });
+    for (let i = 0; i < 10; i += 1) buffer.record({ token: `junk${i}`, protocol: 'dns', callerSourceIp: '198.51.100.1' });
+
+    expect(buffer.query([real]).map((h) => h.token)).toEqual([real]);
   });
 });
 
@@ -121,6 +144,36 @@ describe('dns packets', () => {
     expect(answer.readUInt16BE(2) & 0x000f).toBe(0);
     expect(answer.readUInt16BE(6)).toBe(1); // ANCOUNT
     expect([...answer.subarray(answer.length - 4)]).toEqual([192, 0, 2, 53]);
+  });
+
+  it('ignores responses and non-QUERY opcodes, so it never answers an answer', () => {
+    const response = query('tok.oast.example.net');
+    response.writeUInt16BE(0x8000, 2); // QR=1
+    const notify = query('tok.oast.example.net');
+    notify.writeUInt16BE(4 << 11, 2); // opcode NOTIFY
+
+    expect(respondToDns(response, 'oast.example.net', '192.0.2.53')).toBeNull();
+    expect(respondToDns(notify, 'oast.example.net', '192.0.2.53')).toBeNull();
+  });
+
+  it('refuses names outside its zone instead of answering them authoritatively', () => {
+    const answer = respondToDns(query('google.com'), 'oast.example.net', '192.0.2.53')!;
+
+    expect(answer.readUInt16BE(2) & 0x000f).toBe(5); // RCODE REFUSED
+    expect(answer.readUInt16BE(2) & 0x0400).toBe(0); // not authoritative
+    expect(answer.readUInt16BE(6)).toBe(0);
+  });
+
+  it('answers names in its zone, and the zone apex itself', () => {
+    for (const name of ['tok.oast.example.net', 'OAST.example.net']) {
+      const answer = respondToDns(query(name), 'oast.example.net', '192.0.2.53')!;
+      expect([...answer.subarray(answer.length - 4)]).toEqual([192, 0, 2, 53]);
+    }
+  });
+
+  it('accepts only a dotted-quad IPv4 listener address', () => {
+    expect(isIpv4Address('192.0.2.53')).toBe(true);
+    for (const bad of ['203.0.113.300', '2001:db8::1', '1.2.3', '1.2.3.4.5', '']) expect(isIpv4Address(bad)).toBe(false);
   });
 
   it('answers a non-A query with no records, still authoritatively', () => {

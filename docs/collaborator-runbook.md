@@ -52,6 +52,10 @@ npm run collaborator
 
 Binding ports 53 and 80 needs root or `CAP_NET_BIND_SERVICE`. Run it under a supervisor (systemd or a container restart policy). Hits are held in memory for about 10 minutes. A restart only loses callbacks for scans that are draining at that moment, and those come back as `unavailable`, not as clean.
 
+The listener only keeps hits for tokens that Colossus signed with the shared secret, so internet noise under the zone cannot push real callbacks out of the buffer. A hand-made name like `x.oast.example.net` still gets a DNS answer and an HTTP `ok`, but it is never stored or returned by the query API.
+
+The listener also refuses names outside its zone (`REFUSED`) and ignores DNS responses. `COLLABORATOR_PUBLIC_IP` must be a dotted-quad IPv4 address, or the listener exits at startup.
+
 Firewall: open UDP 53 and TCP 80 to the internet. Open the query port to the Colossus host only.
 
 ## 4. Point Colossus at it

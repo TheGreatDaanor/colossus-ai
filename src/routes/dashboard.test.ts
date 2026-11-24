@@ -218,6 +218,29 @@ describe('GET /dashboard/scans/:id — SSRF report surface', () => {
     expect(summary).toContain('collaborator-unreachable-mid-drain: 1');
   });
 
+  it('does not call a param untested when its internal read confirmed despite a failed drain', async () => {
+    const html = await render({
+      ...baseTarget,
+      injectionAttempts: [
+        { check: 'ssrf', phase: 'oob', injectionPoint: 'url', payload: 'p', outcome: 'unavailable', error: 'collaborator-unreachable-mid-drain' },
+        { check: 'ssrf', phase: 'internal-read', injectionPoint: 'url', payload: 'm', outcome: 'confirmed' },
+      ],
+      findings: [],
+    });
+
+    expect(html).not.toContain('not tested');
+  });
+
+  it('falls back to escaped raw JSON for malformed ssrf evidence instead of failing the page', async () => {
+    const res = await appFor({
+      ...baseTarget,
+      findings: [{ ...baseFinding, structuredEvidence: JSON.stringify({ kind: 'ssrf', tier: 'oob' }) }],
+    }).request('/dashboard/scans/1');
+
+    expect(res.status).toBe(200);
+    expect(await res.text()).toContain('&quot;kind&quot;:&quot;ssrf&quot;');
+  });
+
   it('shows no not-tested indicator when SSRF ran', async () => {
     const html = await render({
       ...baseTarget,

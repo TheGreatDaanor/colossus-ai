@@ -25,6 +25,16 @@ const config = {
 };
 
 describe('http collaborator client', () => {
+  it('fails a poll that the query api never answers, instead of hanging', async () => {
+    const hangsUntilAborted = (_input: string | URL | Request, init?: RequestInit) =>
+      new Promise<Response>((_resolve, reject) => {
+        init?.signal?.addEventListener('abort', () => reject(new Error('aborted')));
+      });
+    const client = makeHttpCollaboratorClient({ ...config, pollTimeoutMs: 20, fetchImpl: hangsUntilAborted });
+
+    await expect(client.poll(['abc'])).rejects.toThrow();
+  });
+
   it('mints a fresh dns-safe token per call, under the base domain', () => {
     const client = makeHttpCollaboratorClient({ ...config, fetchImpl: stubQueryApi(() => []).fetchImpl });
     const minted = Array.from({ length: 50 }, () => client.mint());

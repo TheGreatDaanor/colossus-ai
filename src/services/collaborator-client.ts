@@ -1,4 +1,4 @@
-import { randomBytes } from 'node:crypto';
+import { mintSignedToken } from '../collaborator/token.js';
 import type { BodyFetchImpl } from './active-scanner.js';
 import type { CollaboratorClient, CollaboratorHit, SelfTestResult } from './ssrf-probe.js';
 
@@ -12,19 +12,12 @@ export type HttpCollaboratorConfig = {
   queryUrl: string;
   secret: string;
   fetchImpl?: typeof fetch;
+  // A poll the listener never answers fails after this long, so a wedged listener
+  // reads as `unavailable` instead of leaving the scan `running` forever.
+  pollTimeoutMs?: number;
   // How long the self-test waits for its own callback to show up at the listener.
   selfTestTiming?: { attempts: number; intervalMs: number; sleep?: (ms: number) => Promise<void> };
 };
-
-// Base32 (RFC 4648 lower-case): 32 symbols, so `byte & 31` picks one without modulo
-// bias, and every symbol is valid in a DNS label. 20 symbols carry 100 bits — globally
-// unique across scans, so a callback is never mis-attributed.
-const TOKEN_ALPHABET = 'abcdefghijklmnopqrstuvwxyz234567';
-const TOKEN_LENGTH = 20;
-
-function mintToken(): string {
-  return [...randomBytes(TOKEN_LENGTH)].map((byte) => TOKEN_ALPHABET[byte & 31]).join('');
-}
 
 // The listener is trusted to be ours, but its answer is still parsed defensively: a
 // hit that is not well-formed is dropped rather than turned into a finding.
@@ -47,7 +40,7 @@ export function makeHttpCollaboratorClient(config: HttpCollaboratorConfig): Coll
 
   const client: CollaboratorClient = {
     mint() {
-      const token = mintToken();
+      const token = mintSignedToken(config.secret);
       return { token, url: `http://${token}.${config.baseDomain}/` };
     },
 
@@ -59,6 +52,7 @@ export function makeHttpCollaboratorClient(config: HttpCollaboratorConfig): Coll
         method: 'POST',
         headers: { authorization: `Bearer ${config.secret}`, 'content-type': 'application/json' },
         body: JSON.stringify({ tokens }),
+        signal: AbortSignal.timeout(config.pollTimeoutMs ?? 5_000),
       });
       if (!response.ok) throw new Error(`collaborator query api answered ${response.status}`);
       const { hits } = (await response.json()) as { hits?: unknown };

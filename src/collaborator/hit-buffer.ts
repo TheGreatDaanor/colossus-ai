@@ -26,13 +26,17 @@ export class HitBuffer {
   readonly #ttlMs: number;
   readonly #maxHits: number;
   readonly #now: () => number;
+  readonly #accepts: (token: string) => boolean;
   // Oldest first: arrival order is time order, so pruning is a prefix cut.
   readonly #hits: { at: number; hit: RecordedHit }[] = [];
 
-  constructor(options: { ttlMs: number; maxHits: number; now?: () => number }) {
+  // `accepts` gates which tokens are worth keeping (the daemon passes the signed-token
+  // check); a rejected hit never takes a slot, so junk cannot evict real callbacks.
+  constructor(options: { ttlMs: number; maxHits: number; now?: () => number; accepts?: (token: string) => boolean }) {
     this.#ttlMs = options.ttlMs;
     this.#maxHits = options.maxHits;
     this.#now = options.now ?? Date.now;
+    this.#accepts = options.accepts ?? (() => true);
   }
 
   get size(): number {
@@ -40,6 +44,7 @@ export class HitBuffer {
   }
 
   record(hit: Omit<RecordedHit, 'observedAt'>): void {
+    if (!this.#accepts(hit.token)) return;
     const at = this.#now();
     this.#hits.push({ at, hit: { ...hit, observedAt: new Date(at).toISOString() } });
     this.#prune(at);

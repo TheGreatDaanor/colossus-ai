@@ -2351,6 +2351,28 @@ describe('ScannerService active-mode SSRF', () => {
     return completedScan(svc, scan.id);
   }
 
+  it('completes the scan when a target hangs on the ssrf fetches, instead of stalling forever', async () => {
+    const world = ssrfWorld();
+    const hangsOnSsrf = vi.fn(async (url: string) => {
+      const injected = new URL(url).searchParams.get('url') ?? '';
+      if (injected.includes('collab.test') || injected.includes('169.254.169.254')) return new Promise<never>(() => {});
+      return { body: '', headers: new Headers() };
+    });
+    const svc = new ScannerService(createDb(':memory:'), {
+      fetchImpl: vi.fn(async () => okResponse(FULLY_HARDENED_HEADERS)),
+      tlsCheckImpl: okTlsCheckImpl(),
+      xssConfirmImpl: vi.fn(async () => ({ outcome: 'not_vulnerable' as const })),
+      bodyFetchImpl: hangsOnSsrf,
+      collaborator: world.collaborator,
+      ssrfDrainTiming: instantDrain,
+      timeoutMs: 50,
+    });
+    const scan = await svc.startScan(['https://example.com/fetch?url=a'], { mode: 'active', confirmAuthorized: true });
+
+    const completed = await completedScan(svc, scan.id);
+    expect(completed.status).toBe('completed');
+  });
+
   it('marks ssrf unavailable per param when no collaborator is configured, and the scan still completes', async () => {
     const completed = await activeScan(null);
 
@@ -2410,6 +2432,35 @@ describe('ScannerService active-mode SSRF', () => {
     // A fresh token was fired, yet the standing bug is the same (target, param, tier).
     expect(second.map((f) => f.isNew)).toEqual([false]);
     expect(upgraded.map((f) => [f.severity, f.isNew])).toEqual([['critical', true]]);
+  });
+
+  it('marks a second cookie missing Secure as new, not as the first cookie seen again', async () => {
+    let cookies = ['a=1'];
+    const svc = new ScannerService(createDb(':memory:'), {
+      fetchImpl: vi.fn(async () => {
+        const headers = new Headers(FULLY_HARDENED_HEADERS);
+        for (const cookie of cookies) headers.append('set-cookie', cookie);
+        return new Response(null, { status: 200, headers });
+      }),
+      tlsCheckImpl: okTlsCheckImpl(),
+    });
+    const scanOnce = async () => {
+      const scan = await svc.startScan(['https://example.com/']);
+      const completed = await completedScan(svc, scan.id);
+      return completed.targets
+        .flatMap((t) => t.findings)
+        .filter((f) => f.category === 'cookie-missing-secure')
+        .map((f) => [f.explanation, f.isNew]);
+    };
+
+    await scanOnce();
+    cookies = ['a=1', 'b=2'];
+    const second = await scanOnce();
+
+    expect(second).toEqual([
+      ['Cookie "a" is missing the Secure attribute.', false],
+      ['Cookie "b" is missing the Secure attribute.', true],
+    ]);
   });
 
   it('fires no ssrf payload in a passive-mode scan', async () => {

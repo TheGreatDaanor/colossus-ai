@@ -54,14 +54,28 @@ function ssrfEvidence(evidence: SsrfEvidence): string {
   return list + note;
 }
 
+const isOptionalString = (value: unknown) => value === undefined || typeof value === 'string';
+
+// Only a row with the full SsrfEvidence shape renders as labeled fields; anything
+// else falls back to escaped raw JSON so one bad row never fails the page.
 function parseSsrfEvidence(raw: string | null): SsrfEvidence | null {
   if (raw === null) return null;
+  let parsed: Record<string, unknown>;
   try {
-    const parsed = JSON.parse(raw) as { kind?: unknown };
-    return parsed.kind === 'ssrf' ? (parsed as SsrfEvidence) : null;
+    parsed = JSON.parse(raw) as Record<string, unknown>;
   } catch {
     return null;
   }
+  if (typeof parsed !== 'object' || parsed === null || parsed.kind !== 'ssrf') return null;
+  const wellFormed =
+    typeof parsed.param === 'string' &&
+    (parsed.tier === 'oob' || parsed.tier === 'internal-read') &&
+    Array.isArray(parsed.protocols) &&
+    parsed.protocols.every((p) => typeof p === 'string') &&
+    isOptionalString(parsed.callerSourceIp) &&
+    isOptionalString(parsed.matchedSignature) &&
+    isOptionalString(parsed.internalRead);
+  return wellFormed ? (parsed as unknown as SsrfEvidence) : null;
 }
 
 function findingCell(finding: Finding, col: string): string {
@@ -72,8 +86,11 @@ function findingCell(finding: Finding, col: string): string {
   return escapeHtml((finding as unknown as Record<string, unknown>)[col]);
 }
 
+// A param whose internal read confirmed was tested, even if its callback drain failed.
 function untestedSsrfAttempts(target: ScanTarget) {
-  return (target.injectionAttempts ?? []).filter((attempt) => attempt.check === 'ssrf' && attempt.outcome === 'unavailable');
+  const ssrf = (target.injectionAttempts ?? []).filter((attempt) => attempt.check === 'ssrf');
+  const confirmed = new Set(ssrf.filter((a) => a.outcome === 'confirmed').map((a) => a.injectionPoint));
+  return ssrf.filter((attempt) => attempt.outcome === 'unavailable' && !confirmed.has(attempt.injectionPoint));
 }
 
 function plural(count: number, noun: string): string {

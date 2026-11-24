@@ -1,6 +1,7 @@
 import { connect as tlsConnect } from 'node:tls';
-import { eq, lt } from 'drizzle-orm';
+import { eq } from 'drizzle-orm';
 import type { Db } from '../db/client.js';
+import { findingsBeforeScan } from '../db/finding-history.js';
 import {
   makeXssInjectionClass,
   makeSstiInjectionClass,
@@ -36,6 +37,7 @@ import {
   type TlsFinding,
   type TlsInfo,
   type VersionBanner,
+  findingInstanceKey,
 } from './passive-checks.js';
 import {
   scans,
@@ -121,14 +123,26 @@ function lowercaseHeaders(headers: Headers): Record<string, string> {
   return out;
 }
 
+function withTimeout(fetchImpl: BodyFetchImpl, timeoutMs: number): BodyFetchImpl {
+  return (url) => {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timedOut = new Promise<never>((_resolve, reject) => {
+      timer = setTimeout(() => reject(new Error(`fetch timed out after ${timeoutMs}ms`)), timeoutMs);
+    });
+    return Promise.race([fetchImpl(url), timedOut]).finally(() => clearTimeout(timer));
+  };
+}
+
 // What makes two findings "the same standing defect" across scans: the target (in its
 // `sameTargetKey` form), the category, and whatever names the instance — injection
-// point, CVE, and for SSRF the tier, so an `oob` → `internal-read` upgrade is new.
+// point, CVE, the cookie name for per-cookie checks, and for SSRF the tier, so an `oob` → `internal-read` upgrade is new.
 // Never the payload: SSRF fires a fresh token every scan. Module-private, covered
 // through `getScan`.
-function findingIdentity(targetUrl: string, finding: Finding): string {
+type FindingIdentityFields = Pick<Finding, 'category' | 'injectionPoint' | 'cveId' | 'explanation' | 'structuredEvidence'>;
+
+function findingIdentity(targetUrl: string, finding: FindingIdentityFields): string {
   let tier = '';
-  if (finding.structuredEvidence !== null) {
+  if (finding.category === 'ssrf' && finding.structuredEvidence !== null) {
     try {
       const evidence = JSON.parse(finding.structuredEvidence) as { kind?: string; tier?: string };
       if (evidence.kind === 'ssrf') tier = evidence.tier ?? '';
@@ -142,6 +156,7 @@ function findingIdentity(targetUrl: string, finding: Finding): string {
     finding.injectionPoint ?? '',
     finding.cveId ?? '',
     tier,
+    findingInstanceKey(finding.category, finding.explanation),
   ]);
 }
 
@@ -556,7 +571,9 @@ export class ScannerService {
     this.#llmEnrichImpl = options.llmEnrichImpl ?? defaultLlmEnrich;
     this.#collaborator = options.collaborator ?? null;
     this.#ssrfDrainTiming = options.ssrfDrainTiming;
-    this.#ssrfFetchImpl = options.bodyFetchImpl ?? guardedFetchText;
+    // Bounded so a target that hangs on an SSRF payload (often the unroutable IMDS
+    // address) frees its fetch slot instead of stalling the scan.
+    this.#ssrfFetchImpl = withTimeout(options.bodyFetchImpl ?? guardedFetchText, this.#timeoutMs);
   }
 
   async startScan(urls: string[], options: StartScanOptions = {}): Promise<Scan> {
@@ -688,15 +705,7 @@ export class ScannerService {
     // Newness is derived per read, like the inventory's (041): a finding is new unless
     // an earlier scan — by id, so re-reading an old scan never changes its answer —
     // recorded the same defect. Findings are still recorded on every scan.
-    const prior = new Set(
-      this.#db
-        .select({ url: scanTargets.url, finding: findings })
-        .from(findings)
-        .innerJoin(scanTargets, eq(findings.scanTargetId, scanTargets.id))
-        .where(lt(scanTargets.scanId, id))
-        .all()
-        .map(({ url, finding }) => findingIdentity(url, finding)),
-    );
+    const prior = new Set(findingsBeforeScan(this.#db, id).map(({ url, ...finding }) => findingIdentity(url, finding)));
 
     const targetRows = this.#db.select().from(scanTargets).where(eq(scanTargets.scanId, id)).all();
     const targets = targetRows.map((target) => ({

@@ -2,9 +2,10 @@ import { createSocket } from 'node:dgram';
 import { serve } from '@hono/node-server';
 import type { HttpBindings } from '@hono/node-server';
 import { Hono } from 'hono';
-import { buildDnsAnswer, parseDnsQuestion } from './dns.js';
+import { isIpv4Address, parseDnsQuestion, respondToDns } from './dns.js';
 import { HitBuffer, tokenFromHostname } from './hit-buffer.js';
 import { createQueryApi } from './query-api.js';
+import { isSignedToken } from './token.js';
 
 // The standalone SSRF collaborator listener: one per Colossus deployment, run as its
 // own process (`npm run collaborator`). Three sockets:
@@ -27,6 +28,12 @@ function required(name: string): string {
 const baseDomain = required('COLLABORATOR_BASE_DOMAIN');
 const publicIp = required('COLLABORATOR_PUBLIC_IP');
 const secret = required('COLLABORATOR_SECRET');
+// Written byte by byte into every A answer, so a bad value must stop startup rather
+// than crash the listener (or answer 0.0.0.0) on the first lookup.
+if (!isIpv4Address(publicIp)) {
+  console.error(`collaborator: COLLABORATOR_PUBLIC_IP must be a dotted-quad IPv4 address, got "${publicIp}"`);
+  process.exit(1);
+}
 const dnsPort = Number(process.env['COLLABORATOR_DNS_PORT'] ?? 53);
 const httpPort = Number(process.env['COLLABORATOR_HTTP_PORT'] ?? 80);
 const queryHost = process.env['COLLABORATOR_QUERY_HOST'] ?? '127.0.0.1';
@@ -34,18 +41,20 @@ const queryPort = Number(process.env['COLLABORATOR_QUERY_PORT'] ?? 8443);
 
 // ~10 min TTL: comfortably past one scan's 30s drain, short enough that a token's
 // hits are gone long before anyone could ask about it again.
-const buffer = new HitBuffer({ ttlMs: 10 * 60 * 1000, maxHits: 100_000 });
+// Only tokens signed with the shared secret are kept, so public junk traffic under
+// the zone cannot evict the callbacks a scan is waiting on.
+const buffer = new HitBuffer({ ttlMs: 10 * 60 * 1000, maxHits: 100_000, accepts: (token) => isSignedToken(secret, token) });
 
 // IPv4 peers arrive as `::ffff:a.b.c.d` on a dual-stack socket.
 const plainIp = (address: string | undefined) => (address ?? 'unknown').replace(/^::ffff:/, '');
 
 const dns = createSocket('udp4');
 dns.on('message', (packet, remote) => {
-  const question = parseDnsQuestion(packet);
-  if (question === null) return;
-  const token = tokenFromHostname(question.name, baseDomain);
+  const answer = respondToDns(packet, baseDomain, publicIp);
+  if (answer === null) return;
+  const token = tokenFromHostname(parseDnsQuestion(packet)?.name ?? '', baseDomain);
   if (token !== null) buffer.record({ token, protocol: 'dns', callerSourceIp: remote.address });
-  dns.send(buildDnsAnswer(packet, question, publicIp), remote.port, remote.address);
+  dns.send(answer, remote.port, remote.address);
 });
 dns.on('error', (err) => console.error(`collaborator dns: ${err.message}`));
 dns.bind(dnsPort, () => console.warn(`collaborator dns listening on udp/${dnsPort} for *.${baseDomain}`));
