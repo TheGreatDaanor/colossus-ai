@@ -55,7 +55,18 @@ export interface SsrfProbe<C> {
   drainCollaborator(): Promise<SsrfOutcome<C>[]>;
 }
 
-type Pending<C> = { context: C; url: string; param: string; payload: string; hits: CollaboratorHit[] };
+// `earliest` keeps one hit per protocol — the earliest seen — so a cumulative
+// listener buffer re-reported on every poll never grows it, and a DNS+HTTP pair for
+// one token folds into a single verdict.
+type Pending<C> = {
+  context: C;
+  url: string;
+  param: string;
+  payload: string;
+  earliest: Map<'dns' | 'http', CollaboratorHit>;
+};
+
+const PROTOCOL_ORDER: readonly ('dns' | 'http')[] = ['dns', 'http'];
 
 const defaultSleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 
@@ -74,7 +85,7 @@ export function makeSsrfProbe<C>(
       const fires: Promise<unknown>[] = [];
       for (const param of new Set(target.searchParams.keys())) {
         const { token, url: payload } = collaborator.mint();
-        pending.set(token, { context, url: target.toString(), param, payload, hits: [] });
+        pending.set(token, { context, url: target.toString(), param, payload, earliest: new Map() });
         const mutated = new URL(target);
         mutated.searchParams.set(param, payload);
         fires.push(fetchImpl(mutated.toString()).catch(() => undefined));
@@ -92,13 +103,18 @@ export function makeSsrfProbe<C>(
         for (const hit of seen) {
           const entry = pending.get(hit.token);
           if (entry === undefined) continue;
-          entry.hits.push(hit);
+          const known = entry.earliest.get(hit.protocol);
+          if (known === undefined || hit.observedAt < known.observedAt) entry.earliest.set(hit.protocol, hit);
         }
       }
 
       const outcomes = [...pending.values()].map((entry): SsrfOutcome<C> => {
-        const { context, url, param, payload, hits } = entry;
-        const first = hits[0];
+        const { context, url, param, payload } = entry;
+        const hits = [...entry.earliest.values()];
+        const first = hits.reduce<CollaboratorHit | undefined>(
+          (soonest, hit) => (soonest === undefined || hit.observedAt < soonest.observedAt ? hit : soonest),
+          undefined,
+        );
         if (first === undefined) return { context, url, param, payload, outcome: 'not_vulnerable' };
         return {
           context,
@@ -111,7 +127,7 @@ export function makeSsrfProbe<C>(
             url,
             param,
             tier: 'oob',
-            protocols: [...new Set(hits.map((h) => h.protocol))],
+            protocols: PROTOCOL_ORDER.filter((p) => entry.earliest.has(p)),
             callerSourceIp: first.callerSourceIp,
             observedAt: first.observedAt.toISOString(),
           },
