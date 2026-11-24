@@ -11,15 +11,21 @@ export type FindingConfidence = 'definitive' | 'possible';
 // confirmers annotate against, not an exhaustive enum of the `category` column.
 export type FindingCategory = 'xss' | 'ssti' | 'sqli' | 'lfi' | 'crlf-injection' | 'idor';
 
-export type XssOutcome = 'confirmed' | 'not_vulnerable' | 'unavailable';
+// Shared by every check that records per-parameter attempts (XSS, SSRF).
+export type AttemptOutcome = 'confirmed' | 'not_vulnerable' | 'unavailable';
+export type XssOutcome = AttemptOutcome;
 
-// An active-mode canary injection attempt against one query parameter, recorded per
-// target. `outcome` is the browser-confirmation result from 011; `error` carries the
-// reason a `not_vulnerable`/`unavailable` attempt could not be confirmed, when known.
+// An active-mode injection attempt against one query parameter, recorded per target.
+// `check` says which check made it — absent on rows written before SSRF existed, which
+// are XSS. `phase` is set on SSRF rows only. `outcome` is the check's verdict; `error`
+// carries the reason a `not_vulnerable`/`unavailable` attempt could not be confirmed,
+// when known.
 export type InjectionAttempt = {
+  check?: 'xss' | 'ssrf';
+  phase?: 'oob' | 'internal-read';
   injectionPoint: string;
   payload: string;
-  outcome?: XssOutcome;
+  outcome?: AttemptOutcome;
   error?: string;
 };
 

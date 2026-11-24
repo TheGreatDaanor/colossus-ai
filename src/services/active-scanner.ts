@@ -279,7 +279,7 @@ function baselineUrlFor(point: InjectionPoint): string {
 // address before fetching, so the SSTI confirmer can't be pointed at internal
 // infrastructure. The scanner injects its own already-guarded fetch instead; this is
 // the default for standalone use.
-async function guardedFetchText(url: string): Promise<{ body: string; headers: Headers }> {
+export async function guardedFetchText(url: string): Promise<{ body: string; headers: Headers }> {
   const disallowed = await findDisallowedAddress(new URL(url).hostname);
   if (disallowed !== null) throw new Error(`fetch to a disallowed address (${disallowed}) was blocked`);
   const response = await fetch(url, { redirect: 'manual' });

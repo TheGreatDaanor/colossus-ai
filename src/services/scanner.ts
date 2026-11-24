@@ -8,6 +8,7 @@ import {
   makeLfiInjectionClass,
   makeCrlfInjectionClass,
   saveEvidence,
+  guardedFetchText,
   type InjectionClass,
   type XssConfirmImpl,
   type BodyFetchImpl,
@@ -16,6 +17,7 @@ import { disallowedPrefixes, discoverLinks } from './discovery.js';
 import { runAccessControlChecks, type Identity, type HeaderedFetchImpl } from './access-control.js';
 import { hostCapFor, ProgramsService, type EnumeratedHost, type Scope } from './programs.js';
 import { findDisallowedAddress, isDisallowedAddress } from './ssrf-guard.js';
+import { makeSsrfProbe, type CollaboratorClient, type DrainTiming, type SsrfOutcome, type SsrfProbe } from './ssrf-probe.js';
 import {
   detectHeaderFindings,
   detectTlsFindings,
@@ -467,6 +469,12 @@ export class ScannerService {
   // through. Default is SSRF-guarded (see #guardedHeaderedFetch); tests inject a
   // fake mapping (url, headers) → (status, body) to drive the oracle offline.
   readonly #headeredFetchImpl: HeaderedFetchImpl;
+  // The out-of-band SSRF collaborator. Null when the deployment has none, in which
+  // case no SSRF payloads are fired (reporting that as `unavailable` is 053).
+  readonly #collaborator: CollaboratorClient | null;
+  readonly #ssrfDrainTiming: DrainTiming | undefined;
+  // SSRF fire is a plain body fetch, so it reuses the oracle classes' fetcher.
+  readonly #ssrfFetchImpl: BodyFetchImpl;
 
   constructor(
     db: Db,
@@ -485,6 +493,8 @@ export class ScannerService {
       allowedHosts?: string[];
       programsService?: ProgramsService;
       headeredFetchImpl?: HeaderedFetchImpl;
+      collaborator?: CollaboratorClient;
+      ssrfDrainTiming?: DrainTiming;
     } = {},
   ) {
     this.#db = db;
@@ -511,6 +521,9 @@ export class ScannerService {
       options.tlsCheckImpl ?? ((hostname, port) => defaultTlsCheck(hostname, port, this.#timeoutMs));
     this.#osvCheckImpl = options.osvCheckImpl ?? defaultOsvCheck;
     this.#llmEnrichImpl = options.llmEnrichImpl ?? defaultLlmEnrich;
+    this.#collaborator = options.collaborator ?? null;
+    this.#ssrfDrainTiming = options.ssrfDrainTiming;
+    this.#ssrfFetchImpl = options.bodyFetchImpl ?? guardedFetchText;
   }
 
   async startScan(urls: string[], options: StartScanOptions = {}): Promise<Scan> {
@@ -692,11 +705,22 @@ export class ScannerService {
       discoveredCount: new Map(targetRows.map((t) => [t.id, new Budget(MAX_DISCOVERED_PER_ROOT)])),
     };
 
+    // One SSRF probe per scan run: it holds this scan's pending tokens in memory
+    // until the drain below resolves them. Fire shares the oracle fetch budget.
+    const ssrf =
+      mode === 'active' && this.#collaborator !== null
+        ? makeSsrfProbe<number>(
+            (url) => this.#fetchSemaphore.run(() => this.#ssrfFetchImpl(url)),
+            this.#collaborator,
+            this.#ssrfDrainTiming,
+          )
+        : null;
+
     const queue = [...targetRows];
     while (queue.length > 0) {
       const batch = queue.splice(0, this.#concurrency);
       const discoveredBatches = await Promise.all(
-        batch.map((target) => this.#processTarget(target, cveCache, llmCache, userAgent, mode, discovery)),
+        batch.map((target) => this.#processTarget(target, cveCache, llmCache, userAgent, mode, discovery, ssrf)),
       );
       for (const discovered of discoveredBatches) queue.push(...discovered);
     }
@@ -706,6 +730,10 @@ export class ScannerService {
     // than walking the crawl frontier. Active-mode only, and only when identities
     // were supplied — startScan already cleared both gates.
     if (identities.length > 0) await this.#runAccessControlChecks(scanId, identities);
+
+    // The scan-level drain barrier: every SSRF payload across the whole scan has been
+    // fired, so one bounded window resolves them all before the scan completes.
+    if (ssrf !== null) this.#persistSsrfOutcomes(await ssrf.drainCollaborator());
 
     this.#db
       .update(scans)
@@ -721,6 +749,7 @@ export class ScannerService {
     userAgent: string,
     mode: ScanMode,
     discovery: DiscoveryContext,
+    ssrf: SsrfProbe<number> | null,
   ): Promise<ScanTarget[]> {
     console.warn(`[scan ${target.scanId}] ${target.url} started`);
 
@@ -846,6 +875,7 @@ export class ScannerService {
       if (mode === 'active') {
         await this.#injectQueryParams(target, targetUrl, userAgent);
         await this.#runOracleClasses(target, targetUrl);
+        if (ssrf !== null) await ssrf.fire(targetUrl, target.id);
       }
 
       // Discovery runs regardless of mode — it's non-intrusive HTML parsing, not a
@@ -1026,6 +1056,50 @@ export class ScannerService {
         }),
       ),
     );
+  }
+
+  // Every SSRF verdict is recorded as an `oob` attempt on its target, merged into —
+  // never replacing — the XSS attempts already there. A confirmed SSRF also writes one
+  // definitive finding per (target, param), carrying its body-free proof as
+  // `structured_evidence`. `context` is the scan-target id.
+  #persistSsrfOutcomes(outcomes: SsrfOutcome<number>[]): void {
+    const byTarget = new Map<number, InjectionAttempt[]>();
+    for (const outcome of outcomes) {
+      const attempts = byTarget.get(outcome.context) ?? [];
+      attempts.push({
+        check: 'ssrf',
+        phase: 'oob',
+        injectionPoint: outcome.param,
+        payload: outcome.payload,
+        outcome: outcome.outcome,
+      });
+      byTarget.set(outcome.context, attempts);
+    }
+    for (const [targetId, ssrfAttempts] of byTarget) {
+      const [row] = this.#db
+        .select({ injectionAttempts: scanTargets.injectionAttempts })
+        .from(scanTargets)
+        .where(eq(scanTargets.id, targetId))
+        .all();
+      const merged = [...(row?.injectionAttempts ?? []), ...ssrfAttempts];
+      this.#db.update(scanTargets).set({ injectionAttempts: merged }).where(eq(scanTargets.id, targetId)).run();
+    }
+
+    for (const outcome of outcomes) {
+      if (outcome.outcome !== 'confirmed') continue;
+      this.#db
+        .insert(findings)
+        .values({
+          scanTargetId: outcome.context,
+          category: 'ssrf',
+          severity: 'high',
+          confidence: 'definitive',
+          injectionPoint: outcome.param,
+          payload: outcome.payload,
+          structuredEvidence: JSON.stringify(outcome.evidence),
+        })
+        .run();
+    }
   }
 
   // Replays each identity's declared-private URLs across the other identities and
