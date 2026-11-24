@@ -82,11 +82,15 @@ export const findings = sqliteTable('findings', {
   // Set only on oracle-confirmed non-XSS findings (ssti/sqli/lfi/crlf-injection): the response
   // substring that proved the injection. XSS keeps using `evidencePath` (screenshot).
   evidenceSnippet: text('evidence_snippet'),
-  // Set only on access-control findings (idor): compact JSON differential proof —
-  // the URL, the owner/peer/no-auth response statuses and normalized-body digests,
-  // and the owner and unauthorized identity labels. Never any response body, so the
-  // report itself does not leak what the defect exposes. `evidenceSnippet` and
+  // Structured, body-free proof as JSON, discriminated on `kind` (see
+  // `StructuredEvidence`). Set on access-control findings (idor,
+  // unauthenticated-resource-access); null elsewhere. Never any response body, so
+  // the report itself does not leak what the defect exposes. `evidenceSnippet` and
   // `evidencePath` stay null for these categories.
+  structuredEvidence: text('structured_evidence'),
+  // Superseded by `structuredEvidence`: no longer written or read. Kept only until
+  // every deployment has run the startup copy into `structured_evidence`; dropped
+  // by a follow-up migration.
   accessControlEvidence: text('access_control_evidence'),
 });
 
