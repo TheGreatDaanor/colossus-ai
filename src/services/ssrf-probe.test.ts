@@ -90,3 +90,55 @@ describe('ssrf probe', () => {
     expect(outcomes.filter((o) => o.outcome === 'confirmed').map((o) => o.context).sort()).toEqual([1, 2]);
   });
 });
+
+describe('ssrf probe callback protocols', () => {
+  // A collaborator whose buffer is cumulative — every poll returns every hit seen so
+  // far, as the real listener does — scripted with whatever hits the test needs.
+  function scriptedCollaborator(script: (token: string) => Omit<CollaboratorHit, 'token'>[]): CollaboratorClient {
+    let minted = 0;
+    return {
+      mint() {
+        minted += 1;
+        const token = `tok${minted}`;
+        return { token, url: `http://${token}.collab.test/` };
+      },
+      async poll(asked) {
+        return asked.flatMap((token) => script(token).map((hit) => ({ token, ...hit })));
+      },
+    };
+  }
+  const noopFetch = async () => ({ body: '', headers: new Headers() });
+
+  it('confirms a blind ssrf from a bare dns lookup with no http callback', async () => {
+    const collaborator = scriptedCollaborator(() => [
+      { protocol: 'dns', callerSourceIp: '198.51.100.53', observedAt: new Date(1_000) },
+    ]);
+    const probe = makeSsrfProbe<number>(noopFetch, collaborator, instantDrain);
+
+    await probe.fire(new URL('https://example.com/?url=a'), 1);
+    const [outcome] = await probe.drainCollaborator();
+
+    expect(outcome?.outcome).toBe('confirmed');
+    expect(outcome?.evidence?.protocols).toEqual(['dns']);
+    expect(outcome?.evidence?.callerSourceIp).toBe('198.51.100.53');
+  });
+
+  it('folds a dns+http pair, repeated on every poll and reported out of order, into one outcome', async () => {
+    const collaborator = scriptedCollaborator(() => [
+      { protocol: 'http', callerSourceIp: '203.0.113.7', observedAt: new Date(2_000) },
+      { protocol: 'dns', callerSourceIp: '198.51.100.53', observedAt: new Date(1_000) },
+    ]);
+    const probe = makeSsrfProbe<number>(noopFetch, collaborator, instantDrain);
+
+    await probe.fire(new URL('https://example.com/?url=a'), 1);
+    const outcomes = await probe.drainCollaborator();
+
+    expect(outcomes).toHaveLength(1);
+    expect(outcomes[0]?.evidence).toMatchObject({
+      protocols: ['dns', 'http'],
+      // The earliest callback is the one that confirmed.
+      callerSourceIp: '198.51.100.53',
+      observedAt: new Date(1_000).toISOString(),
+    });
+  });
+});
