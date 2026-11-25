@@ -1,0 +1,1 @@
+ALTER TABLE `findings` DROP COLUMN `access_control_evidence`;
