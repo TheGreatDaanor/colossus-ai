@@ -88,10 +88,6 @@ export const findings = sqliteTable('findings', {
   // the report itself does not leak what the defect exposes. `evidenceSnippet` and
   // `evidencePath` stay null for these categories.
   structuredEvidence: text('structured_evidence'),
-  // Superseded by `structuredEvidence`: no longer written or read. Kept only until
-  // every deployment has run the startup copy into `structured_evidence`; dropped
-  // by a follow-up migration.
-  accessControlEvidence: text('access_control_evidence'),
 });
 
 // A program is one engagement, not one domain: its in-scope list holds however
