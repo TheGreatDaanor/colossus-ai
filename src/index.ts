@@ -5,6 +5,7 @@ import { createDashboardRoutes } from './routes/dashboard.js';
 import { createProgramsRoutes } from './routes/programs.js';
 import { createScansRoutes } from './routes/scans.js';
 import { createTakeoverRoutes } from './routes/takeovers.js';
+import { collaboratorFromEnv } from './services/collaborator-client.js';
 import { EnumerationService } from './services/enumeration.js';
 import { ProgramsService } from './services/programs.js';
 import { ScannerService } from './services/scanner.js';
@@ -16,7 +17,15 @@ const defaultUserAgent = process.env['SCANNER_USER_AGENT'] ?? 'colossus-scanner/
 
 const db = createDb(dbPath);
 const programsService = new ProgramsService(db, { enumerationImpl: new EnumerationService({ userAgent: defaultUserAgent }) });
-const service = new ScannerService(db, { defaultUserAgent, programsService });
+// The shared SSRF collaborator listener (src/collaborator/, docs/collaborator-runbook.md).
+// Unset, active scans still run and report SSRF as not tested.
+const collaborator = collaboratorFromEnv(process.env);
+if (collaborator.warning !== null) console.warn(collaborator.warning);
+const service = new ScannerService(db, {
+  defaultUserAgent,
+  programsService,
+  ...(collaborator.client === null ? {} : { collaborator: collaborator.client }),
+});
 const takeoverService = new TakeoverService(db);
 
 // How stale a program's inventory may get before the scheduler re-enumerates

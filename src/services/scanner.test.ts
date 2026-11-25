@@ -3,7 +3,7 @@ import type { AddressInfo } from 'node:net';
 import { readFile, rm } from 'node:fs/promises';
 import { afterAll, describe, expect, it, vi } from 'vitest';
 import { createDb } from '../db/client.js';
-import { findings, scans, scanTargets } from '../db/schema.js';
+import { findings, scans, scanTargets, type InjectionAttempt } from '../db/schema.js';
 import {
   ScannerService,
   ScanValidationError,
@@ -15,6 +15,7 @@ import {
   type LlmEnrichImpl,
 } from './scanner.js';
 import { ProgramsService, type CreateProgramOptions } from './programs.js';
+import type { CollaboratorClient, CollaboratorHit } from './ssrf-probe.js';
 
 function deferred<T>(): { promise: Promise<T>; resolve: (v: T) => void } {
   let resolve!: (v: T) => void;
@@ -60,6 +61,13 @@ function okResponse(body: Record<string, string> = { 'x-test': '1' }): Response 
 // sockets in tests" testing decision) and stay fast/offline-safe.
 function okTlsCheckImpl(): TlsCheckImpl {
   return vi.fn(async () => ({ version: 'TLSv1.3', certExpiresAt: new Date('2099-01-01T00:00:00Z') }));
+}
+
+
+// Active scans also record SSRF attempts (unavailable with no collaborator); XSS
+// assertions look at the XSS rows alone. Rows without `check` read as xss.
+function xssAttempts(attempts: InjectionAttempt[] | null | undefined): InjectionAttempt[] {
+  return (attempts ?? []).filter((a) => (a.check ?? 'xss') === 'xss');
 }
 
 describe('ScannerService program scans', () => {
@@ -1380,7 +1388,7 @@ describe('ScannerService active-mode query-param injection', () => {
     await completedScan(svc, scan.id);
 
     const target = (await svc.getScan(scan.id))?.targets[0];
-    expect(target?.injectionAttempts?.map((a) => a.injectionPoint)).toEqual(['q', 'page']);
+    expect(xssAttempts(target?.injectionAttempts).map((a) => a.injectionPoint)).toEqual(['q', 'page']);
   });
 
   it('records a unique canary marker payload per injection point', async () => {
@@ -1393,7 +1401,7 @@ describe('ScannerService active-mode query-param injection', () => {
 
     await completedScan(svc, scan.id);
 
-    const attempts = (await svc.getScan(scan.id))?.targets[0]?.injectionAttempts ?? [];
+    const attempts = xssAttempts((await svc.getScan(scan.id))?.targets[0]?.injectionAttempts);
     const payloads = attempts.map((a) => a.payload);
     for (const payload of payloads) {
       expect(payload).toMatch(/^<script>window\.__colossus_xss_marker='[0-9a-f-]{36}'<\/script>$/);
@@ -1597,7 +1605,7 @@ describe('ScannerService active-mode XSS confirmation', () => {
     expect(xss?.confidence).toBe('definitive');
     expect(xss?.injectionPoint).toBe('q');
     expect(xss?.payload).toContain('__colossus_xss_marker');
-    expect(target?.injectionAttempts?.map((a) => a.outcome)).toEqual(['confirmed']);
+    expect(xssAttempts(target?.injectionAttempts).map((a) => a.outcome)).toEqual(['confirmed']);
   });
 
   it('records a not_vulnerable outcome and writes no finding when execution is not confirmed', async () => {
@@ -1617,7 +1625,7 @@ describe('ScannerService active-mode XSS confirmation', () => {
 
     const target = (await svc.getScan(scan.id))?.targets[0];
     expect(target?.findings.some((f) => f.category === 'xss')).toBe(false);
-    expect(target?.injectionAttempts?.map((a) => a.outcome)).toEqual(['not_vulnerable']);
+    expect(xssAttempts(target?.injectionAttempts).map((a) => a.outcome)).toEqual(['not_vulnerable']);
   });
 
   it('saves the confirmation screenshot to disk and exposes evidencePath on the finding', async () => {
@@ -2196,5 +2204,321 @@ describe('ScannerService access-control (idor)', () => {
     // The reported error never leaks the private body.
     expect(errored?.error).not.toContain('Invoice');
     expect(errored?.findings).toHaveLength(0);
+  });
+});
+
+describe('ScannerService active-mode SSRF', () => {
+  // A target that fetches whatever URL its `url` param names, and a collaborator that
+  // records the callback — the shared world a vulnerable server would create.
+  function ssrfWorld(
+    metadataBody = '',
+    selfTest: CollaboratorClient['selfTest'] = async () => ({ ok: true, ownEgressIps: [] }),
+  ) {
+    let metadata = metadataBody;
+    let minted = 0;
+    const tokenByUrl = new Map<string, string>();
+    const hits: CollaboratorHit[] = [];
+    const collaborator: CollaboratorClient = {
+      mint() {
+        minted += 1;
+        const token = `tok${minted}`;
+        const url = `http://${token}.collab.test/`;
+        tokenByUrl.set(url, token);
+        return { token, url };
+      },
+      async poll(tokens) {
+        return hits.filter((h) => tokens.includes(h.token));
+      },
+      selfTest,
+    };
+    const bodyFetchImpl = vi.fn(async (url: string) => {
+      const token = tokenByUrl.get(new URL(url).searchParams.get('url') ?? '');
+      if (token !== undefined) {
+        hits.push({ token, protocol: 'http', callerSourceIp: '203.0.113.7', observedAt: new Date(0) });
+      }
+      const reflectsMetadata = new URL(url).searchParams.get('url') === 'http://169.254.169.254/latest/meta-data/';
+      return { body: reflectsMetadata ? metadata : '', headers: new Headers() };
+    });
+    return {
+      collaborator,
+      bodyFetchImpl,
+      reflectMetadata(body: string) {
+        metadata = body;
+      },
+    };
+  }
+
+  const instantDrain = { windowMs: 30_000, pollIntervalMs: 3_000, sleep: async () => {} };
+
+  it('records a high, definitive ssrf finding when the target calls back to the collaborator', async () => {
+    const world = ssrfWorld();
+    const svc = new ScannerService(createDb(':memory:'), {
+      fetchImpl: vi.fn(async () => okResponse(FULLY_HARDENED_HEADERS)),
+      tlsCheckImpl: okTlsCheckImpl(),
+      xssConfirmImpl: vi.fn(async () => ({ outcome: 'not_vulnerable' as const })),
+      bodyFetchImpl: world.bodyFetchImpl,
+      collaborator: world.collaborator,
+      ssrfDrainTiming: instantDrain,
+    });
+    const scan = await svc.startScan(['https://example.com/fetch?url=a&q=b'], {
+      mode: 'active',
+      confirmAuthorized: true,
+    });
+    const completed = await completedScan(svc, scan.id);
+
+    const ssrf = completed.targets.flatMap((t) => t.findings).filter((f) => f.category === 'ssrf');
+    expect(ssrf).toHaveLength(1);
+    expect(ssrf[0]?.severity).toBe('high');
+    expect(ssrf[0]?.confidence).toBe('definitive');
+    expect(ssrf[0]?.injectionPoint).toBe('url');
+    const evidence = JSON.parse(ssrf[0]?.structuredEvidence ?? '{}');
+    expect(evidence).toMatchObject({ kind: 'ssrf', param: 'url', tier: 'oob', protocols: ['http'] });
+  });
+
+  it('records an ssrf attempt per param alongside, never instead of, the xss attempts', async () => {
+    const world = ssrfWorld();
+    const svc = new ScannerService(createDb(':memory:'), {
+      fetchImpl: vi.fn(async () => okResponse(FULLY_HARDENED_HEADERS)),
+      tlsCheckImpl: okTlsCheckImpl(),
+      xssConfirmImpl: vi.fn(async () => ({ outcome: 'not_vulnerable' as const })),
+      bodyFetchImpl: world.bodyFetchImpl,
+      collaborator: world.collaborator,
+      ssrfDrainTiming: instantDrain,
+    });
+    const scan = await svc.startScan(['https://example.com/fetch?url=a&q=b'], {
+      mode: 'active',
+      confirmAuthorized: true,
+    });
+    const completed = await completedScan(svc, scan.id);
+
+    const attempts = completed.targets[0]?.injectionAttempts ?? [];
+    const xss = attempts.filter((a) => (a.check ?? 'xss') === 'xss');
+    const ssrf = attempts.filter((a) => a.check === 'ssrf');
+    expect(xss.map((a) => a.injectionPoint).sort()).toEqual(['q', 'url']);
+    expect(ssrf.map((a) => [a.injectionPoint, a.phase, a.outcome]).sort()).toEqual([
+      ['q', 'oob', 'not_vulnerable'],
+      ['url', 'oob', 'confirmed'],
+    ]);
+  });
+
+  it('records one critical internal-read finding and attempt when the target reflects the metadata listing', async () => {
+    const world = ssrfWorld(['ami-id', 'hostname', 'instance-id', 'instance-type', 'local-ipv4', 'reservation-id'].join('\n'));
+    const svc = new ScannerService(createDb(':memory:'), {
+      fetchImpl: vi.fn(async () => okResponse(FULLY_HARDENED_HEADERS)),
+      tlsCheckImpl: okTlsCheckImpl(),
+      xssConfirmImpl: vi.fn(async () => ({ outcome: 'not_vulnerable' as const })),
+      bodyFetchImpl: world.bodyFetchImpl,
+      collaborator: world.collaborator,
+      ssrfDrainTiming: instantDrain,
+    });
+    const scan = await svc.startScan(['https://example.com/fetch?url=a&q=b'], {
+      mode: 'active',
+      confirmAuthorized: true,
+    });
+    const completed = await completedScan(svc, scan.id);
+
+    const ssrf = completed.targets.flatMap((t) => t.findings).filter((f) => f.category === 'ssrf');
+    expect(ssrf).toHaveLength(1);
+    expect(ssrf[0]?.severity).toBe('critical');
+    expect(ssrf[0]?.confidence).toBe('definitive');
+    expect(JSON.parse(ssrf[0]?.structuredEvidence ?? '{}')).toMatchObject({
+      tier: 'internal-read',
+      protocols: ['http'],
+      matchedSignature: 'aws-imdsv1-metadata-listing',
+    });
+    const attempts = (completed.targets[0]?.injectionAttempts ?? []).filter((a) => a.check === 'ssrf');
+    expect(attempts.map((a) => [a.injectionPoint, a.phase, a.outcome]).sort()).toEqual([
+      ['q', 'oob', 'not_vulnerable'],
+      ['url', 'internal-read', 'confirmed'],
+      ['url', 'oob', 'confirmed'],
+    ]);
+  });
+
+  async function activeScan(world: ReturnType<typeof ssrfWorld> | null) {
+    const bodyFetchImpl = world?.bodyFetchImpl ?? vi.fn(async () => ({ body: '', headers: new Headers() }));
+    const svc = new ScannerService(createDb(':memory:'), {
+      fetchImpl: vi.fn(async () => okResponse(FULLY_HARDENED_HEADERS)),
+      tlsCheckImpl: okTlsCheckImpl(),
+      xssConfirmImpl: vi.fn(async () => ({ outcome: 'not_vulnerable' as const })),
+      bodyFetchImpl,
+      ...(world === null ? {} : { collaborator: world.collaborator }),
+      ssrfDrainTiming: instantDrain,
+    });
+    const scan = await svc.startScan(['https://example.com/fetch?url=a&q=b'], {
+      mode: 'active',
+      confirmAuthorized: true,
+    });
+    return completedScan(svc, scan.id);
+  }
+
+  it('completes the scan when a target hangs on the ssrf fetches, instead of stalling forever', async () => {
+    const world = ssrfWorld();
+    const hangsOnSsrf = vi.fn(async (url: string) => {
+      const injected = new URL(url).searchParams.get('url') ?? '';
+      if (injected.includes('collab.test') || injected.includes('169.254.169.254')) return new Promise<never>(() => {});
+      return { body: '', headers: new Headers() };
+    });
+    const svc = new ScannerService(createDb(':memory:'), {
+      fetchImpl: vi.fn(async () => okResponse(FULLY_HARDENED_HEADERS)),
+      tlsCheckImpl: okTlsCheckImpl(),
+      xssConfirmImpl: vi.fn(async () => ({ outcome: 'not_vulnerable' as const })),
+      bodyFetchImpl: hangsOnSsrf,
+      collaborator: world.collaborator,
+      ssrfDrainTiming: instantDrain,
+      timeoutMs: 50,
+    });
+    const scan = await svc.startScan(['https://example.com/fetch?url=a'], { mode: 'active', confirmAuthorized: true });
+
+    const completed = await completedScan(svc, scan.id);
+    expect(completed.status).toBe('completed');
+  });
+
+  it('marks ssrf unavailable per param when no collaborator is configured, and the scan still completes', async () => {
+    const completed = await activeScan(null);
+
+    expect(completed.status).toBe('completed');
+    const attempts = completed.targets[0]?.injectionAttempts ?? [];
+    expect(xssAttempts(attempts)).toHaveLength(2);
+    const ssrf = attempts.filter((a) => a.check === 'ssrf');
+    expect(ssrf.map((a) => [a.injectionPoint, a.phase, a.outcome, a.error]).sort()).toEqual([
+      ['q', 'oob', 'unavailable', 'collaborator-not-configured'],
+      ['url', 'oob', 'unavailable', 'collaborator-not-configured'],
+    ]);
+  });
+
+  it('marks ssrf unavailable with the self-test reason, and fires no ssrf payload', async () => {
+    const world = ssrfWorld('', async () => ({ ok: false, reason: 'dns delegation missing' }));
+    const completed = await activeScan(world);
+
+    expect(completed.status).toBe('completed');
+    const ssrf = (completed.targets[0]?.injectionAttempts ?? []).filter((a) => a.check === 'ssrf');
+    expect(ssrf.map((a) => [a.outcome, a.error])).toEqual([
+      ['unavailable', 'collaborator-self-test-failed: dns delegation missing'],
+      ['unavailable', 'collaborator-self-test-failed: dns delegation missing'],
+    ]);
+    const fired = world.bodyFetchImpl.mock.calls.map(([u]) => u).filter((u) => u.includes('collab.test'));
+    expect(fired).toEqual([]);
+  });
+
+  it("never confirms from a callback made by colossus's own egress ip", async () => {
+    const world = ssrfWorld('', async () => ({ ok: true, ownEgressIps: ['203.0.113.7'] }));
+    const completed = await activeScan(world);
+
+    expect(completed.targets.flatMap((t) => t.findings).filter((f) => f.category === 'ssrf')).toHaveLength(0);
+  });
+
+  it('marks a standing ssrf not-new on a re-scan, and a tier upgrade new', async () => {
+    const world = ssrfWorld();
+    const svc = new ScannerService(createDb(':memory:'), {
+      fetchImpl: vi.fn(async () => okResponse(FULLY_HARDENED_HEADERS)),
+      tlsCheckImpl: okTlsCheckImpl(),
+      xssConfirmImpl: vi.fn(async () => ({ outcome: 'not_vulnerable' as const })),
+      bodyFetchImpl: world.bodyFetchImpl,
+      collaborator: world.collaborator,
+      ssrfDrainTiming: instantDrain,
+    });
+    const scanOnce = async () => {
+      const scan = await svc.startScan(['https://example.com/fetch?url=a'], { mode: 'active', confirmAuthorized: true });
+      const completed = await completedScan(svc, scan.id);
+      return completed.targets.flatMap((t) => t.findings).filter((f) => f.category === 'ssrf');
+    };
+
+    const first = await scanOnce();
+    const second = await scanOnce();
+    world.reflectMetadata(['ami-id', 'instance-id', 'instance-type', 'local-ipv4'].join('\n'));
+    const upgraded = await scanOnce();
+
+    expect(first.map((f) => f.isNew)).toEqual([true]);
+    // A fresh token was fired, yet the standing bug is the same (target, param, tier).
+    expect(second.map((f) => f.isNew)).toEqual([false]);
+    expect(upgraded.map((f) => [f.severity, f.isNew])).toEqual([['critical', true]]);
+  });
+
+  it('marks a second cookie missing Secure as new, not as the first cookie seen again', async () => {
+    let cookies = ['a=1'];
+    const svc = new ScannerService(createDb(':memory:'), {
+      fetchImpl: vi.fn(async () => {
+        const headers = new Headers(FULLY_HARDENED_HEADERS);
+        for (const cookie of cookies) headers.append('set-cookie', cookie);
+        return new Response(null, { status: 200, headers });
+      }),
+      tlsCheckImpl: okTlsCheckImpl(),
+    });
+    const scanOnce = async () => {
+      const scan = await svc.startScan(['https://example.com/']);
+      const completed = await completedScan(svc, scan.id);
+      return completed.targets
+        .flatMap((t) => t.findings)
+        .filter((f) => f.category === 'cookie-missing-secure')
+        .map((f) => [f.explanation, f.isNew]);
+    };
+
+    await scanOnce();
+    cookies = ['a=1', 'b=2'];
+    const second = await scanOnce();
+
+    expect(second).toEqual([
+      ['Cookie "a" is missing the Secure attribute.', false],
+      ['Cookie "b" is missing the Secure attribute.', true],
+    ]);
+  });
+
+  it('fires no ssrf payload in a passive-mode scan', async () => {
+    const world = ssrfWorld();
+    const svc = new ScannerService(createDb(':memory:'), {
+      fetchImpl: vi.fn(async () => okResponse(FULLY_HARDENED_HEADERS)),
+      tlsCheckImpl: okTlsCheckImpl(),
+      bodyFetchImpl: world.bodyFetchImpl,
+      collaborator: world.collaborator,
+      ssrfDrainTiming: instantDrain,
+    });
+    const scan = await svc.startScan(['https://example.com/fetch?url=a'], { mode: 'passive' });
+    const completed = await completedScan(svc, scan.id);
+
+    expect(world.bodyFetchImpl).not.toHaveBeenCalled();
+    expect(completed.targets.flatMap((t) => t.findings).filter((f) => f.category === 'ssrf')).toHaveLength(0);
+  });
+});
+
+describe('ScannerService finding newness', () => {
+  function service() {
+    // No security headers, so every scan of a target yields the same missing-header findings.
+    return new ScannerService(createDb(':memory:'), {
+      fetchImpl: vi.fn(async () => okResponse()),
+      tlsCheckImpl: okTlsCheckImpl(),
+    });
+  }
+  const scanFindings = async (svc: ScannerService, urls: string[]) => {
+    const scan = await svc.startScan(urls);
+    return (await completedScan(svc, scan.id)).targets.flatMap((t) => t.findings);
+  };
+
+  it('marks every finding new on the first scan of a target and not-new when it stands on a re-scan', async () => {
+    const svc = service();
+    const first = await scanFindings(svc, ['https://example.com/']);
+    const second = await scanFindings(svc, ['https://example.com']);
+
+    expect(first.length).toBeGreaterThan(0);
+    expect(first.every((f) => f.isNew)).toBe(true);
+    expect(second.map((f) => f.category).sort()).toEqual(first.map((f) => f.category).sort());
+    expect(second.every((f) => !f.isNew)).toBe(true);
+  });
+
+  it('does not count a finding on a different target as prior', async () => {
+    const svc = service();
+    await scanFindings(svc, ['https://other.example/']);
+    const findingsHere = await scanFindings(svc, ['https://example.com/']);
+
+    expect(findingsHere.every((f) => f.isNew)).toBe(true);
+  });
+
+  it('judges an earlier scan against only the scans before it', async () => {
+    const svc = service();
+    const first = await svc.startScan(['https://example.com/']);
+    await completedScan(svc, first.id);
+    await scanFindings(svc, ['https://example.com/']);
+
+    const reread = (await svc.getScan(first.id))?.targets.flatMap((t) => t.findings) ?? [];
+    expect(reread.every((f) => f.isNew)).toBe(true);
   });
 });

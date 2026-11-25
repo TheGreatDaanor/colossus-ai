@@ -45,6 +45,18 @@ const COOKIE_ATTRIBUTE_CHECKS: { category: string; label: string; isMissing: (at
   },
 ];
 
+const cookieExplanation = (name: string, label: string) => `Cookie "${name}" is missing the ${label} attribute.`;
+const COOKIE_NAME_IN_EXPLANATION = /^Cookie "(.*)" is missing the \w+ attribute\.$/;
+
+// What tells apart several findings of one category on one target, for matching a
+// finding across scans. Cookie checks emit one finding per cookie and carry the name
+// only in their detector-written explanation, which this reads back in the exact
+// format `cookieExplanation` writes. Empty for every other category.
+export function findingInstanceKey(category: string, explanation: string | null): string {
+  if (!category.startsWith('cookie-missing-') || explanation === null) return '';
+  return COOKIE_NAME_IN_EXPLANATION.exec(explanation)?.[1] ?? '';
+}
+
 function detectCookieFindings(setCookies: string[]): HeaderFinding[] {
   const result: HeaderFinding[] = [];
 
@@ -59,7 +71,7 @@ function detectCookieFindings(setCookies: string[]): HeaderFinding[] {
           category: check.category,
           severity: 'medium',
           confidence: 'definitive',
-          explanation: `Cookie "${name}" is missing the ${check.label} attribute.`,
+          explanation: cookieExplanation(name, check.label),
         });
       }
     }

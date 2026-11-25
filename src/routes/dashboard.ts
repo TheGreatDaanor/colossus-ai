@@ -1,5 +1,6 @@
 import { Hono } from 'hono';
 import type { Finding, Scan, ScanTarget, ScannerService } from '../services/scanner.js';
+import type { SsrfEvidence } from '../services/ssrf-probe.js';
 
 function escapeHtml(value: unknown): string {
   return String(value)
@@ -31,6 +32,100 @@ function scanListTable(scanList: Scan[]): string {
   </table>`;
 }
 
+function definitionList(fields: [string, string | undefined][]): string {
+  const items = fields
+    .filter((field): field is [string, string] => field[1] !== undefined)
+    .map(([label, value]) => `<dt>${escapeHtml(label)}</dt><dd>${escapeHtml(value)}</dd>`)
+    .join('');
+  return `<dl>${items}</dl>`;
+}
+
+// SSRF proof reads as labeled fields, never raw JSON. It is body-free by
+// construction, so there is no response body here to leak.
+function ssrfEvidence(evidence: SsrfEvidence): string {
+  const list = definitionList([
+    ['param', evidence.param],
+    ['protocols', evidence.protocols.length > 0 ? evidence.protocols.join(', ') : undefined],
+    ['caller egress IP', evidence.callerSourceIp],
+    ['tier', evidence.tier],
+    ['matched signature', evidence.matchedSignature],
+  ]);
+  const note = evidence.internalRead === 'not-demonstrated' ? '<p>metadata read: not demonstrated</p>' : '';
+  return list + note;
+}
+
+const isOptionalString = (value: unknown) => value === undefined || typeof value === 'string';
+
+// Only a row with the full SsrfEvidence shape renders as labeled fields; anything
+// else falls back to escaped raw JSON so one bad row never fails the page.
+function parseSsrfEvidence(raw: string | null): SsrfEvidence | null {
+  if (raw === null) return null;
+  let parsed: Record<string, unknown>;
+  try {
+    parsed = JSON.parse(raw) as Record<string, unknown>;
+  } catch {
+    return null;
+  }
+  if (typeof parsed !== 'object' || parsed === null || parsed.kind !== 'ssrf') return null;
+  const wellFormed =
+    typeof parsed.param === 'string' &&
+    (parsed.tier === 'oob' || parsed.tier === 'internal-read') &&
+    Array.isArray(parsed.protocols) &&
+    parsed.protocols.every((p) => typeof p === 'string') &&
+    isOptionalString(parsed.callerSourceIp) &&
+    isOptionalString(parsed.matchedSignature) &&
+    isOptionalString(parsed.internalRead);
+  return wellFormed ? (parsed as unknown as SsrfEvidence) : null;
+}
+
+function findingCell(finding: Finding, col: string): string {
+  if (col === 'structuredEvidence') {
+    const ssrf = parseSsrfEvidence(finding.structuredEvidence);
+    if (ssrf !== null) return ssrfEvidence(ssrf);
+  }
+  return escapeHtml((finding as unknown as Record<string, unknown>)[col]);
+}
+
+// A param whose internal read confirmed was tested, even if its callback drain failed.
+function untestedSsrfAttempts(target: ScanTarget) {
+  const ssrf = (target.injectionAttempts ?? []).filter((attempt) => attempt.check === 'ssrf');
+  const confirmed = new Set(ssrf.filter((a) => a.outcome === 'confirmed').map((a) => a.injectionPoint));
+  return ssrf.filter((attempt) => attempt.outcome === 'unavailable' && !confirmed.has(attempt.injectionPoint));
+}
+
+function plural(count: number, noun: string): string {
+  return `${count} ${noun}${count === 1 ? '' : 's'}`;
+}
+
+// Scan-level roll-up of the per-param indicator, so an operator sees at the top
+// that SSRF coverage has gaps before reading a single target row.
+function ssrfNotTestedSummary(targets: ScanTarget[]): string {
+  const perTarget = targets.map(untestedSsrfAttempts).filter((attempts) => attempts.length > 0);
+  if (perTarget.length === 0) return '';
+
+  const byReason = new Map<string, number>();
+  for (const attempt of perTarget.flat()) {
+    const reason = attempt.error ?? 'unknown reason';
+    byReason.set(reason, (byReason.get(reason) ?? 0) + 1);
+  }
+  const reasons = [...byReason]
+    .map(([reason, count]) => `<li>${escapeHtml(reason)}: ${count}</li>`)
+    .join('');
+  const total = perTarget.flat().length;
+  return `<section><p><strong>SSRF: not tested on ${plural(total, 'parameter')} across ${plural(perTarget.length, 'target')}</strong></p><ul>${reasons}</ul></section>`;
+}
+
+// An `unavailable` SSRF attempt means the param was never probed. Saying so per
+// param keeps a clean report from reading as "no SSRF".
+function ssrfNotTested(target: ScanTarget): string {
+  return untestedSsrfAttempts(target)
+    .map(
+      (attempt) =>
+        `<p>SSRF: not tested (${escapeHtml(attempt.error ?? 'unknown reason')}) — param ${escapeHtml(attempt.injectionPoint)}</p>`,
+    )
+    .join('');
+}
+
 function findingsTable(findingList: Finding[]): string {
   if (findingList.length === 0) return '<p>no findings</p>';
 
@@ -40,7 +135,7 @@ function findingsTable(findingList: Finding[]): string {
     .map(
       (finding) =>
         `<tr>${columns
-          .map((col) => `<td>${escapeHtml((finding as unknown as Record<string, unknown>)[col])}</td>`)
+          .map((col) => `<td>${findingCell(finding, col)}</td>`)
           .join('')}</tr>`,
     )
     .join('');
@@ -68,7 +163,7 @@ function targetsTable(targets: (ScanTarget & { findings: Finding[] })[]): string
         <td>${target.responseTimeMs ?? ''}</td>
         <td>${escapeHtml(target.redirectLocation ?? '')}</td>
         <td>${escapeHtml(target.error ?? '')}</td>
-        <td>${findingsTable(target.findings)}</td>
+        <td>${ssrfNotTested(target)}${findingsTable(target.findings)}</td>
       </tr>`,
     )
     .join('');
@@ -94,7 +189,7 @@ export function createDashboardRoutes(service: ScannerService): Hono {
     const scan = await service.getScan(id);
     if (!scan) return c.text('scan not found', 404);
 
-    const body = `<h1>${escapeHtml(scan.name)}</h1><p>status: ${escapeHtml(scan.status)}</p>${targetsTable(scan.targets)}`;
+    const body = `<h1>${escapeHtml(scan.name)}</h1><p>status: ${escapeHtml(scan.status)}</p>${ssrfNotTestedSummary(scan.targets)}${targetsTable(scan.targets)}`;
     return c.html(page(scan.name, body));
   });
 

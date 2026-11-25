@@ -1,6 +1,7 @@
 import { connect as tlsConnect } from 'node:tls';
 import { eq } from 'drizzle-orm';
 import type { Db } from '../db/client.js';
+import { findingsBeforeScan } from '../db/finding-history.js';
 import {
   makeXssInjectionClass,
   makeSstiInjectionClass,
@@ -8,6 +9,7 @@ import {
   makeLfiInjectionClass,
   makeCrlfInjectionClass,
   saveEvidence,
+  guardedFetchText,
   type InjectionClass,
   type XssConfirmImpl,
   type BodyFetchImpl,
@@ -16,6 +18,15 @@ import { disallowedPrefixes, discoverLinks } from './discovery.js';
 import { runAccessControlChecks, type Identity, type HeaderedFetchImpl } from './access-control.js';
 import { hostCapFor, ProgramsService, type EnumeratedHost, type Scope } from './programs.js';
 import { findDisallowedAddress, isDisallowedAddress } from './ssrf-guard.js';
+import {
+  DEFAULT_DRAIN_TIMING,
+  makeSsrfProbe,
+  makeUnavailableSsrfProbe,
+  type CollaboratorClient,
+  type DrainTiming,
+  type SsrfOutcome,
+  type SsrfProbe,
+} from './ssrf-probe.js';
 import {
   detectHeaderFindings,
   detectTlsFindings,
@@ -26,6 +37,7 @@ import {
   type TlsFinding,
   type TlsInfo,
   type VersionBanner,
+  findingInstanceKey,
 } from './passive-checks.js';
 import {
   scans,
@@ -50,7 +62,8 @@ export type Scan = typeof scans.$inferSelect;
 export type ScanTarget = typeof scanTargets.$inferSelect;
 export type Finding = typeof findings.$inferSelect;
 export type ScanWithTargets = Scan & {
-  targets: (ScanTarget & { findings: Finding[] })[];
+  // `isNew` is derived, never stored: see `findingIdentity`.
+  targets: (ScanTarget & { findings: (Finding & { isNew: boolean })[] })[];
   findingsBySeverity: Record<FindingSeverity, number>;
 };
 
@@ -108,6 +121,43 @@ function lowercaseHeaders(headers: Headers): Record<string, string> {
     out[key.toLowerCase()] = value;
   });
   return out;
+}
+
+function withTimeout(fetchImpl: BodyFetchImpl, timeoutMs: number): BodyFetchImpl {
+  return (url) => {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timedOut = new Promise<never>((_resolve, reject) => {
+      timer = setTimeout(() => reject(new Error(`fetch timed out after ${timeoutMs}ms`)), timeoutMs);
+    });
+    return Promise.race([fetchImpl(url), timedOut]).finally(() => clearTimeout(timer));
+  };
+}
+
+// What makes two findings "the same standing defect" across scans: the target (in its
+// `sameTargetKey` form), the category, and whatever names the instance — injection
+// point, CVE, the cookie name for per-cookie checks, and for SSRF the tier, so an `oob` → `internal-read` upgrade is new.
+// Never the payload: SSRF fires a fresh token every scan. Module-private, covered
+// through `getScan`.
+type FindingIdentityFields = Pick<Finding, 'category' | 'injectionPoint' | 'cveId' | 'explanation' | 'structuredEvidence'>;
+
+function findingIdentity(targetUrl: string, finding: FindingIdentityFields): string {
+  let tier = '';
+  if (finding.category === 'ssrf' && finding.structuredEvidence !== null) {
+    try {
+      const evidence = JSON.parse(finding.structuredEvidence) as { kind?: string; tier?: string };
+      if (evidence.kind === 'ssrf') tier = evidence.tier ?? '';
+    } catch {
+      // Unparseable evidence names no tier; the rest of the identity still holds.
+    }
+  }
+  return JSON.stringify([
+    sameTargetKey(targetUrl),
+    finding.category,
+    finding.injectionPoint ?? '',
+    finding.cveId ?? '',
+    tier,
+    findingInstanceKey(finding.category, finding.explanation),
+  ]);
 }
 
 // Module-private: the only caller is `getScan`, and it is covered through that
@@ -467,6 +517,12 @@ export class ScannerService {
   // through. Default is SSRF-guarded (see #guardedHeaderedFetch); tests inject a
   // fake mapping (url, headers) → (status, body) to drive the oracle offline.
   readonly #headeredFetchImpl: HeaderedFetchImpl;
+  // The out-of-band SSRF collaborator. Null when the deployment has none, in which
+  // case no SSRF payloads are fired and every param is reported `unavailable`.
+  readonly #collaborator: CollaboratorClient | null;
+  readonly #ssrfDrainTiming: DrainTiming | undefined;
+  // SSRF fire is a plain body fetch, so it reuses the oracle classes' fetcher.
+  readonly #ssrfFetchImpl: BodyFetchImpl;
 
   constructor(
     db: Db,
@@ -485,6 +541,8 @@ export class ScannerService {
       allowedHosts?: string[];
       programsService?: ProgramsService;
       headeredFetchImpl?: HeaderedFetchImpl;
+      collaborator?: CollaboratorClient;
+      ssrfDrainTiming?: DrainTiming;
     } = {},
   ) {
     this.#db = db;
@@ -511,6 +569,11 @@ export class ScannerService {
       options.tlsCheckImpl ?? ((hostname, port) => defaultTlsCheck(hostname, port, this.#timeoutMs));
     this.#osvCheckImpl = options.osvCheckImpl ?? defaultOsvCheck;
     this.#llmEnrichImpl = options.llmEnrichImpl ?? defaultLlmEnrich;
+    this.#collaborator = options.collaborator ?? null;
+    this.#ssrfDrainTiming = options.ssrfDrainTiming;
+    // Bounded so a target that hangs on an SSRF payload (often the unroutable IMDS
+    // address) frees its fetch slot instead of stalling the scan.
+    this.#ssrfFetchImpl = withTimeout(options.bodyFetchImpl ?? guardedFetchText, this.#timeoutMs);
   }
 
   async startScan(urls: string[], options: StartScanOptions = {}): Promise<Scan> {
@@ -639,10 +702,20 @@ export class ScannerService {
     const scan = this.#db.select().from(scans).where(eq(scans.id, id)).get();
     if (!scan) return null;
 
+    // Newness is derived per read, like the inventory's (041): a finding is new unless
+    // an earlier scan — by id, so re-reading an old scan never changes its answer —
+    // recorded the same defect. Findings are still recorded on every scan.
+    const prior = new Set(findingsBeforeScan(this.#db, id).map(({ url, ...finding }) => findingIdentity(url, finding)));
+
     const targetRows = this.#db.select().from(scanTargets).where(eq(scanTargets.scanId, id)).all();
     const targets = targetRows.map((target) => ({
       ...target,
-      findings: this.#db.select().from(findings).where(eq(findings.scanTargetId, target.id)).all(),
+      findings: this.#db
+        .select()
+        .from(findings)
+        .where(eq(findings.scanTargetId, target.id))
+        .all()
+        .map((finding) => ({ ...finding, isNew: !prior.has(findingIdentity(target.url, finding)) })),
     }));
 
     const allFindings = targets.flatMap((target) => target.findings);
@@ -692,11 +765,13 @@ export class ScannerService {
       discoveredCount: new Map(targetRows.map((t) => [t.id, new Budget(MAX_DISCOVERED_PER_ROOT)])),
     };
 
+    const ssrf = mode === 'active' ? await this.#preflightSsrf(scanId) : null;
+
     const queue = [...targetRows];
     while (queue.length > 0) {
       const batch = queue.splice(0, this.#concurrency);
       const discoveredBatches = await Promise.all(
-        batch.map((target) => this.#processTarget(target, cveCache, llmCache, userAgent, mode, discovery)),
+        batch.map((target) => this.#processTarget(target, cveCache, llmCache, userAgent, mode, discovery, ssrf)),
       );
       for (const discovered of discoveredBatches) queue.push(...discovered);
     }
@@ -706,6 +781,16 @@ export class ScannerService {
     // than walking the crawl frontier. Active-mode only, and only when identities
     // were supplied — startScan already cleared both gates.
     if (identities.length > 0) await this.#runAccessControlChecks(scanId, identities);
+
+    // The scan-level drain barrier: every SSRF payload across the whole scan has been
+    // fired, so one bounded window resolves them all before the scan completes.
+    if (ssrf !== null) {
+      this.#persistSsrfOutcomes(await ssrf.drainCollaborator());
+      const { fired, received, late, ownEgressDiscarded, unavailable } = ssrf.stats();
+      console.warn(
+        `[scan ${scanId}] ssrf fired=${fired} received=${received} late=${late} own-egress-discarded=${ownEgressDiscarded} unavailable=${unavailable}`,
+      );
+    }
 
     this.#db
       .update(scans)
@@ -721,6 +806,7 @@ export class ScannerService {
     userAgent: string,
     mode: ScanMode,
     discovery: DiscoveryContext,
+    ssrf: SsrfProbe<number> | null,
   ): Promise<ScanTarget[]> {
     console.warn(`[scan ${target.scanId}] ${target.url} started`);
 
@@ -846,6 +932,7 @@ export class ScannerService {
       if (mode === 'active') {
         await this.#injectQueryParams(target, targetUrl, userAgent);
         await this.#runOracleClasses(target, targetUrl);
+        if (ssrf !== null) await ssrf.fire(targetUrl, target.id);
       }
 
       // Discovery runs regardless of mode — it's non-intrusive HTML parsing, not a
@@ -1026,6 +1113,86 @@ export class ScannerService {
         }),
       ),
     );
+  }
+
+  // One SSRF probe per active scan run: it holds this scan's pending tokens in memory
+  // until the drain resolves them, and fire shares the oracle fetch budget. The
+  // preflight self-test proves the collaborator end-to-end and learns Colossus's own
+  // egress IPs; with no collaborator, or a failed or throwing self-test, the probe
+  // fires nothing and reports SSRF `unavailable` per param — never a failed scan.
+  async #preflightSsrf(scanId: number): Promise<SsrfProbe<number>> {
+    if (this.#collaborator === null) return makeUnavailableSsrfProbe('collaborator-not-configured');
+    let result;
+    try {
+      result = await this.#collaborator.selfTest(this.#ssrfFetchImpl);
+    } catch (err) {
+      result = { ok: false as const, reason: err instanceof Error ? err.message : String(err) };
+    }
+    if (!result.ok) {
+      console.warn(`[scan ${scanId}] ssrf collaborator self-test failed: ${result.reason}`);
+      return makeUnavailableSsrfProbe(`collaborator-self-test-failed: ${result.reason}`);
+    }
+    return makeSsrfProbe<number>(
+      (url) => this.#fetchSemaphore.run(() => this.#ssrfFetchImpl(url)),
+      this.#collaborator,
+      { ...(this.#ssrfDrainTiming ?? DEFAULT_DRAIN_TIMING), ownEgressIps: result.ownEgressIps },
+    );
+  }
+
+  // Every SSRF verdict is recorded as an `oob` attempt on its target, merged into —
+  // never replacing — the XSS attempts already there; an `internal-read` attempt is
+  // added only on a signature match (a miss has no honest negative). Either signal
+  // writes one definitive finding per (target, param) at the highest tier — `high` for
+  // oob, `critical` for internal-read — carrying its body-free proof as
+  // `structured_evidence`. `context` is the scan-target id.
+  #persistSsrfOutcomes(outcomes: SsrfOutcome<number>[]): void {
+    const byTarget = new Map<number, InjectionAttempt[]>();
+    for (const outcome of outcomes) {
+      const attempts = byTarget.get(outcome.context) ?? [];
+      attempts.push({
+        check: 'ssrf',
+        phase: 'oob',
+        injectionPoint: outcome.param,
+        payload: outcome.payload,
+        outcome: outcome.outcome,
+        ...(outcome.error === undefined ? {} : { error: outcome.error }),
+      });
+      if (outcome.internalRead !== undefined) {
+        attempts.push({
+          check: 'ssrf',
+          phase: 'internal-read',
+          injectionPoint: outcome.param,
+          payload: outcome.internalRead.payload,
+          outcome: 'confirmed',
+        });
+      }
+      byTarget.set(outcome.context, attempts);
+    }
+    for (const [targetId, ssrfAttempts] of byTarget) {
+      const [row] = this.#db
+        .select({ injectionAttempts: scanTargets.injectionAttempts })
+        .from(scanTargets)
+        .where(eq(scanTargets.id, targetId))
+        .all();
+      const merged = [...(row?.injectionAttempts ?? []), ...ssrfAttempts];
+      this.#db.update(scanTargets).set({ injectionAttempts: merged }).where(eq(scanTargets.id, targetId)).run();
+    }
+
+    for (const outcome of outcomes) {
+      if (outcome.evidence === undefined || outcome.severity === undefined) continue;
+      this.#db
+        .insert(findings)
+        .values({
+          scanTargetId: outcome.context,
+          category: 'ssrf',
+          severity: outcome.severity,
+          confidence: 'definitive',
+          injectionPoint: outcome.param,
+          payload: outcome.payload,
+          structuredEvidence: JSON.stringify(outcome.evidence),
+        })
+        .run();
+    }
   }
 
   // Replays each identity's declared-private URLs across the other identities and
